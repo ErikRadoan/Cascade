@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+.venv/
+venv/
+build/
+dist/
+eggs/
+*.egg-info/
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+*.pyo
+
+# Pyright
+pyrightconfig.json
+
+# VSCode / JetBrains
+.vscode/
+.idea/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Environment
+.env
+.env.*
+
+# Lockfiles (optionally keep uv.lock, uncomment to ignore)
+# uv.lock
+
+# Simulation outputs
+*.h5
+*.vtk
+*.csv
+outputs/
+results/
+
+# OS files
+.DS_Store
+Thumbs.db
+
