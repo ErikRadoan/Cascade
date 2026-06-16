@@ -1,0 +1,11 @@
+{
+  "name": "cascade-frontend",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "echo 'Frontend scaffold only'",
+    "build": "echo 'Frontend scaffold only'",
+    "check": "echo 'Frontend scaffold only'"
+  }
+}
+
