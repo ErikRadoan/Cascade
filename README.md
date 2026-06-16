@@ -1,19 +1,15 @@
 # Cascade
-
-Research project monorepo (frontend + backend + docs). This repo contains templates and infra for getting started.
-
-Quick start (local)
+Research project monorepo for a FastAPI backend, a Svelte frontend, and supporting docs.
+## Layout
+- `backend/cascade/`: FastAPI app, domain models, services, adapters, execution backends, and repositories
+- `frontend/`: SvelteKit-style frontend scaffold
+- `docs/`: architecture notes and decision records
+## Quick start
 1. Copy environment template:
-
-   cp .env.example .env
-
+   `cp .env.example .env`
 2. Start services (requires Docker):
-
-   docker-compose up --build
-
-Development guidance
-- Branching: use `dev` as integration branch and feature branches `feat/...` for work in progress.
-- ADRs: add architecture decisions to `docs/decisions/`.
-
-See `PROJECT_KICKOFF_CHECKLIST.md` for the full onboarding checklist.
+   `docker-compose up --build`
+## Development notes
+- The shared Python project configuration currently lives at the repo root in `pyproject.toml`.
+- Add architecture decisions to `docs/decisions/` and higher-level architecture notes to `docs/architecture/`.
 

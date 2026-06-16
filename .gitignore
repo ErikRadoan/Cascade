@@ -45,4 +45,4 @@ results/
 .DS_Store
 Thumbs.db
 
-/backend/tests/dsl/test_loader.py
+/backend/tests/
