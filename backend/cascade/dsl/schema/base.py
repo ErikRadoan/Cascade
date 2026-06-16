@@ -1,6 +1,6 @@
-from fastapi.openapi.models import Schema
+from pydantic import BaseModel
 
 
-class BaseComponentSchema(Schema):
+class BaseComponentSchema(BaseModel):
     """Base class for all component schemas."""
-    type: str
+    pass
