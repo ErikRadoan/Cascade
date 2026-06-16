@@ -1,0 +1,688 @@
+"""OpenMC adapter — converts CascadeGeometry to OpenMC XML input files.
+
+Generates three XML files that OpenMC requires:
+    geometry.xml    — surfaces and cells
+    materials.xml   — material compositions and densities
+    settings.xml    — run parameters (particles, batches, etc.)
+
+Design notes:
+    - No dependency on the openmc Python package. The XML is built as strings.
+    - Material definitions are referenced by material_id strings from the
+      domain model. Full material XML is generated from the project's
+      material library (passed separately to export_materials).
+    - The adapter is stateless. Every method is a pure function of its inputs.
+
+OpenMC XML reference:
+    https://docs.openmc.org/en/stable/usersguide/geometry.html
+    https://docs.openmc.org/en/stable/usersguide/materials.html
+    https://docs.openmc.org/en/stable/usersguide/settings.html
+"""
+
+from __future__ import annotations
+
+import re
+import textwrap
+from dataclasses import dataclass, field
+from pathlib import Path
+from xml.etree import ElementTree as ET
+from xml.dom import minidom
+
+from ..domain.geometry import (
+    CascadeGeometry,
+    Cell,
+    Complement,
+    Inside,
+    Intersection,
+    Outside,
+    Region,
+    Surface,
+    SurfaceType,
+    Union, BoundaryType,
+)
+from ..domain.material import Material
+from ..domain.result import TallyResult
+
+
+# ---------------------------------------------------------------------------
+# Run settings dataclass — what the user configures per job
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OpenMCRunSettings:
+    """Parameters for an OpenMC Monte Carlo run.
+
+    These map directly to OpenMC's settings.xml fields.
+    Defaults are conservative — fast enough for geometry checking,
+    not production quality. Users should increase for real results.
+
+    Attributes:
+        particles:      Neutrons per batch.
+        inactive:       Inactive (warmup) batches — discarded from tallies.
+        batches:        Total batches (inactive + active).
+        seed:           Random number seed. Fixed default for reproducibility.
+        run_mode:       "eigenvalue" for criticality, "fixed source" for shielding.
+        energy_groups:  Number of energy groups for multi-group mode.
+                        None = continuous energy (default, recommended).
+    """
+    particles: int = 1000
+    inactive: int = 20
+    batches: int = 100
+    seed: int = 1
+    run_mode: str = "eigenvalue"
+    energy_groups: int | None = None
+    source_box: tuple[float, ...] | None = None
+
+    def __post_init__(self):
+        if self.inactive >= self.batches:
+            raise ValueError(
+                f"inactive batches ({self.inactive}) must be less than "
+                f"total batches ({self.batches})."
+            )
+        if self.run_mode not in ("eigenvalue", "fixed source"):
+            raise ValueError(
+                f"run_mode must be 'eigenvalue' or 'fixed source', "
+                f"got '{self.run_mode}'."
+            )
+
+
+# ---------------------------------------------------------------------------
+# Surface type mapping
+# ---------------------------------------------------------------------------
+
+# Maps our SurfaceType enum to OpenMC's surface type string.
+# Reference: https://docs.openmc.org/en/stable/io_formats/geometry.html
+_SURFACE_TYPE_MAP: dict[SurfaceType, str] = {
+    SurfaceType.PLANE_X:    "x-plane",
+    SurfaceType.PLANE_Y:    "y-plane",
+    SurfaceType.PLANE_Z:    "z-plane",
+    SurfaceType.CYLINDER_X: "x-cylinder",
+    SurfaceType.CYLINDER_Y: "y-cylinder",
+    SurfaceType.CYLINDER_Z: "z-cylinder",
+    SurfaceType.SPHERE:     "sphere",
+    SurfaceType.CONE_Z:     "z-cone",
+    SurfaceType.TORUS:      "z-torus",
+}
+
+# Maps our SurfaceType to the ordered parameter names OpenMC expects in coeffs.
+# The expander may use shorthand keys ("z", "r") — we normalise these below
+# via _PARAM_ALIASES before building the coeffs string.
+_SURFACE_PARAMS_MAP: dict[SurfaceType, list[str]] = {
+    SurfaceType.PLANE_X:    ["x0"],
+    SurfaceType.PLANE_Y:    ["y0"],
+    SurfaceType.PLANE_Z:    ["z0"],
+    SurfaceType.CYLINDER_X: ["y0", "z0", "r"],
+    SurfaceType.CYLINDER_Y: ["x0", "z0", "r"],
+    SurfaceType.CYLINDER_Z: ["x0", "y0", "r"],
+    SurfaceType.SPHERE:     ["x0", "y0", "z0", "r"],
+    SurfaceType.CONE_Z:     ["x0", "y0", "z0", "r2"],
+    SurfaceType.TORUS:      ["x0", "y0", "z0", "a", "b", "c"],
+}
+
+# Aliases: the expander uses short param names; map them to canonical names.
+# e.g. the expander writes params={"z": 0.0} but the canonical name is "z0".
+_PARAM_ALIASES: dict[str, str] = {
+    "x": "x0",
+    "y": "y0",
+    "z": "z0",
+}
+
+# Default parameter values when not explicitly specified.
+_SURFACE_PARAM_DEFAULTS: dict[str, float] = {
+    "x0": 0.0, "y0": 0.0, "z0": 0.0,
+    "r": 1.0, "r2": 1.0,
+    "a": 1.0, "b": 0.5, "c": 0.5,
+}
+
+
+# ---------------------------------------------------------------------------
+# ID helpers
+# ---------------------------------------------------------------------------
+
+def _int_id(id_val: str | int) -> str:
+    """Strip any leading alpha/underscore prefix and return the integer portion.
+
+    The domain model uses prefixed string IDs ('s1', 'c6') for readability.
+    OpenMC's XML parser requires bare integers everywhere an ID appears.
+
+    Examples:
+        's1'   -> '1'
+        'c12'  -> '12'
+        's_3'  -> '3'
+        '42'   -> '42'
+
+    Args:
+        id_val: Surface or cell ID from the domain model.
+
+    Returns:
+        String containing only the integer digits.
+
+    Raises:
+        ValueError: If the result is empty (no digits found in id_val).
+    """
+    result = re.sub(r"^[a-zA-Z_]+", "", str(id_val))
+    if not result:
+        raise ValueError(
+            f"Could not extract an integer ID from '{id_val}'. "
+            f"IDs must contain at least one digit."
+        )
+    return result
+
+
+def _resolve_param(params: dict, canonical_name: str) -> float:
+    """Look up a surface parameter, accepting both canonical and alias names.
+
+    OpenMC canonical names are like 'x0', 'y0', 'z0'. The expander may
+    write shorthand like 'x', 'y', 'z'. We check both before falling
+    back to the default.
+
+    Args:
+        params:         Surface.params dict from the domain model.
+        canonical_name: The canonical parameter name ('x0', 'z0', etc.).
+
+    Returns:
+        The parameter value as a float.
+    """
+    # Try canonical name first ('z0')
+    if canonical_name in params:
+        return float(params[canonical_name])
+
+    # Try reverse-alias ('z0' -> check if 'z' is in params)
+    for alias, canon in _PARAM_ALIASES.items():
+        if canon == canonical_name and alias in params:
+            return float(params[alias])
+
+    # Fall back to default
+    return _SURFACE_PARAM_DEFAULTS.get(canonical_name, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# Region expression serializer
+# ---------------------------------------------------------------------------
+
+def _region_to_openmc(region: Region) -> str:
+    """Recursively convert a Region expression tree to an OpenMC region string.
+
+    OpenMC region syntax:
+        -N   inside surface N  (negative halfspace)
+        +N   outside surface N (positive halfspace)
+        A B  intersection (space-separated, implicit AND)
+        A | B  union
+        ~A   complement
+
+    Surface IDs are converted from prefixed strings ('s1') to bare integers
+    ('1') since OpenMC's parser requires integer IDs throughout.
+
+    Args:
+        region: Any Region subclass from domain.geometry.
+
+    Returns:
+        OpenMC-compatible region string.
+
+    Raises:
+        TypeError: If an unknown Region subclass is encountered.
+    """
+    if isinstance(region, Inside):
+        return f"-{_int_id(region.surface_id)}"
+
+    elif isinstance(region, Outside):
+        return f"+{_int_id(region.surface_id)}"
+
+    elif isinstance(region, Intersection):
+        if not region.regions:
+            return ""
+        parts = [_region_to_openmc(r) for r in region.regions]
+        inner = " ".join(parts)
+        return f"({inner})" if len(region.regions) > 1 else inner
+
+    elif isinstance(region, Union):
+        if not region.regions:
+            return ""
+        parts = [_region_to_openmc(r) for r in region.regions]
+        inner = " | ".join(parts)
+        return f"({inner})" if len(region.regions) > 1 else inner
+
+    elif isinstance(region, Complement):
+        inner = _region_to_openmc(region.region)
+        return f"~{inner}"
+
+    else:
+        raise TypeError(
+            f"Unknown Region type: {type(region).__name__}. "
+            f"Add it to _region_to_openmc() in openmc_adapter.py."
+        )
+
+
+# ---------------------------------------------------------------------------
+# XML building helpers
+# ---------------------------------------------------------------------------
+
+def _pretty_xml(element: ET.Element) -> str:
+    """Serialize an ElementTree element to a pretty-printed XML string.
+
+    Args:
+        element: Root XML element.
+
+    Returns:
+        UTF-8 XML string with 2-space indentation and XML declaration.
+    """
+    raw = ET.tostring(element, encoding="unicode")
+    reparsed = minidom.parseString(raw)
+    pretty = reparsed.toprettyxml(indent="  ")
+    # toprettyxml adds its own declaration — strip it, we add our own
+    lines = pretty.split("\n")
+    if lines[0].startswith("<?xml"):
+        lines = lines[1:]
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + "\n".join(lines)
+
+
+def _surface_element(surface: Surface) -> ET.Element:
+    """Build an XML <surface> element from a Surface domain object.
+
+    OpenMC expects:
+        - id:     bare integer (no prefix)
+        - type:   OpenMC surface type string
+        - coeffs: single space-separated string of parameter values
+                  in the canonical order defined by _SURFACE_PARAMS_MAP
+
+    Args:
+        surface: Surface domain object.
+
+    Returns:
+        ET.Element for insertion into the geometry XML tree.
+
+    Raises:
+        KeyError: If surface.type_ is not in _SURFACE_TYPE_MAP.
+    """
+    openmc_type = _SURFACE_TYPE_MAP.get(surface.type_)
+    if openmc_type is None:
+        raise KeyError(
+            f"Surface type '{surface.type_}' has no OpenMC mapping. "
+            f"Add it to _SURFACE_TYPE_MAP in openmc_adapter.py."
+        )
+
+    el = ET.Element("surface")
+    el.set("id", _int_id(surface.id))
+    el.set("type", openmc_type)
+
+    # Build coeffs: space-separated values in canonical parameter order.
+    # Uses _resolve_param so both 'z' and 'z0' are accepted from the expander.
+    expected_params = _SURFACE_PARAMS_MAP.get(surface.type_, [])
+    if expected_params:
+        coeffs = " ".join(
+            str(_resolve_param(surface.params, p)) for p in expected_params
+        )
+        el.set("coeffs", coeffs)
+
+    if surface.boundary_type != BoundaryType.NONE:
+        el.set("boundary", surface.boundary_type.value)
+
+    return el
+
+
+def _cell_element(cell: Cell, material_id_map: dict[str, int]) -> ET.Element:
+    """Build an XML <cell> element from a Cell domain object.
+
+    Args:
+        cell: Cell domain object.
+        material_id_map: Maps material_id strings to integer IDs for OpenMC.
+                         OpenMC requires integer material IDs in geometry.xml.
+
+    Returns:
+        ET.Element for insertion into the geometry XML tree.
+
+    Raises:
+        ValueError: If cell references a material not in material_id_map.
+    """
+    el = ET.Element("cell")
+    el.set("id", _int_id(cell.id))
+
+    if cell.name:
+        el.set("name", cell.name)
+
+    if cell.material_id is not None:
+        mat_int_id = material_id_map.get(cell.material_id)
+        if mat_int_id is None:
+            raise ValueError(
+                f"Cell '{cell.id}' references material '{cell.material_id}' "
+                f"which is not in the material library. "
+                f"Add it to the project's materials before exporting."
+            )
+        el.set("material", str(mat_int_id))
+    else:
+        el.set("material", "void")
+
+    el.set("region", _region_to_openmc(cell.region))
+
+    return el
+
+
+# Nuclides that make a material fissile
+_FISSILE_NUCLIDES = frozenset({
+    "U233", "U235", "U238",  # uranium
+    "Pu238", "Pu239", "Pu240", "Pu241", "Pu242",  # plutonium
+    "Th232",  # thorium (relevant for your LFTR work too)
+    "Am241", "Cm244",  # minor actinides
+})
+
+
+def _is_fissile(material: Material) -> bool:
+    return any(nuc in _FISSILE_NUCLIDES for nuc in material.composition)
+
+
+def _compute_fissile_source_box(
+        geometry: CascadeGeometry,
+        materials: list[Material],
+) -> tuple[float, ...]:
+    """Compute a source box bounding all fissile cells.
+
+    Finds every cell whose material is fissile, then computes the
+    bounding box of those cells from their surface parameters.
+    Contracts the box by 1% on each side to ensure particles are
+    born strictly inside surfaces, never on them.
+    """
+    fissile_ids = {m.id for m in materials if _is_fissile(m)}
+    fissile_cells = [c for c in geometry.cells if c.material_id in fissile_ids]
+
+    if not fissile_cells:
+        raise ValueError(
+            "No fissile cells found in geometry. Cannot auto-compute "
+            "source distribution. Specify source_box in OpenMCRunSettings."
+        )
+
+    # Collect cylinder and plane surfaces that bound fissile cells
+    surface_map = {s.id: s for s in geometry.surfaces}
+
+    r_max = 0.0
+    z_min = float('inf')
+    z_max = float('-inf')
+
+    for cell in fissile_cells:
+        for sid in _surface_ids_in_region(cell.region):
+            surf = surface_map.get(sid)
+            if surf is None:
+                continue
+            if surf.type_ == SurfaceType.CYLINDER_Z:
+                r = float(surf.params.get("r", 0))
+                r_max = max(r_max, r)
+            elif surf.type_ == SurfaceType.PLANE_Z:
+                z = float(surf.params.get("z", surf.params.get("z0", 0)))
+                z_min = min(z_min, z)
+                z_max = max(z_max, z)
+
+    if r_max == 0 or z_min == float('inf'):
+        raise ValueError(
+            "Could not determine fissile cell bounds from geometry surfaces. "
+            "Specify source_box in OpenMCRunSettings."
+        )
+
+    # Contract by 1% to keep particles off surfaces
+    shrink = 0.99
+    r = r_max * shrink
+    dz = (z_max - z_min) * 0.01  # 1% inset from each z face
+
+    return (-r, -r, z_min + dz, r, r, z_max - dz)
+
+
+def _surface_ids_in_region(region) -> list[str]:
+    """Recursively collect all surface IDs referenced in a region."""
+    from ..domain.geometry import Inside, Outside, Intersection, Union, Complement
+    if isinstance(region, (Inside, Outside)):
+        return [region.surface_id]
+    elif isinstance(region, (Intersection, Union)):
+        ids = []
+        for r in region.regions:
+            ids.extend(_surface_ids_in_region(r))
+        return ids
+    elif isinstance(region, Complement):
+        return _surface_ids_in_region(region.region)
+    return []
+
+# ---------------------------------------------------------------------------
+# Main adapter class
+# ---------------------------------------------------------------------------
+
+class OpenMCAdapter:
+    """Converts CascadeGeometry and materials to OpenMC XML input files.
+
+    Usage:
+        adapter = OpenMCAdapter()
+        files = adapter.export(geometry, materials, settings)
+        # files is a dict: {"geometry.xml": "...", "materials.xml": "...", "settings.xml": "..."}
+        # Write each value to the job working directory before running OpenMC.
+    """
+
+    name = "openmc"
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def export(
+        self,
+        geometry: CascadeGeometry,
+        materials: list[Material],
+        settings: OpenMCRunSettings | None = None,
+    ) -> dict[str, str]:
+        """Export a complete set of OpenMC input files.
+
+        Args:
+            geometry: Resolved CascadeGeometry (surfaces + cells).
+            materials: All materials referenced by cells in this geometry.
+                       Any material_id used in a cell must appear here.
+            settings: Run parameters. Uses conservative defaults if None.
+
+        Returns:
+            Dict mapping filename to XML string content:
+                "geometry.xml"  — surface and cell definitions
+                "materials.xml" — material compositions
+                "settings.xml"  — Monte Carlo run parameters
+
+        Raises:
+            ValueError: If a cell references a material not in the materials list.
+            KeyError: If a surface type has no OpenMC mapping.
+        """
+        if settings is None:
+            settings = OpenMCRunSettings()
+
+        material_id_map = {mat.id: i + 1 for i, mat in enumerate(materials)}
+
+        return {
+            "geometry.xml": self.export_geometry(geometry, material_id_map),
+            "materials.xml": self.export_materials(materials, material_id_map),
+            "settings.xml": self.export_settings(settings, geometry, materials),
+        }
+
+    def export_geometry(
+        self,
+        geometry: CascadeGeometry,
+        material_id_map: dict[str, int] | None = None,
+    ) -> str:
+        """Serialize geometry to OpenMC geometry.xml format.
+
+        Args:
+            geometry: CascadeGeometry with surfaces and cells.
+            material_id_map: Maps string material IDs to integers.
+                             If None, void is used for all cells (useful
+                             for geometry-only validation runs).
+
+        Returns:
+            geometry.xml content as a string.
+        """
+        if material_id_map is None:
+            material_id_map = {}
+
+        root = ET.Element("geometry")
+
+        # Surfaces first — OpenMC requires surfaces declared before cells
+        for surface in geometry.surfaces:
+            root.append(_surface_element(surface))
+
+        # Then cells
+        for cell in geometry.cells:
+            root.append(_cell_element(cell, material_id_map))
+
+        return _pretty_xml(root)
+
+    def export_materials(
+        self,
+        materials: list[Material],
+        material_id_map: dict[str, int] | None = None,
+    ) -> str:
+        """Serialize materials to OpenMC materials.xml format.
+
+        Material composition is expressed as atom fractions (sum = 1.0)
+        or mass fractions (sum = -1.0 in OpenMC convention for mass).
+        We use atom fractions — the composition dict on Material is
+        expected to contain {nuclide: atom_fraction} pairs.
+
+        Nuclide names must match OpenMC's library naming convention:
+            "U235", "U238", "O16", "Zr90", "H1", etc.
+
+        Args:
+            materials: List of Material domain objects.
+            material_id_map: Maps material.id strings to integer IDs.
+                             Generated from enumerate(materials) if None.
+
+        Returns:
+            materials.xml content as a string.
+        """
+        if material_id_map is None:
+            material_id_map = {mat.id: i + 1 for i, mat in enumerate(materials)}
+
+        root = ET.Element("materials")
+
+        for mat in materials:
+            mat_el = ET.Element("material")
+            mat_el.set("id", str(material_id_map[mat.id]))
+            mat_el.set("name", mat.name)
+
+            if mat.density is not None:
+                density_el = ET.SubElement(mat_el, "density")
+                density_el.set("value", str(mat.density))
+                density_el.set("units", "g/cm3")
+
+            for nuclide, fraction in mat.composition.items():
+                nuclide_el = ET.SubElement(mat_el, "nuclide")
+                nuclide_el.set("name", nuclide)
+                nuclide_el.set("ao", str(fraction))
+
+            root.append(mat_el)
+
+        return _pretty_xml(root)
+
+    def export_settings(self,
+                        settings: OpenMCRunSettings,
+                        geometry: CascadeGeometry | None = None,
+                        materials: list[Material] | None = None,
+                        ) -> str:
+        """Serialize run settings to OpenMC settings.xml format.
+
+        Args:
+            settings: OpenMCRunSettings dataclass.
+
+        Returns:
+            settings.xml content as a string.
+        """
+
+        source_box = settings.source_box
+
+        if source_box is None and geometry is not None and materials is not None:
+            source_box = _compute_fissile_source_box(geometry, materials)
+        if source_box is None:
+            raise ValueError(
+                "Cannot determine source distribution. Either provide "
+                "source_box in OpenMCRunSettings, or pass geometry and "
+                "materials to export_settings() for automatic detection."
+            )
+
+        root = ET.Element("settings")
+
+        run_mode_el = ET.SubElement(root, "run_mode")
+        run_mode_el.text = settings.run_mode
+
+        particles_el = ET.SubElement(root, "particles")
+        particles_el.text = str(settings.particles)
+
+        batches_el = ET.SubElement(root, "batches")
+        batches_el.text = str(settings.batches)
+
+        inactive_el = ET.SubElement(root, "inactive")
+        inactive_el.text = str(settings.inactive)
+
+        seed_el = ET.SubElement(root, "seed")
+        seed_el.text = str(settings.seed)
+
+        # Source definition — isotropic point source at origin for eigenvalue.
+        # For fixed source mode this needs to be user-configurable (future work).
+        if settings.run_mode == "eigenvalue":
+            source_el = ET.SubElement(root, "source")
+            space_el = ET.SubElement(source_el, "space")
+            space_el.set("type", "box")
+            params_el = ET.SubElement(space_el, "parameters")
+            params_el.text = " ".join(str(v) for v in source_box)
+
+        return _pretty_xml(root)
+
+    def write_input_files(
+        self,
+        geometry: CascadeGeometry,
+        materials: list[Material],
+        output_dir: Path,
+        settings: OpenMCRunSettings | None = None,
+    ) -> list[Path]:
+        """Export and write all input files to a directory.
+
+        Convenience method used by the LocalBackend and SlurmBackend
+        to stage input files before submission.
+
+        Args:
+            geometry: Resolved geometry.
+            materials: Material library entries referenced by this geometry.
+            output_dir: Directory to write files into. Created if absent.
+            settings: Run parameters.
+
+        Returns:
+            List of Path objects for the written files.
+        """
+        output_dir.mkdir(parents=True, exist_ok=True)
+        files = self.export(geometry, materials, settings)
+
+        written: list[Path] = []
+        for filename, content in files.items():
+            path = output_dir / filename
+            path.write_text(content, encoding="utf-8")
+            written.append(path)
+
+        return written
+
+    # ------------------------------------------------------------------
+    # Result import (stub — HDF5 parsing is a separate implementation)
+    # ------------------------------------------------------------------
+
+    def export_geometry_stub(self, geometry: CascadeGeometry) -> dict[str, object]:
+        """Legacy stub — returns geometry as dict. Use export() instead."""
+        return {"simulator": self.name, "geometry": geometry.to_dict()}
+
+    def import_results(self, payload: dict[str, object]) -> list[TallyResult]:
+        """Import tally results from OpenMC statepoint HDF5 output.
+
+        OpenMC writes results to statepoint.<batch>.h5 files.
+        Parsing these requires the h5py library and knowledge of which
+        tallies were requested in the input (tallies.xml — not yet generated).
+
+        This is a stub — full implementation comes when tally definition
+        and result analysis are added to the pipeline.
+
+        Args:
+            payload: Dict containing at minimum {"statepoint_path": "..."}.
+
+        Returns:
+            Empty list until implemented.
+        """
+        # TODO: implement when tallies.xml generation and HDF5 parsing are added
+        # Steps:
+        #   1. Open statepoint file with h5py
+        #   2. Read tally IDs and scores
+        #   3. Extract mean + std dev per tally bin
+        #   4. Map to TallyResult domain objects
+        return []
