@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from ..dsl import loader
-from ..services.scene_builder import SceneBuilder
+from ..services.scene_builder_service import SceneBuilder
 from .schemas import (
     BoundsOut,
     CylinderLayerOut,

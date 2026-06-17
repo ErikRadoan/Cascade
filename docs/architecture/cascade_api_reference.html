@@ -1,0 +1,445 @@
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font-sans)}
+.page{padding:1.5rem 0}
+.section{margin-bottom:2.5rem}
+.section-header{display:flex;align-items:center;gap:10px;margin-bottom:1rem;padding-bottom:8px;border-bottom:0.5px solid var(--color-border-tertiary)}
+.section-title{font-size:15px;font-weight:500;color:var(--color-text-primary)}
+.section-icon{font-size:18px}
+.endpoint{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);margin-bottom:10px;overflow:hidden}
+.ep-header{display:flex;align-items:center;gap:10px;padding:10px 14px;cursor:pointer;user-select:none}
+.ep-header:hover{background:var(--color-background-secondary)}
+.method{font-size:11px;font-weight:500;padding:3px 8px;border-radius:4px;min-width:52px;text-align:center;flex-shrink:0}
+.GET{background:#EAF3DE;color:#27500A}
+.POST{background:#E6F1FB;color:#0C447C}
+.DELETE{background:#FCEBEB;color:#791F1F}
+.ep-path{font-family:var(--font-mono);font-size:13px;color:var(--color-text-primary);flex:1}
+.ep-desc{font-size:12px;color:var(--color-text-secondary);flex:2;text-align:right}
+.chevron{font-size:14px;color:var(--color-text-tertiary);transition:transform 0.15s}
+.chevron.open{transform:rotate(180deg)}
+.ep-body{display:none;padding:12px 14px 14px;border-top:0.5px solid var(--color-border-tertiary)}
+.ep-body.open{display:block}
+.schema-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.schema-box{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:10px 12px}
+.schema-label{font-size:11px;font-weight:500;color:var(--color-text-secondary);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:8px}
+.field{display:flex;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:0.5px solid var(--color-border-tertiary)}
+.field:last-child{border-bottom:none}
+.field-name{font-family:var(--font-mono);font-size:12px;color:var(--color-text-primary);min-width:120px;flex-shrink:0}
+.field-type{font-size:11px;color:#0C447C;background:#E6F1FB;padding:1px 5px;border-radius:3px;flex-shrink:0}
+.field-note{font-size:11px;color:var(--color-text-secondary);flex:1}
+.req-badge{font-size:10px;color:#791F1F;background:#FCEBEB;padding:1px 4px;border-radius:3px;flex-shrink:0}
+.opt-badge{font-size:10px;color:#3B6D11;background:#EAF3DE;padding:1px 4px;border-radius:3px;flex-shrink:0}
+.status-row{display:flex;gap:8px;margin-top:8px}
+.status{font-size:11px;padding:2px 7px;border-radius:3px;font-weight:500}
+.s2{background:#EAF3DE;color:#27500A}
+.s4{background:#FCEBEB;color:#791F1F}
+.s5{background:#FAEEDA;color:#633806}
+</style>
+<div class="page">
+
+<div class="section">
+  <div class="section-header">
+    <i class="ti ti-vector-triangle section-icon" style="color:#27500A" aria-hidden="true"></i>
+    <span class="section-title">Geometry</span>
+    <span style="font-size:12px;color:var(--color-text-secondary);margin-left:4px">prefix: /geometry</span>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method POST">POST</span>
+      <span class="ep-path">/validate</span>
+      <span class="ep-desc">Validate YAML without storing</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box">
+          <div class="schema-label">Request body</div>
+          <div class="field"><span class="field-name">text</span><span class="field-type">string</span><span class="req-badge">required</span><span class="field-note">YAML geometry definition</span></div>
+          <div class="field"><span class="field-name">name</span><span class="field-type">string</span><span class="opt-badge">optional</span><span class="field-note">Label for saving</span></div>
+        </div>
+        <div class="schema-box">
+          <div class="schema-label">Response — ValidationResponse</div>
+          <div class="field"><span class="field-name">valid</span><span class="field-type">bool</span><span class="field-note">Whether YAML passed all checks</span></div>
+          <div class="field"><span class="field-name">errors[]</span><span class="field-type">array</span><span class="field-note">type · message · component · field · line</span></div>
+          <div class="status-row"><span class="status s2">200 OK</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method POST">POST</span>
+      <span class="ep-path">/scene</span>
+      <span class="ep-desc">Build 3D scene from YAML</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box">
+          <div class="schema-label">Request body</div>
+          <div class="field"><span class="field-name">text</span><span class="field-type">string</span><span class="req-badge">required</span><span class="field-note">YAML geometry definition</span></div>
+        </div>
+        <div class="schema-box">
+          <div class="schema-label">Response — SceneResponse</div>
+          <div class="field"><span class="field-name">components[]</span><span class="field-type">array</span><span class="field-note">type · name · position · layers · box</span></div>
+          <div class="field"><span class="field-name">material_colors</span><span class="field-type">object</span><span class="field-note">material_id → hex color string</span></div>
+          <div class="field"><span class="field-name">bounds</span><span class="field-type">object</span><span class="field-note">x/y/z min + max floats</span></div>
+          <div class="field"><span class="field-name">error</span><span class="field-type">string?</span><span class="opt-badge">optional</span><span class="field-note">Set if validation fails</span></div>
+          <div class="status-row"><span class="status s2">200 OK</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method GET">GET</span>
+      <span class="ep-path">/</span>
+      <span class="ep-desc">List saved geometries</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Request</div><div style="font-size:12px;color:var(--color-text-secondary);padding:4px 0">No params</div></div>
+        <div class="schema-box">
+          <div class="schema-label">Response — GeometrySummary[]</div>
+          <div class="field"><span class="field-name">id</span><span class="field-type">string</span><span class="field-note">UUID</span></div>
+          <div class="field"><span class="field-name">name</span><span class="field-type">string</span></div>
+          <div class="field"><span class="field-name">created_at</span><span class="field-type">datetime</span></div>
+          <div class="field"><span class="field-name">n_surfaces</span><span class="field-type">int</span></div>
+          <div class="field"><span class="field-name">n_cells</span><span class="field-type">int</span></div>
+          <div class="status-row"><span class="status s2">200 OK</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method POST">POST</span>
+      <span class="ep-path">/</span>
+      <span class="ep-desc">Save a geometry definition</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box">
+          <div class="schema-label">Request body</div>
+          <div class="field"><span class="field-name">text</span><span class="field-type">string</span><span class="req-badge">required</span><span class="field-note">YAML geometry definition</span></div>
+          <div class="field"><span class="field-name">name</span><span class="field-type">string</span><span class="opt-badge">optional</span><span class="field-note">Falls back to geometry_{uuid8}</span></div>
+        </div>
+        <div class="schema-box">
+          <div class="schema-label">Response — GeometrySummary</div>
+          <div class="field"><span class="field-name">id</span><span class="field-type">string</span><span class="field-note">New UUID</span></div>
+          <div class="field"><span class="field-name">name</span><span class="field-type">string</span></div>
+          <div class="field"><span class="field-name">created_at</span><span class="field-type">datetime</span></div>
+          <div class="field"><span class="field-name">n_surfaces</span><span class="field-type">int</span></div>
+          <div class="field"><span class="field-name">n_cells</span><span class="field-type">int</span></div>
+          <div class="status-row"><span class="status s2">201 Created</span><span class="status s4">422 Validation error</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method GET">GET</span>
+      <span class="ep-path">/{geometry_id}</span>
+      <span class="ep-desc">Get geometry by ID</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Path param</div><div class="field"><span class="field-name">geometry_id</span><span class="field-type">string</span><span class="req-badge">required</span></div></div>
+        <div class="schema-box">
+          <div class="schema-label">Response — GeometryDetail</div>
+          <div class="field"><span class="field-name">id · name · created_at</span><span class="field-type">—</span><span class="field-note">Same as summary</span></div>
+          <div class="field"><span class="field-name">yaml_text</span><span class="field-type">string?</span></div>
+          <div class="field"><span class="field-name">param_values</span><span class="field-type">object</span><span class="field-note">param → float</span></div>
+          <div class="status-row"><span class="status s2">200 OK</span><span class="status s4">404 Not found</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method DELETE">DELETE</span>
+      <span class="ep-path">/{geometry_id}</span>
+      <span class="ep-desc">Delete a geometry</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Path param</div><div class="field"><span class="field-name">geometry_id</span><span class="field-type">string</span><span class="req-badge">required</span></div></div>
+        <div class="schema-box"><div class="schema-label">Response — DeletedResponse</div><div class="field"><span class="field-name">deleted</span><span class="field-type">bool</span><span class="field-note">Always true</span></div><div class="field"><span class="field-name">id</span><span class="field-type">string</span></div><div class="status-row"><span class="status s2">200 OK</span><span class="status s4">404 Not found</span></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <i class="ti ti-flask section-icon" style="color:#0C447C" aria-hidden="true"></i>
+    <span class="section-title">Materials</span>
+    <span style="font-size:12px;color:var(--color-text-secondary);margin-left:4px">prefix: /materials</span>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method GET">GET</span>
+      <span class="ep-path">/</span>
+      <span class="ep-desc">List all materials</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Request</div><div style="font-size:12px;color:var(--color-text-secondary);padding:4px 0">No params</div></div>
+        <div class="schema-box"><div class="schema-label">Response — MaterialSummary[]</div><div class="field"><span class="field-name">id</span><span class="field-type">string</span></div><div class="field"><span class="field-name">name</span><span class="field-type">string</span></div><div class="field"><span class="field-name">density</span><span class="field-type">float?</span><span class="field-note">g/cm³</span></div><div class="status-row"><span class="status s2">200 OK</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method POST">POST</span>
+      <span class="ep-path">/</span>
+      <span class="ep-desc">Create a material</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box">
+          <div class="schema-label">Request body</div>
+          <div class="field"><span class="field-name">name</span><span class="field-type">string</span><span class="req-badge">required</span><span class="field-note">ID = name uppercased</span></div>
+          <div class="field"><span class="field-name">density</span><span class="field-type">float</span><span class="req-badge">required</span><span class="field-note">g/cm³, must be &gt;0</span></div>
+          <div class="field"><span class="field-name">composition</span><span class="field-type">object</span><span class="req-badge">required</span><span class="field-note">nuclide → atom fraction</span></div>
+        </div>
+        <div class="schema-box"><div class="schema-label">Response — MaterialDetail</div><div class="field"><span class="field-name">id · name · density</span><span class="field-type">—</span><span class="field-note">Same as summary</span></div><div class="field"><span class="field-name">composition</span><span class="field-type">object</span></div><div class="status-row"><span class="status s2">201 Created</span><span class="status s4">409 ID conflict</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method GET">GET</span>
+      <span class="ep-path">/{material_id}</span>
+      <span class="ep-desc">Get a material</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Path param</div><div class="field"><span class="field-name">material_id</span><span class="field-type">string</span><span class="req-badge">required</span></div></div>
+        <div class="schema-box"><div class="schema-label">Response — MaterialDetail</div><div class="field"><span class="field-name">id · name · density · composition</span><span class="field-type">—</span></div><div class="status-row"><span class="status s2">200 OK</span><span class="status s4">404 Not found</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method DELETE">DELETE</span>
+      <span class="ep-path">/{material_id}</span>
+      <span class="ep-desc">Delete a material</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Path param</div><div class="field"><span class="field-name">material_id</span><span class="field-type">string</span><span class="req-badge">required</span></div></div>
+        <div class="schema-box"><div class="schema-label">Response — DeletedResponse</div><div class="field"><span class="field-name">deleted · id</span><span class="field-type">—</span></div><div class="status-row"><span class="status s2">200 OK</span><span class="status s4">404 Not found</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method POST">POST</span>
+      <span class="ep-path">/import</span>
+      <span class="ep-desc">Bulk import from JSON file</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box">
+          <div class="schema-label">Multipart form</div>
+          <div class="field"><span class="field-name">file</span><span class="field-type">UploadFile</span><span class="req-badge">required</span><span class="field-note">JSON array of material objects</span></div>
+          <div style="font-size:11px;color:var(--color-text-secondary);margin-top:8px">Each item: id · name · density · composition</div>
+        </div>
+        <div class="schema-box"><div class="schema-label">Response — MaterialImportResponse</div><div class="field"><span class="field-name">imported[]</span><span class="field-type">array</span><span class="field-note">MaterialSummary items added</span></div><div class="field"><span class="field-name">skipped[]</span><span class="field-type">string[]</span><span class="field-note">IDs that already existed</span></div><div class="field"><span class="field-name">errors[]</span><span class="field-type">string[]</span><span class="field-note">Parse/validation errors</span></div><div class="status-row"><span class="status s2">200 OK</span><span class="status s4">400 Bad JSON</span></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <i class="ti ti-cpu section-icon" style="color:#633806" aria-hidden="true"></i>
+    <span class="section-title">Jobs</span>
+    <span style="font-size:12px;color:var(--color-text-secondary);margin-left:4px">prefix: /jobs</span>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method POST">POST</span>
+      <span class="ep-path">/submit</span>
+      <span class="ep-desc">Submit a single simulation</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box">
+          <div class="schema-label">Request body</div>
+          <div class="field"><span class="field-name">geometry_text</span><span class="field-type">string</span><span class="req-badge">required</span></div>
+          <div class="field"><span class="field-name">material_ids</span><span class="field-type">string[]</span><span class="req-badge">required</span></div>
+          <div class="field"><span class="field-name">backend</span><span class="field-type">string</span><span class="opt-badge">optional</span><span class="field-note">default: "docker"</span></div>
+          <div class="field"><span class="field-name">particles</span><span class="field-type">int</span><span class="opt-badge">optional</span><span class="field-note">default: 1000</span></div>
+          <div class="field"><span class="field-name">inactive</span><span class="field-type">int</span><span class="opt-badge">optional</span><span class="field-note">default: 20</span></div>
+          <div class="field"><span class="field-name">batches</span><span class="field-type">int</span><span class="opt-badge">optional</span><span class="field-note">default: 100</span></div>
+          <div class="field"><span class="field-name">seed</span><span class="field-type">int</span><span class="opt-badge">optional</span><span class="field-note">default: 1</span></div>
+          <div class="field"><span class="field-name">notes</span><span class="field-type">string?</span><span class="opt-badge">optional</span></div>
+        </div>
+        <div class="schema-box"><div class="schema-label">Response — JobSummary (202)</div><div class="field"><span class="field-name">id</span><span class="field-type">string</span></div><div class="field"><span class="field-name">status</span><span class="field-type">string</span><span class="field-note">queued initially</span></div><div class="field"><span class="field-name">backend</span><span class="field-type">string</span></div><div class="field"><span class="field-name">param_values</span><span class="field-type">object</span></div><div class="field"><span class="field-name">created_at</span><span class="field-type">datetime</span></div><div class="field"><span class="field-name">notes</span><span class="field-type">string?</span></div><div class="status-row"><span class="status s2">202 Accepted</span><span class="status s4">422</span><span class="status s5">500</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method POST">POST</span>
+      <span class="ep-path">/sweep</span>
+      <span class="ep-desc">Submit a parametric sweep</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Request body</div><div class="field"><span class="field-name">geometry_text</span><span class="field-type">string</span><span class="req-badge">required</span><span class="field-note">Must include sweep() exprs</span></div><div class="field"><span class="field-name">material_ids</span><span class="field-type">string[]</span><span class="req-badge">required</span></div><div class="field"><span class="field-name">backend · particles · inactive · batches · seed · notes</span><span class="field-type">—</span><span class="field-note">Same as /submit</span></div></div>
+        <div class="schema-box"><div class="schema-label">Response — SweepResponse</div><div class="field"><span class="field-name">sweep_id</span><span class="field-type">string</span></div><div class="field"><span class="field-name">jobs[]</span><span class="field-type">JobSummary[]</span><span class="field-note">One per sweep point</span></div><div class="field"><span class="field-name">total</span><span class="field-type">int</span></div><div class="status-row"><span class="status s2">202 Accepted</span><span class="status s4">422</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method GET">GET</span>
+      <span class="ep-path">/</span>
+      <span class="ep-desc">List all jobs</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Request</div><div style="font-size:12px;color:var(--color-text-secondary);padding:4px 0">No params — returns most recent first</div></div>
+        <div class="schema-box"><div class="schema-label">Response — JobSummary[]</div><div class="field"><span class="field-name">id · status · backend · param_values · created_at · notes</span><span class="field-type">—</span></div><div class="status-row"><span class="status s2">200 OK</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method GET">GET</span>
+      <span class="ep-path">/{job_id}</span>
+      <span class="ep-desc">Get job detail + live status</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Path param</div><div class="field"><span class="field-name">job_id</span><span class="field-type">string</span><span class="req-badge">required</span></div></div>
+        <div class="schema-box"><div class="schema-label">Response — JobDetail</div><div class="field"><span class="field-name">+ geometry_id</span><span class="field-type">string</span></div><div class="field"><span class="field-name">+ started_at</span><span class="field-type">datetime?</span></div><div class="field"><span class="field-name">+ finished_at</span><span class="field-type">datetime?</span></div><div class="field"><span class="field-name">+ error</span><span class="field-type">string?</span></div><div class="field"><span class="field-name">+ working_dir</span><span class="field-type">string?</span></div><div class="status-row"><span class="status s2">200 OK</span><span class="status s4">404</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method POST">POST</span>
+      <span class="ep-path">/{job_id}/cancel</span>
+      <span class="ep-desc">Cancel a running job</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Path param</div><div class="field"><span class="field-name">job_id</span><span class="field-type">string</span><span class="req-badge">required</span></div></div>
+        <div class="schema-box"><div class="schema-label">Response — JobSummary</div><div class="field"><span class="field-name">status</span><span class="field-type">string</span><span class="field-note">cancelled</span></div><div class="status-row"><span class="status s2">200 OK</span><span class="status s4">404 · 409 already terminal</span><span class="status s5">500</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method DELETE">DELETE</span>
+      <span class="ep-path">/{job_id}</span>
+      <span class="ep-desc">Delete a terminal job</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Path param</div><div class="field"><span class="field-name">job_id</span><span class="field-type">string</span><span class="req-badge">required</span></div><div style="font-size:11px;color:var(--color-text-secondary);margin-top:6px">Running jobs must be cancelled first. Also removes working directory.</div></div>
+        <div class="schema-box"><div class="schema-label">Response — DeletedResponse</div><div class="field"><span class="field-name">deleted · id</span><span class="field-type">—</span></div><div class="status-row"><span class="status s2">200 OK</span><span class="status s4">404 · 409 still running</span></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    <i class="ti ti-chart-line section-icon" style="color:#533AB7" aria-hidden="true"></i>
+    <span class="section-title">Results</span>
+    <span style="font-size:12px;color:var(--color-text-secondary);margin-left:4px">prefix: /results</span>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method GET">GET</span>
+      <span class="ep-path">/{job_id}</span>
+      <span class="ep-desc">Get tally results for a job</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Path param</div><div class="field"><span class="field-name">job_id</span><span class="field-type">string</span><span class="req-badge">required</span><span class="field-note">Job must be completed</span></div></div>
+        <div class="schema-box"><div class="schema-label">Response — TallyResultSet</div><div class="field"><span class="field-name">job_id</span><span class="field-type">string</span></div><div class="field"><span class="field-name">param_values</span><span class="field-type">object</span></div><div class="field"><span class="field-name">tallies[]</span><span class="field-type">array</span><span class="field-note">Empty until HDF5 parsing</span></div><div class="field"><span class="field-name">k_effective</span><span class="field-type">float?</span><span class="field-note">Parsed from run.log</span></div><div class="field"><span class="field-name">k_uncertainty</span><span class="field-type">float?</span></div><div class="status-row"><span class="status s2">200 OK</span><span class="status s4">404 · 409 not completed</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method GET">GET</span>
+      <span class="ep-path">/sweep/{sweep_id}</span>
+      <span class="ep-desc">Get all results for a sweep</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Path param</div><div class="field"><span class="field-name">sweep_id</span><span class="field-type">string</span><span class="req-badge">required</span></div></div>
+        <div class="schema-box"><div class="schema-label">Response — SweepResultsResponse</div><div class="field"><span class="field-name">sweep_id</span><span class="field-type">string</span></div><div class="field"><span class="field-name">points[]</span><span class="field-type">TallyResultSet[]</span><span class="field-note">Null k-eff if still running</span></div><div class="status-row"><span class="status s2">200 OK</span><span class="status s4">404</span></div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggle(this)">
+      <span class="method GET">GET</span>
+      <span class="ep-path">/{job_id}/download</span>
+      <span class="ep-desc">Download statepoint HDF5</span>
+      <i class="ti ti-chevron-down chevron"></i>
+    </div>
+    <div class="ep-body">
+      <div class="schema-grid">
+        <div class="schema-box"><div class="schema-label">Path param</div><div class="field"><span class="field-name">job_id</span><span class="field-type">string</span><span class="req-badge">required</span><span class="field-note">Job must be completed</span></div></div>
+        <div class="schema-box"><div class="schema-label">Response</div><div class="field"><span class="field-name">Binary file</span><span class="field-type">HDF5</span><span class="field-note">statepoint.N.h5, highest batch</span></div><div style="font-size:11px;color:var(--color-text-secondary);margin-top:6px">Content-Type: application/x-hdf5</div><div class="status-row"><span class="status s2">200 OK</span><span class="status s4">404 no file · 409 not completed</span></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div>
+<script>
+function toggle(header){
+  const body=header.nextElementSibling;
+  const chevron=header.querySelector('.chevron');
+  const open=body.classList.toggle('open');
+  chevron.classList.toggle('open',open);
+}
+</script>
