@@ -1,8 +1,2 @@
-<svelte:head>
-  <title>Cascade</title>
-</svelte:head>
-<main>
-  <h1>Cascade</h1>
-  <p>Frontend scaffold ready for SvelteKit pages and components.</p>
-</main>
-
+<h1>Welcome to SvelteKit</h1>
+<p>Visit <a href="https://svelte.dev/docs/kit">svelte.dev/docs/kit</a> to read the documentation</p>
