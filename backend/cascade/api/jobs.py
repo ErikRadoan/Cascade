@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import shutil
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
+from ..repositories.db import SessionLocal, get_db
+from ..repositories.job_repository import JobRepository
+from ..repositories.sweep_repository import SweepRepository
 from ..adapters.openmc_adapter import OpenMCRunSettings
 from ..domain.job import JobStatus, SimulationJob
 from ..dsl import loader, expander
-from ..dsl.sweep import expand_sweep
+from ..dsl.sweep import expand_sweep, parse_sweep
 from ..execution.backend_config import (
     BackendConfig,
     DockerBackendConfig,
@@ -27,24 +31,8 @@ from .schemas import (
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
-# ---------------------------------------------------------------------------
-# In-memory stores — replace with repositories when DB is wired up
-# ---------------------------------------------------------------------------
-
-_jobs: dict[str, SimulationJob] = {}
-
-# Stores the raw backend config dict used to submit each job.
-# Keyed by job_id. Used to reconstruct the correct backend for
-# status polling and cancellation — a SLURM job must be polled
-# via SlurmBackend, not DockerBackend.
-_job_backend_configs: dict[str, dict] = {}
-
-# Sweep index: sweep_id -> list of job IDs
-_sweeps: dict[str, list[str]] = {}
-
 JOBS_BASE_DIR = Path.home() / ".cascade" / "jobs"
 
-# Default backend config used when the request omits backend_config.
 _DEFAULT_BACKEND_CONFIG = DockerBackendConfig(
     cli="podman",
     image="cascade-openmc:latest",
@@ -82,7 +70,7 @@ class SweepSubmitRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Pure helpers — no DB access, no Depends
 # ---------------------------------------------------------------------------
 
 def _to_summary(job: SimulationJob) -> JobSummary:
@@ -117,33 +105,49 @@ def _resolve_materials(material_ids: list[str]):
     return get_materials_by_ids(material_ids)
 
 
-def _make_run_settings(body: JobSubmitRequest | SweepSubmitRequest) -> OpenMCRunSettings:
-    return OpenMCRunSettings(
-        particles=body.particles,
-        inactive=body.inactive,
-        batches=body.batches,
-        seed=body.seed,
-    )
+def _extract_swept_params(geometry_text: str) -> dict[str, list[float]]:
+    """Parse sweep(...) expressions from YAML, returning param name -> value list."""
+    import yaml as _yaml
+    try:
+        raw = _yaml.safe_load(geometry_text)
+    except Exception:
+        return {}
 
+    result: dict[str, list[float]] = {}
+    for comp_name, comp_data in raw.items():
+        if not isinstance(comp_data, dict):
+            continue
+        for field_name, field_value in comp_data.items():
+            if field_name == "type":
+                continue
+            values = parse_sweep(field_value)
+            if values is not None:
+                result[f"{comp_name}.{field_name}"] = values
+    return result
+
+
+# ---------------------------------------------------------------------------
+# DB helpers — these are called from route handlers that already hold a
+# session, so they accept db as a parameter rather than opening their own.
+# The two exceptions (_backend_for_job, _get_job_or_404) are called from
+# within route handlers *after* the injected session may have closed, so
+# they open their own short-lived sessions via SessionLocal().
+# ---------------------------------------------------------------------------
 
 def _backend_for_job(job_id: str):
-    """Reconstruct the correct backend for an existing job.
+    """Reconstruct the correct backend for a job using its stored config.
 
-    Uses the config stored at submission time — ensures a SLURM job
-    is always managed by SlurmBackend, never accidentally by DockerBackend.
-
-    Raises:
-        HTTPException 404: If job_id is unknown.
-        HTTPException 500: If the stored config is corrupt or unresolvable.
+    Opens its own session because it is called both inside and outside
+    of route handler scope — making it a Depends target would complicate
+    the call sites without benefit.
     """
-    raw_config = _job_backend_configs.get(job_id)
+    with SessionLocal() as db:
+        raw_config = JobRepository(db).get_backend_config(job_id)
+
     if raw_config is None:
         raise HTTPException(
             status_code=500,
-            detail=(
-                f"No backend config found for job '{job_id}'. "
-                "The server may have restarted — backend config is not yet persisted."
-            ),
+            detail=f"No backend config found for job '{job_id}'.",
         )
     try:
         from pydantic import TypeAdapter
@@ -156,19 +160,28 @@ def _backend_for_job(job_id: str):
         )
 
 
+def _get_job_or_404(job_id: str, db: Session) -> SimulationJob:
+    """Fetch a job from the DB or raise 404.
+
+    Takes an injected session so callers don't open a second session
+    for this lookup when they already hold one.
+    """
+    job = JobRepository(db).get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    return job
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @router.post("/submit", response_model=JobSummary, status_code=202)
-async def submit_job(body: JobSubmitRequest) -> JobSummary:
-    """Submit a single simulation job.
-
-    The backend_config block controls where the simulation runs.
-    Omit it to use the default local Docker/Podman backend.
-
-    Examples — see GET /jobs/backends/available for all config fields.
-    """
+async def submit_job(
+    body: JobSubmitRequest,
+    db:   Session = Depends(get_db),
+) -> JobSummary:
+    """Submit a single simulation job."""
     errors = loader.validate(body.geometry_text)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
@@ -198,15 +211,15 @@ async def submit_job(body: JobSubmitRequest) -> JobSummary:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Submission failed: {e}")
 
-    _jobs[job_id] = job
-    # Store raw config dict — reconstructed when polling/cancelling
-    _job_backend_configs[job_id] = body.backend_config.model_dump()
-
+    JobRepository(db).save(job, body.backend_config.model_dump())
     return _to_summary(job)
 
 
 @router.post("/sweep", response_model=SweepResponse, status_code=202)
-async def submit_sweep(body: SweepSubmitRequest) -> SweepResponse:
+async def submit_sweep(
+    body: SweepSubmitRequest,
+    db:   Session = Depends(get_db),
+) -> SweepResponse:
     """Submit a parametric sweep — one job per parameter combination."""
     errors = loader.validate(body.geometry_text)
     if errors:
@@ -217,13 +230,21 @@ async def submit_sweep(body: SweepSubmitRequest) -> SweepResponse:
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    materials = _resolve_materials(body.material_ids)
-    backend   = create_backend(body.backend_config)
-    sweep_id  = str(uuid.uuid4())
-    job_ids:   list[str]       = []
-    summaries: list[JobSummary] = []
+    if not sweep_points:
+        raise HTTPException(
+            status_code=422,
+            detail="No sweep parameters found. Add sweep(...) expressions to the geometry.",
+        )
 
-    raw_config = body.backend_config.model_dump()
+    materials    = _resolve_materials(body.material_ids)
+    backend      = create_backend(body.backend_config)
+    sweep_id     = str(uuid.uuid4())
+    raw_config   = body.backend_config.model_dump()
+    swept_params = _extract_swept_params(body.geometry_text)
+    job_repo     = JobRepository(db)
+
+    job_ids:   list[str]        = []
+    summaries: list[JobSummary] = []
 
     for param_values, geometry in sweep_points:
         job_id = str(uuid.uuid4())
@@ -243,22 +264,59 @@ async def submit_sweep(body: SweepSubmitRequest) -> SweepResponse:
             job.status = JobStatus.FAILED
             job.error  = str(e)
 
-        _jobs[job_id] = job
-        _job_backend_configs[job_id] = raw_config
+        job_repo.save(job, raw_config)
         job_ids.append(job_id)
         summaries.append(_to_summary(job))
 
-    _sweeps[sweep_id] = job_ids
+    SweepRepository(db).save(
+        sweep_id=      sweep_id,
+        job_ids=       job_ids,
+        geometry_text= body.geometry_text,
+        swept_params=  swept_params,
+        notes=         body.notes,
+    )
+
     return SweepResponse(sweep_id=sweep_id, jobs=summaries, total=len(summaries))
+
+
+@router.get("/sweeps", response_model=list[dict])
+async def list_sweeps(db: Session = Depends(get_db)) -> list[dict]:
+    """List all parametric sweeps, most recent first."""
+    return [r.to_dict() for r in SweepRepository(db).list()]
+
+
+@router.get("/sweeps/{sweep_id}", response_model=dict)
+async def get_sweep(
+    sweep_id: str,
+    db:       Session = Depends(get_db),
+) -> dict:
+    """Get sweep metadata and derived status."""
+    record = SweepRepository(db).get(sweep_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Sweep '{sweep_id}' not found.")
+    return record.to_dict()
+
+
+@router.delete("/sweeps/{sweep_id}", response_model=DeletedResponse)
+async def delete_sweep(
+    sweep_id:    str,
+    delete_jobs: bool    = False,
+    db:          Session = Depends(get_db),
+) -> DeletedResponse:
+    """Delete a sweep record.
+
+    Query params:
+        delete_jobs: Also delete child job records and working directories.
+    """
+    deleted = SweepRepository(db).delete(sweep_id, delete_jobs=delete_jobs)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Sweep '{sweep_id}' not found.")
+    return DeletedResponse(id=sweep_id)
 
 
 @router.get("/backends/available")
 async def list_available_backends() -> list[dict]:
-    """List available backend types with their configuration schemas.
-
-    The frontend uses this to build the backend configuration form
-    dynamically — showing the right fields for Docker vs SLURM etc.
-    """
+    """List available backend types with their configuration schemas."""
     from ..execution.backend_config import (
         DockerBackendConfig, LocalBackendConfig, SlurmBackendConfig,
     )
@@ -288,31 +346,37 @@ async def list_available_backends() -> list[dict]:
 
 
 @router.get("/", response_model=list[JobSummary])
-async def list_jobs() -> list[JobSummary]:
+async def list_jobs(db: Session = Depends(get_db)) -> list[JobSummary]:
     """List all jobs, most recent first."""
-    return [
-        _to_summary(j)
-        for j in sorted(_jobs.values(), key=lambda j: j.created_at, reverse=True)
-    ]
+    return [_to_summary(j) for j in JobRepository(db).list()]
 
 
 @router.get("/{job_id}", response_model=JobDetail)
-async def get_job(job_id: str) -> JobDetail:
+async def get_job(
+    job_id: str,
+    db:     Session = Depends(get_db),
+) -> JobDetail:
     """Get current status and detail for a job.
 
-    If still running, polls the correct backend before returning.
+    Polls the correct backend if still running, then persists any status change.
     """
-    job = _jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    job = _get_job_or_404(job_id, db)
 
     if job.status == JobStatus.RUNNING:
         try:
             backend    = _backend_for_job(job_id)
-            job.status = backend.status(job)
-            _jobs[job_id] = job
+            new_status = backend.status(job)
+            if new_status != job.status:
+                job.status = new_status
+                JobRepository(db).update_status(
+                    job_id=      job_id,
+                    status=      new_status,
+                    error=       job.error,
+                    started_at=  job.started_at,
+                    finished_at= job.finished_at,
+                )
         except HTTPException:
-            pass   # stale status is better than surfacing a 500 here
+            pass
         except Exception:
             pass
 
@@ -320,11 +384,12 @@ async def get_job(job_id: str) -> JobDetail:
 
 
 @router.post("/{job_id}/cancel", response_model=JobSummary)
-async def cancel_job(job_id: str) -> JobSummary:
+async def cancel_job(
+    job_id: str,
+    db:     Session = Depends(get_db),
+) -> JobSummary:
     """Cancel a queued or running job using the correct backend."""
-    job = _jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    job = _get_job_or_404(job_id, db)
 
     if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
         raise HTTPException(
@@ -336,19 +401,25 @@ async def cancel_job(job_id: str) -> JobSummary:
 
     try:
         job = backend.cancel(job)
-        _jobs[job_id] = job
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cancel failed: {e}")
+
+    JobRepository(db).update_status(
+        job_id=      job_id,
+        status=      job.status,
+        finished_at= job.finished_at,
+    )
 
     return _to_summary(job)
 
 
 @router.delete("/{job_id}", response_model=DeletedResponse)
-async def delete_job(job_id: str) -> DeletedResponse:
+async def delete_job(
+    job_id: str,
+    db:     Session = Depends(get_db),
+) -> DeletedResponse:
     """Delete a job record and its working directory."""
-    job = _jobs.get(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    job = _get_job_or_404(job_id, db)
 
     if job.status == JobStatus.RUNNING:
         raise HTTPException(
@@ -356,10 +427,8 @@ async def delete_job(job_id: str) -> DeletedResponse:
             detail="Cannot delete a running job. Cancel it first.",
         )
 
-    import shutil
     if job.working_dir and job.working_dir.exists():
         shutil.rmtree(job.working_dir, ignore_errors=True)
 
-    del _jobs[job_id]
-    _job_backend_configs.pop(job_id, None)
+    JobRepository(db).delete(job_id)
     return DeletedResponse(id=job_id)
