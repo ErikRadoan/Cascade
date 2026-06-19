@@ -1,85 +1,201 @@
-"""Geometry expander: converts validated schema objects into CascadeGeometry."""
+"""Geometry expander v3 — fixes the duplicate z-plane / lost particle bug.
+
+Root cause of v2 bug:
+    The fuel pin template created its own axial z-planes at z=0 and z=height.
+    The box template also created z-planes at z=0 and z=height.
+    After translation these were geometrically identical but separate surfaces.
+    OpenMC saw regions where the fill cell and pin cells had inconsistent
+    axial bounds — particles crossing into those regions got lost.
+
+Fix:
+    The fuel pin template now produces ONLY radial surfaces (cylinders).
+    Axial bounds are contributed solely by the Box placement.
+    The box z-planes are stored in ctx after Phase 2B so that Phase 2A
+    pin placements can reference them.
+
+    This requires a two-pass approach:
+        Pass 1:  Expand box template, translate, store z-planes in ctx.
+        Pass 2:  Expand and translate fuel pin placements using ctx z-planes.
+
+    Declaration order in YAML still doesn't matter — we always process
+    Box SinglePlacements before other placements.
+"""
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..domain.geometry import (
-    BoundaryType,
-    CascadeGeometry,
-    Cell,
-    Inside,
-    Intersection,
-    Outside,
-    Surface,
-    SurfaceType,
+    BoundaryType, CascadeGeometry, Cell, Complement,
+    Inside, Intersection, Outside, Region, Surface, SurfaceType, Union,
 )
-from .schema.bounding_box import BoundingBoxSchema
+from .schema.base import BaseComponentSchema
+from .schema.box import BoxSchema
 from .schema.fuel_pin import FuelPinSchema
+from .schema.lattice import HexLatticeSchema, SquareLatticeSchema
+from .schema.single_placement import SinglePlacementSchema
 
 
 # ---------------------------------------------------------------------------
-# Resolution context
+# Context
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Context:
-    """State shared across all expanders within one geometry expansion.
-
-    Attributes:
-        param_values:
-            Sweep parameter substitutions — stored on the final
-            CascadeGeometry for result tracking.
-
-        outermost_surfaces:
-            IDs of each inner component's outermost radial surface.
-            Fuel pin expanders append the cladding cylinder ID here.
-            BoundingBox reads this to build the fill-material cell region
-            ("inside box AND outside all inner geometry").
-
-        axial_bounds:
-            The bottom and top bounding surfaces for the problem, if already
-            created by a BoundingBox expander. Structure:
-                {"bot": Surface, "top": Surface}
-            When set, inner components (fuel pins) reuse these surfaces
-            as their axial caps instead of creating new duplicate planes.
-            This avoids two separate surfaces at the same Z coordinate,
-            one with boundary_type and one without — which makes OpenMC
-            complain that some boundary surfaces have no condition applied.
-
-        _counter:
-            Monotonically increasing integer for ID generation.
-    """
-    param_values:       dict[str, float]           = field(default_factory=dict)
-    outermost_surfaces: list[str]                  = field(default_factory=list)
-    axial_bounds:       dict[str, Surface] | None  = field(default=None)
-    _counter:           int                        = field(default=0, init=False, repr=False)
+    param_values:       dict[str, float]       = field(default_factory=dict)
+    outermost_surfaces: list[str]              = field(default_factory=list)
+    # Axial bounds from the placed Box — shared by all pin placements
+    axial_bot_id:       str | None             = field(default=None)
+    axial_top_id:       str | None             = field(default=None)
+    _counter:           int                    = field(default=0, init=False, repr=False)
 
     def fresh_id(self, prefix: str = "s") -> str:
         self._counter += 1
         return f"{prefix}{self._counter}"
 
+    def has_axial_bounds(self) -> bool:
+        return self.axial_bot_id is not None and self.axial_top_id is not None
+
 
 # ---------------------------------------------------------------------------
-# BoundingBox expander  (must run FIRST — sets ctx.axial_bounds)
+# Translation helpers
 # ---------------------------------------------------------------------------
 
-def _expand_bounding_box(
-    schema: BoundingBoxSchema,
+_TRANSLATE_PARAMS: dict[SurfaceType, dict[str, str]] = {
+    SurfaceType.PLANE_X:    {"x": "dx", "x0": "dx"},
+    SurfaceType.PLANE_Y:    {"y": "dy", "y0": "dy"},
+    SurfaceType.PLANE_Z:    {"z": "dz", "z0": "dz"},
+    SurfaceType.CYLINDER_Z: {"x": "dx", "x0": "dx", "y": "dy", "y0": "dy"},
+    SurfaceType.CYLINDER_X: {"y": "dy", "y0": "dy", "z": "dz", "z0": "dz"},
+    SurfaceType.CYLINDER_Y: {"x": "dx", "x0": "dx", "z": "dz", "z0": "dz"},
+    SurfaceType.SPHERE:     {"x": "dx", "x0": "dx", "y": "dy", "y0": "dy",
+                             "z": "dz", "z0": "dz"},
+}
+
+
+def _translate_params(type_: SurfaceType, params: dict,
+                      dx: float, dy: float, dz: float) -> dict:
+    offsets = {"dx": dx, "dy": dy, "dz": dz}
+    axes    = _TRANSLATE_PARAMS.get(type_, {})
+    result  = dict(params)
+    for param_key, offset_key in axes.items():
+        if param_key in result:
+            result[param_key] = float(result[param_key]) + offsets[offset_key]
+    return result
+
+
+def _remap_region(region: Region, id_map: dict[str, str]) -> Region:
+    if isinstance(region, Inside):
+        return Inside(id_map.get(region.surface_id, region.surface_id))
+    if isinstance(region, Outside):
+        return Outside(id_map.get(region.surface_id, region.surface_id))
+    if isinstance(region, Intersection):
+        return Intersection([_remap_region(r, id_map) for r in region.regions])
+    if isinstance(region, Union):
+        return Union([_remap_region(r, id_map) for r in region.regions])
+    if isinstance(region, Complement):
+        return Complement(_remap_region(region.region, id_map))
+    return region
+
+
+def _translate(objects: list[Surface | Cell], dx: float, dy: float, dz: float,
+               ctx: Context) -> tuple[list[Surface | Cell], dict[str, str]]:
+    """Deep-copy objects with fresh IDs and translated coordinates."""
+    id_map:       dict[str, str] = {}
+    new_surfaces: list[Surface]  = []
+    new_cells:    list[Cell]     = []
+
+    for obj in objects:
+        if isinstance(obj, Surface):
+            new_id = ctx.fresh_id("s")
+            id_map[obj.id] = new_id
+            new_surfaces.append(Surface(
+                id=            new_id,
+                type_=         obj.type_,
+                params=        _translate_params(obj.type_, obj.params, dx, dy, dz),
+                boundary_type= obj.boundary_type,
+            ))
+
+    for obj in objects:
+        if isinstance(obj, Cell):
+            new_cells.append(Cell(
+                id=          ctx.fresh_id("c"),
+                region=      _remap_region(obj.region, id_map),
+                material_id= obj.material_id,
+                name=        obj.name,
+            ))
+
+    return new_surfaces + new_cells, id_map
+
+
+# ---------------------------------------------------------------------------
+# Template expanders — produce geometry at the origin, NO axial planes
+# for FuelPin (axial bounds come from the Box)
+# ---------------------------------------------------------------------------
+
+def _expand_fuel_pin_radial(
+    schema: FuelPinSchema,
     ctx: Context,
-) -> list[Surface | Cell]:
-    """Expand BoundingBoxSchema into six boundary surfaces and a fill cell.
+) -> tuple[list[Surface], str | None]:
+    """Expand fuel pin radial surfaces ONLY — no z-planes.
 
-    Must be called BEFORE fuel pin expanders so that ctx.axial_bounds is
-    set and inner components can reuse the z-planes rather than creating
-    duplicates without boundary conditions.
+    Z-planes are shared from the Box placement via ctx.axial_bot_id / axial_top_id.
+    This prevents duplicate coincident surfaces that cause lost particles.
 
-    The fill cell is added AFTER all inner geometry is known, so this
-    function splits its work: surfaces are returned immediately, but the
-    fill cell is deferred and appended at the end of expand().
-    To keep the API simple we return all six surfaces here and store a
-    reference so expand() can build the fill cell after all components run.
+    Returns (radial_surfaces, outermost_cylinder_id).
+    """
+    surfaces: list[Surface] = []
+    layer_surfaces: list[Surface] = []
+
+    for outer_r, _ in schema.radial_layers():
+        s = Surface(id=ctx.fresh_id("s"), type_=SurfaceType.CYLINDER_Z,
+                    params={"r": outer_r})
+        surfaces.append(s)
+        layer_surfaces.append(s)
+
+    outermost_id = layer_surfaces[-1].id if layer_surfaces else None
+    return surfaces, outermost_id
+
+
+def _build_fuel_pin_cells(
+    schema: FuelPinSchema,
+    layer_surface_ids: list[str],
+    bot_id: str,
+    top_id: str,
+    ctx: Context,
+) -> list[Cell]:
+    """Build fuel pin cells using provided surface IDs.
+
+    Uses the axial bound IDs from context (shared with the box).
+    """
+    cells: list[Cell] = []
+    axial = [Outside(bot_id), Inside(top_id)]
+
+    for i, (_, mat_id) in enumerate(schema.radial_layers()):
+        outer_id = layer_surface_ids[i]
+        radial = (
+            [Inside(outer_id)]
+            if i == 0
+            else [Outside(layer_surface_ids[i-1]), Inside(outer_id)]
+        )
+        cells.append(Cell(
+            id=          ctx.fresh_id("c"),
+            region=      Intersection(radial + axial),
+            material_id= mat_id,
+            name=        f"{mat_id}_layer_{i}",
+        ))
+    return cells
+
+
+def _expand_box_surfaces(
+    schema: BoxSchema, ctx: Context,
+) -> tuple[list[Surface], dict[str, str]]:
+    """Expand box boundary surfaces at origin.
+
+    Returns (surfaces, label_map) where label_map maps
+    'bot'/'top'/'xlo'/'xhi'/'ylo'/'yhi' to surface IDs.
     """
     hx = schema.half_x()
     hy = schema.half_y()
@@ -93,193 +209,270 @@ def _expand_bounding_box(
                     params={"y": -hy}, boundary_type=bt)
     s_yhi = Surface(id=ctx.fresh_id("s"), type_=SurfaceType.PLANE_Y,
                     params={"y": +hy}, boundary_type=bt)
-    s_zlo = Surface(id=ctx.fresh_id("s"), type_=SurfaceType.PLANE_Z,
-                    params={"z": schema.z_min}, boundary_type=bt)
-    s_zhi = Surface(id=ctx.fresh_id("s"), type_=SurfaceType.PLANE_Z,
-                    params={"z": schema.z_max}, boundary_type=bt)
+    s_bot = Surface(id=ctx.fresh_id("s"), type_=SurfaceType.PLANE_Z,
+                    params={"z": 0.0}, boundary_type=bt)
+    s_top = Surface(id=ctx.fresh_id("s"), type_=SurfaceType.PLANE_Z,
+                    params={"z": schema.z_size}, boundary_type=bt)
 
-    # Store axial planes in context so fuel pin expanders reuse them
-    ctx.axial_bounds = {"bot": s_zlo, "top": s_zhi}
-
-    # Lateral planes stored for fill-cell construction in expand()
-    ctx._lateral_surfaces = {          # type: ignore[attr-defined]
-        "xlo": s_xlo, "xhi": s_xhi,
-        "ylo": s_ylo, "yhi": s_yhi,
-        "zlo": s_zlo, "zhi": s_zhi,
+    label_map = {
+        "xlo": s_xlo.id, "xhi": s_xhi.id,
+        "ylo": s_ylo.id, "yhi": s_yhi.id,
+        "bot": s_bot.id, "top": s_top.id,
     }
-    ctx._fill_material = schema.material   # type: ignore[attr-defined]
-
-    return [s_xlo, s_xhi, s_ylo, s_yhi, s_zlo, s_zhi]
+    return [s_xlo, s_xhi, s_ylo, s_yhi, s_bot, s_top], label_map
 
 
 # ---------------------------------------------------------------------------
-# FuelPin expander  (must run AFTER BoundingBox sets ctx.axial_bounds)
+# Placement functions
 # ---------------------------------------------------------------------------
 
-def _expand_fuel_pin(
-    schema: FuelPinSchema,
+def _place_box(
+    schema: BoxSchema,
+    position: tuple[float, float, float],
     ctx: Context,
-    z_offset: float = 0.0,
 ) -> list[Surface | Cell]:
-    """Expand a FuelPinSchema into surfaces and cells.
+    """Place a Box — translate its surfaces and register axial bounds in ctx.
 
-    If ctx.axial_bounds is set (BoundingBox was expanded first), the fuel
-    pin reuses those z-planes as its axial caps. This ensures there is only
-    ONE z-plane surface at each axial boundary — the one that already carries
-    the correct boundary_type — rather than a duplicate without it.
-
-    If no bounding box has been defined yet, the fuel pin creates its own
-    z-planes (useful for standalone testing without a bounding box).
-
-    Registers the outermost cylinder ID in ctx.outermost_surfaces for the
-    fill cell construction.
+    The fill cell is built after all inner placements so outermost_surfaces
+    is complete. We store the translated z-plane IDs in ctx here so pin
+    placements that follow can reuse them.
     """
-    surfaces: list[Surface] = []
-    cells:    list[Cell]    = []
+    dx, dy, dz = position
+    box_surfaces, label_map = _expand_box_surfaces(schema, ctx)
 
-    # --- Axial planes: reuse box planes if available, else create new ones ---
-    if ctx.axial_bounds is not None:
-        s_bot = ctx.axial_bounds["bot"]
-        s_top = ctx.axial_bounds["top"]
-        # Don't add them to surfaces — they're already in the geometry
-        # from the BoundingBox expansion.
-    else:
-        s_bot = Surface(
-            id=ctx.fresh_id("s"),
-            type_=SurfaceType.PLANE_Z,
-            params={"z": z_offset},
+    # Translate all box surfaces
+    translated: list[Surface] = []
+    id_map: dict[str, str] = {}
+    for s in box_surfaces:
+        new_id = ctx.fresh_id("s")
+        id_map[s.id] = new_id
+        translated.append(Surface(
+            id=            new_id,
+            type_=         s.type_,
+            params=        _translate_params(s.type_, s.params, dx, dy, dz),
+            boundary_type= s.boundary_type,
+        ))
+
+    # Remap label_map to translated IDs
+    translated_labels = {k: id_map[v] for k, v in label_map.items()}
+
+    # Store axial bounds in context — pins placed after this share these surfaces
+    ctx.axial_bot_id = translated_labels["bot"]
+    ctx.axial_top_id = translated_labels["top"]
+
+    return translated, translated_labels
+
+
+def _place_fuel_pin(
+    schema: FuelPinSchema,
+    position: tuple[float, float, float],
+    ctx: Context,
+) -> list[Surface | Cell]:
+    """Place one fuel pin instance.
+
+    Requires ctx.axial_bot_id and ctx.axial_top_id to be set
+    (i.e. a Box must have been placed first).
+    """
+    if not ctx.has_axial_bounds():
+        raise RuntimeError(
+            "Cannot place a FuelPin without axial bounds. "
+            "Place a Box (via SinglePlacement) before placing fuel pins. "
+            "The Box provides the z-plane surfaces shared by all pins."
         )
-        s_top = Surface(
-            id=ctx.fresh_id("s"),
-            type_=SurfaceType.PLANE_Z,
-            params={"z": z_offset + schema.pellet_height},
-        )
-        surfaces.extend([s_bot, s_top])
 
-    # --- Radial cylinder surfaces ---
-    layer_surfaces: list[Surface] = []
-    for outer_r, _ in schema.radial_layers():
-        s = Surface(
-            id=ctx.fresh_id("s"),
-            type_=SurfaceType.CYLINDER_Z,
-            params={"r": outer_r},
-        )
-        surfaces.append(s)
-        layer_surfaces.append(s)
+    dx, dy, dz = position
 
-    # Register outermost surface for fill cell
-    if layer_surfaces:
-        ctx.outermost_surfaces.append(layer_surfaces[-1].id)
+    # Expand radial surfaces at origin, then translate in X/Y only
+    # (z stays 0 — axial bounds come from the box's z-planes)
+    radial_surfaces, outermost_id = _expand_fuel_pin_radial(schema, ctx)
 
-    # --- One cell per radial layer ---
-    axial_region = [Outside(s_bot.id), Inside(s_top.id)]
+    # Translate only X and Y (cylinders have no z-position param, but
+    # their x0/y0 centre coordinates shift with the placement)
+    translated_surfaces: list[Surface] = []
+    id_map: dict[str, str] = {}
+    for s in radial_surfaces:
+        new_id = ctx.fresh_id("s")
+        id_map[s.id] = new_id
+        translated_surfaces.append(Surface(
+            id=            new_id,
+            type_=         s.type_,
+            params=        _translate_params(s.type_, s.params, dx, dy, 0.0),
+            boundary_type= s.boundary_type,
+        ))
 
-    for i, (_, material_id) in enumerate(schema.radial_layers()):
-        outer_surf = layer_surfaces[i]
+    # Register translated outermost cylinder for fill cell
+    if outermost_id:
+        new_outermost = id_map.get(outermost_id)
+        if new_outermost:
+            ctx.outermost_surfaces.append(new_outermost)
 
-        if i == 0:
-            radial_region = [Inside(outer_surf.id)]
-        else:
-            inner_surf = layer_surfaces[i - 1]
-            radial_region = [Outside(inner_surf.id), Inside(outer_surf.id)]
+    # Build cells using translated surface IDs and shared axial bounds
+    translated_layer_ids = [id_map[s.id] for s in radial_surfaces]
+    cells = _build_fuel_pin_cells(
+        schema=            schema,
+        layer_surface_ids= translated_layer_ids,
+        bot_id=            ctx.axial_bot_id,
+        top_id=            ctx.axial_top_id,
+        ctx=               ctx,
+    )
 
-        cell = Cell(
-            id=ctx.fresh_id("c"),
-            region=Intersection(radial_region + axial_region),
-            material_id=material_id,
-            name=f"{material_id}_layer_{i}",
-        )
-        cells.append(cell)
+    return translated_surfaces + cells
 
-    return surfaces + cells
+
+def _build_fill_cell(
+    schema: BoxSchema,
+    translated_labels: dict[str, str],
+    ctx: Context,
+) -> Cell:
+    """Build the water fill cell once all pins are placed."""
+    box_interior = [
+        Outside(translated_labels["xlo"]),
+        Inside(translated_labels["xhi"]),
+        Outside(translated_labels["ylo"]),
+        Inside(translated_labels["yhi"]),
+        Outside(translated_labels["bot"]),
+        Inside(translated_labels["top"]),
+    ]
+    outer_exclusions = [Outside(sid) for sid in ctx.outermost_surfaces]
+
+    return Cell(
+        id=          ctx.fresh_id("c"),
+        region=      Intersection(box_interior + outer_exclusions),
+        material_id= schema.material,
+        name=        f"fill_{schema.material}",
+    )
 
 
 # ---------------------------------------------------------------------------
-# Dispatch table
-# ---------------------------------------------------------------------------
-
-_EXPANDERS = {
-    BoundingBoxSchema: _expand_bounding_box,   # NOTE: box first in this dict
-    FuelPinSchema:     _expand_fuel_pin,
-}
-
-
-# ---------------------------------------------------------------------------
-# Public API
+# Main expand()
 # ---------------------------------------------------------------------------
 
 def expand(
-    schemas: dict[str, object],
+    schemas:      dict[str, BaseComponentSchema],
     param_values: dict[str, float] | None = None,
-    geom_name: str = "cascade_geometry",
+    geom_name:    str = "cascade_geometry",
 ) -> CascadeGeometry:
-    """Expand validated schema objects into a CascadeGeometry.
+    """Expand validated schemas into a CascadeGeometry.
 
-    Expansion order:
-        BoundingBox components are always expanded first, regardless of their
-        position in the YAML, so that ctx.axial_bounds is available when
-        fuel pins and other inner geometry are processed.
-
-        All other components are expanded in YAML declaration order.
-
-    After all components are expanded, the fill cell for the BoundingBox
-    is constructed (it needs ctx.outermost_surfaces to be complete first).
+    Ordering (enforced regardless of YAML declaration order):
+        Step 1: Find the Box SinglePlacement, translate its surfaces,
+                register axial bounds in ctx.
+        Step 2: Place all fuel pin placements (SinglePlacement + lattices),
+                sharing the box's z-planes as axial bounds.
+        Step 3: Build the fill cell using ctx.outermost_surfaces.
     """
     ctx = Context(param_values=param_values or {})
-    all_objects: list[Surface | Cell] = []
 
-    # --- Pass 1: BoundingBox first (sets ctx.axial_bounds) ---
-    for component_name, schema in schemas.items():
-        if isinstance(schema, BoundingBoxSchema):
-            expanded = _expand_bounding_box(schema, ctx)
-            all_objects.extend(expanded)
+    # Separate templates from placements
+    templates:  dict[str, BaseComponentSchema] = {}
+    placements: dict[str, BaseComponentSchema] = {}
 
-    # --- Pass 2: everything else ---
-    for component_name, schema in schemas.items():
-        if isinstance(schema, BoundingBoxSchema):
-            continue   # already handled
+    _PLACEMENT_TYPES = (SinglePlacementSchema, SquareLatticeSchema, HexLatticeSchema)
+    for name, schema in schemas.items():
+        if isinstance(schema, _PLACEMENT_TYPES):
+            placements[name] = schema
+        else:
+            templates[name] = schema
 
-        expander_fn = _EXPANDERS.get(type(schema))
-        if expander_fn is None:
-            raise TypeError(
-                f"No expander registered for schema type '{type(schema).__name__}' "
-                f"(component '{component_name}'). "
-                f"Add it to _EXPANDERS in expander.py."
+    all_objects:           list[Surface | Cell]   = []
+    box_schema:            BoxSchema | None        = None
+    box_translated_labels: dict[str, str] | None  = None
+
+    # ------------------------------------------------------------------
+    # Step 1 — Box placements first
+    # ------------------------------------------------------------------
+    for name, schema in placements.items():
+        if not isinstance(schema, SinglePlacementSchema):
+            continue
+        tpl = templates.get(schema.template)
+        if not isinstance(tpl, BoxSchema):
+            continue
+
+        if box_schema is not None:
+            raise ValueError(
+                "Only one Box placement is supported per geometry. "
+                "Use a single Box that encompasses all inner geometry."
             )
 
-        expanded = expander_fn(schema, ctx)
-        all_objects.extend(expanded)
+        placed_surfaces, translated_labels = _place_box(tpl, schema.position(), ctx)
+        all_objects.extend(placed_surfaces)
+        box_schema            = tpl
+        box_translated_labels = translated_labels
 
-    # --- Pass 3: build fill cell now that outermost_surfaces is complete ---
-    if hasattr(ctx, "_lateral_surfaces"):
-        lat = ctx._lateral_surfaces        # type: ignore[attr-defined]
-        fill_mat = ctx._fill_material      # type: ignore[attr-defined]
+    # ------------------------------------------------------------------
+    # Step 2 — Fuel pin placements (SinglePlacement + lattices)
+    # ------------------------------------------------------------------
+    _FUEL_TYPES = (FuelPinSchema,)
 
-        box_interior = [
-            Outside(lat["xlo"].id),
-            Inside(lat["xhi"].id),
-            Outside(lat["ylo"].id),
-            Inside(lat["yhi"].id),
-            Outside(lat["zlo"].id),
-            Inside(lat["zhi"].id),
-        ]
-        outer_exclusions = [Outside(sid) for sid in ctx.outermost_surfaces]
+    for name, schema in placements.items():
+        if isinstance(schema, SinglePlacementSchema):
+            tpl = templates.get(schema.template)
+            if tpl is None:
+                raise ValueError(
+                    f"SinglePlacement '{name}' references undefined template "
+                    f"'{schema.template}'."
+                )
+            if isinstance(tpl, BoxSchema):
+                continue  # already handled in Step 1
 
-        fill_cell = Cell(
-            id=ctx.fresh_id("c"),
-            region=Intersection(box_interior + outer_exclusions),
-            material_id=fill_mat,
-            name=f"fill_{fill_mat}",
-        )
+            if isinstance(tpl, FuelPinSchema):
+                placed = _place_fuel_pin(tpl, schema.position(), ctx)
+                all_objects.extend(placed)
+            else:
+                raise TypeError(
+                    f"SinglePlacement '{name}' references template of type "
+                    f"'{type(tpl).__name__}' which has no placement handler. "
+                    f"Add it to the expander."
+                )
+
+        elif isinstance(schema, SquareLatticeSchema):
+            tpl = templates.get(schema.template)
+            if tpl is None:
+                raise ValueError(
+                    f"SquareLattice '{name}' references undefined template "
+                    f"'{schema.template}'."
+                )
+            if isinstance(tpl, FuelPinSchema):
+                for pos in schema.pin_positions():
+                    placed = _place_fuel_pin(tpl, pos, ctx)
+                    all_objects.extend(placed)
+            else:
+                raise TypeError(
+                    f"SquareLattice '{name}': template type "
+                    f"'{type(tpl).__name__}' not supported in lattices yet."
+                )
+
+        elif isinstance(schema, HexLatticeSchema):
+            tpl = templates.get(schema.template)
+            if tpl is None:
+                raise ValueError(
+                    f"HexLattice '{name}' references undefined template "
+                    f"'{schema.template}'."
+                )
+            if isinstance(tpl, FuelPinSchema):
+                for pos in schema.pin_positions():
+                    placed = _place_fuel_pin(tpl, pos, ctx)
+                    all_objects.extend(placed)
+            else:
+                raise TypeError(
+                    f"HexLattice '{name}': template type "
+                    f"'{type(tpl).__name__}' not supported yet."
+                )
+
+    # ------------------------------------------------------------------
+    # Step 3 — Fill cell
+    # ------------------------------------------------------------------
+    if box_schema is not None and box_translated_labels is not None:
+        fill_cell = _build_fill_cell(box_schema, box_translated_labels, ctx)
         all_objects.append(fill_cell)
 
     surfaces = [obj for obj in all_objects if isinstance(obj, Surface)]
     cells    = [obj for obj in all_objects if isinstance(obj, Cell)]
 
     return CascadeGeometry(
-        id=str(uuid.uuid4()),
-        name=geom_name,
-        surfaces=surfaces,
-        cells=cells,
-        param_values=ctx.param_values,
+        id=           str(uuid.uuid4()),
+        name=         geom_name,
+        surfaces=     surfaces,
+        cells=        cells,
+        param_values= ctx.param_values,
     )

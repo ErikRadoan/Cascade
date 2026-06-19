@@ -99,7 +99,7 @@ def build_test_input_files(work_dir: Path) -> list[Path]:
     )
 
     yaml_text = """
-    fuel_pin:
+    my_fuel_pin:
       type: FuelPin
       pellet_radius: 0.4096
       pellet_height: 365.76
@@ -109,14 +109,27 @@ def build_test_input_files(work_dir: Path) -> list[Path]:
       clad_thickness: 0.0572
       clad_material: Zr4
 
-    boundary:
-      type: BoundingBox
+    my_box:
+      type: Box
       x_size: 1.26
       y_size: 1.26
-      z_min: 0.0
-      z_max: 365.76
+      z_size: 365.76
       material: H2O
       boundary_type: reflective
+
+    center_pin:
+      type: SinglePlacement
+      template: my_fuel_pin
+      x: 0.0
+      y: 0.0
+      z: 0.0
+
+    boundary:
+      type: SinglePlacement
+      template: my_box
+      x: 0.0
+      y: 0.0
+      z: 0.0
     """
 
     print("  [1/3] Parsing YAML...")

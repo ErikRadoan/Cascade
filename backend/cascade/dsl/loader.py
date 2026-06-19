@@ -6,13 +6,20 @@ import yaml
 from pydantic import ValidationError
 
 from .schema.base import BaseComponentSchema
-from .schema.bounding_box import BoundingBoxSchema
+from .schema.box import BoxSchema
 from .schema.fuel_pin import FuelPinSchema
+from .schema.lattice import HexLatticeSchema, SquareLatticeSchema
+from .schema.single_placement import SinglePlacementSchema
 
 
 SCHEMA_MAP: dict[str, type[BaseComponentSchema]] = {
-    "FuelPin":     FuelPinSchema,
-    "BoundingBox": BoundingBoxSchema,
+    # Templates
+    "FuelPin":         FuelPinSchema,
+    "Box":             BoxSchema,
+    # Placements
+    "SinglePlacement": SinglePlacementSchema,
+    "SquareLattice":   SquareLatticeSchema,
+    "HexLattice":      HexLatticeSchema,
 }
 
 
@@ -24,6 +31,12 @@ class LoadError(Exception):
 
 
 def load(text: str) -> dict[str, BaseComponentSchema]:
+    """Parse and validate YAML geometry definition text.
+
+    Returns ordered dict preserving YAML declaration order.
+    Templates must be declared before the placements that reference them
+    (validated in expander, not here).
+    """
     try:
         raw = yaml.safe_load(text)
     except yaml.YAMLError as e:
@@ -44,7 +57,7 @@ def load(text: str) -> dict[str, BaseComponentSchema]:
             )
 
         data = dict(data)
-        component_type = data.get("type", None)
+        component_type = data.pop("type", None)
 
         if component_type is None:
             raise LoadError(
@@ -73,24 +86,24 @@ def validate(text: str) -> list[dict]:
         load(text)
     except LoadError as e:
         errors.append({
-            "type": "structure",
-            "message": e.message,
+            "type":      "structure",
+            "message":   e.message,
             "component": e.component_name,
-            "field": None,
+            "field":     None,
         })
     except ValidationError as e:
         for err in e.errors():
             errors.append({
-                "type": "validation",
-                "message": err["msg"],
+                "type":      "validation",
+                "message":   err["msg"],
                 "component": None,
-                "field": ".".join(str(loc) for loc in err["loc"]),
+                "field":     ".".join(str(loc) for loc in err["loc"]),
             })
     except Exception as e:
         errors.append({
-            "type": "yaml",
-            "message": str(e),
+            "type":      "yaml",
+            "message":   str(e),
             "component": None,
-            "field": None,
+            "field":     None,
         })
     return errors
