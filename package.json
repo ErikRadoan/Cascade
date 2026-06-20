@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/three": "^0.184.1",
+    "js-yaml": "^5.0.0",
+    "three": "^0.184.0"
+  }
+}

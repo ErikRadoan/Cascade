@@ -178,20 +178,22 @@ class HexLatticeSchema(BaseComponentSchema):
         return 3 * n * n + 3 * n + 1
 
     def pin_positions(self) -> list[tuple[float, float, float]]:
-        """Return (x, y, z) for every pin, starting from center outward."""
+        """Return (x, y, z) for every pin, starting from center outward.
+
+        Standard axial hex ring-walk. Each ring N contains exactly 6N pins,
+        all at distance N*pitch from center for ring 1, and at consistent
+        spacing for outer rings. The walk starts at the position N steps
+        in direction[4], then walks all 6 sides; each side contributes
+        exactly `ring` pins (the corner is placed by the side that arrives
+        at it, not duplicated by the next side).
+        """
         import math
         positions = [(self.center_x, self.center_y, self.center_z)]
 
         if self.n_rings == 1:
             return positions
 
-        # Unit vectors for the six hex directions
-        # pointy_top: first direction points right (+X)
-        # flat_top:   first direction points upper-right (30° from X)
-        if self.orientation == "pointy_top":
-            angle_offset = 0.0
-        else:
-            angle_offset = math.pi / 6.0
+        angle_offset = 0.0 if self.orientation == "pointy_top" else math.pi / 6.0
 
         directions = [
             (math.cos(angle_offset + i * math.pi / 3),
@@ -201,16 +203,14 @@ class HexLatticeSchema(BaseComponentSchema):
 
         p = self.pitch
         for ring in range(1, self.n_rings):
-            # Start at the "bottom" of this ring and walk the perimeter
-            # Each ring has 6*ring pins
-            cx = self.center_x + directions[4][0] * ring * p
-            cy = self.center_y + directions[4][1] * ring * p
+            x = self.center_x + directions[4][0] * ring * p
+            y = self.center_y + directions[4][1] * ring * p
 
             for side in range(6):
-                dx, dy = directions[(side + 2) % 6]
-                for step in range(ring):
-                    positions.append((cx, cy, self.center_z))
-                    cx += dx * p
-                    cy += dy * p
+                dx, dy = directions[side]
+                for _ in range(ring):
+                    positions.append((x, y, self.center_z))
+                    x += dx * p
+                    y += dy * p
 
         return positions
