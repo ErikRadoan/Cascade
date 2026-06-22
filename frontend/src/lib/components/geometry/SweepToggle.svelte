@@ -7,6 +7,8 @@
   // Emits the raw sweep(...) string via onApply, or null via onClear
   // to remove the sweep and go back to a plain value.
 
+  import MaterialSearchSelect from './MaterialSearchSelect.svelte';
+
   let {
     fieldKey,
     isActive,
@@ -119,6 +121,15 @@
         </div>
       {:else if options}
         <div class="popover-title">Sweep values</div>
+        {#if fieldKey === 'material'}
+          <MaterialSearchSelect
+            multiSelect={true}
+            checked={checked}
+            onChange={(joined) => {
+              checked = new Set(joined ? joined.split(', ').filter(Boolean) : []);
+            }}
+          />
+        {:else}
         <div class="list-options">
           {#each options as opt}
             <label class="list-option">
@@ -131,6 +142,7 @@
             </label>
           {/each}
         </div>
+        {/if}
         <div class="popover-actions">
           {#if isActive}
             <button class="clear-btn" onclick={clearSweep}>Remove sweep</button>

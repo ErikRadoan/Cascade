@@ -2,7 +2,10 @@
   // Menu bar — File / Edit / View
   // View menu controls panel visibility and can open the YAML editor.
 
+  import MaterialLibraryModal from '$lib/components/geometry/MaterialLibraryModal.svelte';
+
   let openMenu = $state<string | null>(null);
+  let showMaterialLibrary = $state(false);
 
   const menus: {
     id: string;
@@ -29,6 +32,8 @@
         { label: 'Redo',  action: () => {} },
         { divider: true },
         { label: 'Select all', action: () => {} },
+        { divider: true },
+        { label: 'Material library…', action: () => openMaterialLibrary() },
       ],
     },
     {
@@ -53,6 +58,7 @@
   function toggleTemplates()   { /* TODO */ closeMenu(); }
   function toggleObjects()     { /* TODO */ closeMenu(); }
   function resetCamera()       { /* TODO: emit event to Viewport3D */ closeMenu(); }
+  function openMaterialLibrary() { showMaterialLibrary = true; closeMenu(); }
 
   function closeMenu() { openMenu = null; }
   function toggleMenu(id: string) {
@@ -65,6 +71,10 @@
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
+
+{#if showMaterialLibrary}
+  <MaterialLibraryModal onClose={() => showMaterialLibrary = false} />
+{/if}
 
 <!-- Click-outside overlay -->
 {#if openMenu}

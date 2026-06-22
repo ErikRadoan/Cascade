@@ -74,8 +74,27 @@ export const geometry = {
 // ---------------------------------------------------------------------------
 
 export const materials = {
-  list: (): Promise<MaterialSummary[]> =>
-    request('/api/materials/'),
+  search: (params: {
+    search?: string;
+    library_tag?: string;
+    limit?: number;
+    offset?: number;
+  } = {}): Promise<{
+    items: MaterialSummary[];
+    total: number;
+    limit: number;
+    offset: number;
+  }> => {
+    const q = new URLSearchParams();
+    if (params.search)      q.set('search',      params.search);
+    if (params.library_tag) q.set('library_tag', params.library_tag);
+    if (params.limit  != null) q.set('limit',  String(params.limit));
+    if (params.offset != null) q.set('offset', String(params.offset));
+    return request(`/api/materials/?${q}`);
+  },
+
+  libraries: (): Promise<string[]> =>
+    request('/api/materials/libraries'),
 
   get: (id: string): Promise<MaterialDetail> =>
     request(`/api/materials/${id}`),
@@ -84,11 +103,40 @@ export const materials = {
     name: string;
     density: number;
     composition: Record<string, number>;
+  }, libraryTag = 'user'): Promise<MaterialDetail> =>
+    request(`/api/materials/?library_tag=${libraryTag}`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+
+  update: (id: string, data: {
+    name: string;
+    density: number;
+    composition: Record<string, number>;
   }): Promise<MaterialDetail> =>
-    request('/api/materials/', { method: 'POST', body: JSON.stringify(data) }),
+    request(`/api/materials/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
 
   delete: (id: string): Promise<{ deleted: boolean; id: string }> =>
     request(`/api/materials/${id}`, { method: 'DELETE' }),
+
+  importJson: (file: File, libraryTag: string, overwrite = false): Promise<{
+    imported: MaterialSummary[];
+    skipped: string[];
+    errors: string[];
+  }> => {
+    const form = new FormData();
+    form.append('file', file);
+    return request(
+      `/api/materials/import/json?library_tag=${encodeURIComponent(libraryTag)}&overwrite=${overwrite}`,
+      { method: 'POST', body: form, headers: {} },
+    );
+  },
+
+  deleteLibrary: (libraryTag: string): Promise<{ deleted_count: number; library_tag: string }> =>
+    request(`/api/materials/library/${encodeURIComponent(libraryTag)}`, { method: 'DELETE' }),
 };
 
 // ---------------------------------------------------------------------------

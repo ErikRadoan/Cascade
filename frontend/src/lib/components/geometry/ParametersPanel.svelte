@@ -15,6 +15,7 @@
   import {dump} from 'js-yaml';
   import { resolveFieldOptions } from './fieldOptions';
   import SweepToggle from './SweepToggle.svelte';
+  import MaterialSearchSelect from './MaterialSearchSelect.svelte';
 
   interface FieldEntry {
     key: string;
@@ -200,6 +201,11 @@
                   type="checkbox"
                   checked={field.value as boolean}
                   onchange={(e) => onInputChange(field, e)}
+                />
+              {:else if field.key === 'material' && !isSweepExpression(field.value)}
+                <MaterialSearchSelect
+                  value={String(field.value)}
+                  onChange={(id) => updateField(field.key, id)}
                 />
               {:else if isSweepExpression(field.value)}
                 <input

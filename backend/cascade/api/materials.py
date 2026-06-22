@@ -1,14 +1,17 @@
-"""Materials routes — CRUD for the user's material library."""
+"""Materials routes — CRUD for the user's material library.
+
+Storage is now file-backed (~/.cascade/materials.json) via MaterialRepository.
+The in-memory dict is gone — mutations persist across server restarts.
+"""
 
 from __future__ import annotations
 
 import json
-import uuid
-from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 
 from ..domain.material import Material
+from ..repositories.material_repository import MaterialRepository
 from .schemas import (
     DeletedResponse,
     MaterialCreateRequest,
@@ -19,44 +22,12 @@ from .schemas import (
 
 router = APIRouter(prefix="/materials", tags=["materials"])
 
-# In-memory material library — replace with repository when DB is wired up.
-# Pre-seeded with the most common PWR materials so the user can run a fuel
-# pin simulation without importing anything first.
-_materials: dict[str, Material] = {
-    "UO2": Material(
-        id="UO2", name="Uranium Dioxide", density=10.97,
-        composition={"U235": 0.03072, "U238": 0.96928, "O16": 2.0},
-    ),
-    "He": Material(
-        id="He", name="Helium Gap", density=0.0001786,
-        composition={"He4": 1.0},
-    ),
-    "Zr4": Material(
-        id="Zr4", name="Zircaloy-4", density=6.56,
-        composition={
-            "Zr90": 0.5145, "Zr91": 0.1122, "Zr92": 0.1715,
-            "Zr94": 0.1738, "Zr96": 0.0280,
-        },
-    ),
-    "H2O": Material(
-        id="H2O", name="Light Water", density=0.7,
-        composition={"H1": 2.0, "O16": 1.0},
-    ),
-    "B4C": Material(
-        id="B4C", name="Boron Carbide", density=2.52,
-        composition={"B10": 0.144, "B11": 0.576, "C12": 0.28},
-    ),
-    "SS316": Material(
-        id="SS316", name="Stainless Steel 316", density=8.0,
-        composition={
-            "Fe56": 0.6395, "Cr52": 0.170, "Ni58": 0.120,
-            "Mo98": 0.025,  "Mn55": 0.020, "Si28": 0.010,
-        },
-    ),
-}
+# Module-level singleton — one repository per server process, shared
+# across requests. Thread-safe for reads; writes use atomic file replace.
+_repo = MaterialRepository()
 
 
-def _to_summary(mat: Material) -> MaterialSummary:
+def _to_summary(mat: Material, library_tag: str | None = None) -> MaterialSummary:
     return MaterialSummary(id=mat.id, name=mat.name, density=mat.density)
 
 
@@ -72,57 +43,109 @@ def _to_detail(mat: Material) -> MaterialDetail:
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.get("/", response_model=list[MaterialSummary])
-async def list_materials() -> list[MaterialSummary]:
-    """List all materials in the library."""
-    return [_to_summary(m) for m in _materials.values()]
+@router.get("/", response_model=dict)
+async def list_materials(
+    search:      str        = Query("",   description="Free-text search by id, name, or nuclide."),
+    library_tag: str | None = Query(None, description="Filter by library tag."),
+    limit:       int        = Query(50,   ge=1, le=500),
+    offset:      int        = Query(0,    ge=0),
+) -> dict:
+    """List materials with optional search and pagination.
+
+    Returns:
+        {
+            "items": [ MaterialSummary, ... ],
+            "total": int,           # total count before pagination
+            "limit": int,
+            "offset": int,
+        }
+    """
+    materials, total = _repo.search(
+        query=search, library_tag=library_tag, limit=limit, offset=offset,
+    )
+    return {
+        "items":  [_to_summary(m) for m in materials],
+        "total":  total,
+        "limit":  limit,
+        "offset": offset,
+    }
+
+
+@router.get("/libraries", response_model=list[str])
+async def list_libraries() -> list[str]:
+    """Return all distinct library tags in the material library.
+
+    Used by the frontend to populate the library filter dropdown and the
+    'which library does this belong to' label in the material editor.
+    """
+    return _repo.list_libraries()
 
 
 @router.post("/", response_model=MaterialDetail, status_code=201)
-async def create_material(body: MaterialCreateRequest) -> MaterialDetail:
-    """Add a new material to the library.
-
-    The material ID is derived from the name (spaces → underscores,
-    lowercased). If a material with the same ID already exists, returns 409.
-    """
+async def create_material(
+    body:        MaterialCreateRequest,
+    library_tag: str = Query("user", description="Library tag for this material."),
+) -> MaterialDetail:
+    """Add a new material to the library."""
     mat_id = body.name.replace(" ", "_").upper()
-    if mat_id in _materials:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Material '{mat_id}' already exists. Delete it first or use a different name.",
-        )
 
     mat = Material(
-        id=mat_id,
-        name=body.name,
-        density=body.density,
-        composition=body.composition,
+        id=mat_id, name=body.name,
+        density=body.density, composition=body.composition,
     )
-    _materials[mat_id] = mat
+    try:
+        _repo.save(mat, library_tag=library_tag)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
     return _to_detail(mat)
 
 
 @router.get("/{material_id}", response_model=MaterialDetail)
 async def get_material(material_id: str) -> MaterialDetail:
     """Get a material by ID."""
-    mat = _materials.get(material_id)
+    mat = _repo.get(material_id)
     if mat is None:
         raise HTTPException(status_code=404, detail=f"Material '{material_id}' not found.")
     return _to_detail(mat)
 
 
+@router.put("/{material_id}", response_model=MaterialDetail)
+async def update_material(material_id: str, body: MaterialCreateRequest) -> MaterialDetail:
+    """Update an existing material's composition or density."""
+    existing = _repo.get(material_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail=f"Material '{material_id}' not found.")
+
+    updated = Material(
+        id=material_id, name=body.name,
+        density=body.density, composition=body.composition,
+    )
+    try:
+        _repo.update(updated)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return _to_detail(updated)
+
+
 @router.delete("/{material_id}", response_model=DeletedResponse)
 async def delete_material(material_id: str) -> DeletedResponse:
     """Delete a material from the library."""
-    if material_id not in _materials:
+    try:
+        _repo.delete(material_id)
+    except KeyError:
         raise HTTPException(status_code=404, detail=f"Material '{material_id}' not found.")
-    del _materials[material_id]
     return DeletedResponse(id=material_id)
 
 
-@router.post("/import", response_model=MaterialImportResponse)
-async def import_materials(file: UploadFile = File(...)) -> MaterialImportResponse:
-    """Import materials from a JSON file.
+@router.post("/import/json", response_model=MaterialImportResponse)
+async def import_json(
+    file:        UploadFile = File(...),
+    library_tag: str        = Query("imported", description="Tag for all imported materials."),
+    overwrite:   bool       = Query(False, description="Overwrite existing materials with same ID."),
+) -> MaterialImportResponse:
+    """Import materials from a Cascade-format JSON file.
 
     Expected format — a JSON array of material objects:
     [
@@ -135,8 +158,8 @@ async def import_materials(file: UploadFile = File(...)) -> MaterialImportRespon
         ...
     ]
 
-    Materials whose ID already exists are skipped (not overwritten).
-    Returns counts of imported, skipped, and errored entries.
+    All imported materials are tagged with library_tag so they can be
+    filtered or removed as a group later.
     """
     content = await file.read()
 
@@ -151,45 +174,65 @@ async def import_materials(file: UploadFile = File(...)) -> MaterialImportRespon
             detail="Expected a JSON array of material objects at the top level.",
         )
 
-    imported: list[MaterialSummary] = []
-    skipped:  list[str]             = []
-    errors:   list[str]             = []
+    imported_ids, skipped_ids, errors = _repo.import_batch(
+        records=data, library_tag=library_tag, overwrite=overwrite,
+    )
 
-    for i, item in enumerate(data):
-        if not isinstance(item, dict):
-            errors.append(f"Item {i}: not an object, skipping.")
-            continue
+    imported_mats = [_to_summary(_repo.get(mid)) for mid in imported_ids if _repo.get(mid)]
 
-        mat_id = item.get("id")
-        if not mat_id:
-            errors.append(f"Item {i}: missing 'id' field.")
-            continue
+    return MaterialImportResponse(
+        imported=imported_mats,
+        skipped=skipped_ids,
+        errors=errors,
+    )
 
-        if mat_id in _materials:
-            skipped.append(mat_id)
-            continue
 
+@router.delete("/library/{library_tag}", response_model=dict)
+async def delete_library(library_tag: str) -> dict:
+    """Delete all materials belonging to a specific library tag.
+
+    Useful for removing an entire imported library set at once.
+    Does not affect materials with different tags.
+    Builtin materials (library_tag='builtin') cannot be deleted this way.
+    """
+    if library_tag == "builtin":
+        raise HTTPException(
+            status_code=403,
+            detail="Built-in materials cannot be deleted as a library. Delete them individually.",
+        )
+
+    all_mats = _repo.list_all()
+    # Re-read with tags — need raw data for this
+    raw = _repo._read()
+    to_delete = [
+        mid for mid, record in raw.items()
+        if record.get("library_tag") == library_tag
+    ]
+
+    for mid in to_delete:
         try:
-            mat = Material(
-                id=mat_id,
-                name=item.get("name", mat_id),
-                density=float(item["density"]),
-                composition={k: float(v) for k, v in item.get("composition", {}).items()},
-            )
-            _materials[mat_id] = mat
-            imported.append(_to_summary(mat))
-        except (KeyError, ValueError, TypeError) as e:
-            errors.append(f"Item {i} (id='{mat_id}'): {e}")
+            _repo.delete(mid)
+        except KeyError:
+            pass
 
-    return MaterialImportResponse(imported=imported, skipped=skipped, errors=errors)
+    return {"deleted_count": len(to_delete), "library_tag": library_tag}
 
 
 def get_materials_by_ids(ids: list[str]) -> list[Material]:
     """Internal helper used by the jobs router to resolve material IDs."""
-    missing = [mid for mid in ids if mid not in _materials]
+    result: list[Material] = []
+    missing: list[str] = []
+
+    for mid in ids:
+        mat = _repo.get(mid)
+        if mat is None:
+            missing.append(mid)
+        else:
+            result.append(mat)
+
     if missing:
         raise HTTPException(
             status_code=422,
             detail=f"Unknown material IDs: {missing}. Add them to the library first.",
         )
-    return [_materials[mid] for mid in ids]
+    return result
