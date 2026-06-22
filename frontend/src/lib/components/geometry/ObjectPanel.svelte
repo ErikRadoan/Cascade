@@ -5,7 +5,7 @@
   // viewport — Boxes default to visible but are the most common thing
   // a user will want to hide since they can occlude inner geometry.
 
-  import { editor, ui, setGeometryText, isVisible, toggleVisibility } from '$lib/stores/index.svelte';
+  import { activeProject, ui, setGeometryText, isVisible, toggleVisibility } from '$lib/stores/index.svelte';
   import yaml from './yamlParseHelper';
   import {dump} from 'js-yaml';
   import TypePickerMenu from './TypePickerMenu.svelte';
@@ -13,7 +13,7 @@
   import type { SceneComponent } from '$lib/types';
 
   // No more filtering Box out — every placed component is a real object.
-  let placements = $derived(editor.scene?.components ?? []);
+  let placements = $derived(activeProject().scene?.components ?? []);
 
   interface Group {
     name: string;
@@ -38,7 +38,7 @@
   const NON_TEMPLATE_TYPES = new Set(['SinglePlacement', 'SquareLattice', 'HexLattice']);
 
   let parsedDoc = $derived((): Record<string, { type?: string }> | null => {
-    const raw = yaml.parse(editor.text);
+    const raw = yaml.parse(activeProject().text);
     if (!raw || typeof raw !== 'object') return null;
     return raw as Record<string, { type?: string }>;
   });

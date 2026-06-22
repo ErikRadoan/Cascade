@@ -123,44 +123,60 @@ async def build_scene(body: SceneRequest) -> SceneResponse:
 
 @router.get("/", response_model=list[GeometrySummary])
 async def list_geometries() -> list[GeometrySummary]:
-    """List all saved geometry definitions."""
-    from datetime import timezone
-    result = []
-    for gid, entry in _geometry_store.items():
-        geom = entry["geometry"]
-        result.append(GeometrySummary(
+    """List all saved geometry definitions, most recently created first."""
+    result = [
+        GeometrySummary(
             id=gid,
             name=entry["name"],
             created_at=entry["created_at"],
-            n_surfaces=len(geom.surfaces),
-            n_cells=len(geom.cells),
-        ))
+            n_surfaces=entry["n_surfaces"],
+            n_cells=entry["n_cells"],
+        )
+        for gid, entry in _geometry_store.items()
+    ]
+    result.sort(key=lambda g: g.created_at, reverse=True)
     return result
 
 
 @router.post("/", response_model=GeometrySummary, status_code=201)
 async def save_geometry(body: GeometryTextRequest) -> GeometrySummary:
-    """Parse, expand, and save a geometry definition.
+    """Save a geometry project's YAML text.
 
-    Validates and expands the YAML — if either step fails, returns 422.
-    On success, stores the resolved geometry and returns a summary.
+    Unlike the old behaviour, this does NOT require the geometry to be
+    valid or expandable. A geometry project tab in the frontend autosaves
+    on every edit, and the user is typing invalid/incomplete YAML for
+    most of that time — rejecting drafts would make autosave useless.
+
+    Validity is only enforced where it actually matters: job submission
+    (POST /jobs/submit) parses and expands the YAML itself and will
+    reject an invalid geometry there.
+
+    The only requirement here is that the YAML parses as a mapping —
+    i.e. loader.load() doesn't raise a structural LoadError. Pydantic
+    field-validation errors on individual components (e.g. a FuelPin
+    with a missing required field) are fine; n_surfaces/n_cells will
+    just read 0 for those components until they're fixed.
     """
     from datetime import datetime, timezone
     from ..dsl import expander
     import uuid
 
-    errors = loader.validate(body.text)
-    if errors:
-        raise HTTPException(
-            status_code=422,
-            detail=errors,
-        )
-
-    schemas = loader.load(body.text)
+    surfaces_count = 0
+    cells_count = 0
 
     try:
-        geom = expander.expand(schemas)
-    except Exception as e:
+        schemas = loader.load(body.text)
+        try:
+            geom = expander.expand(schemas)
+            surfaces_count = len(geom.surfaces)
+            cells_count = len(geom.cells)
+        except Exception:
+            # Expansion failed (e.g. references an undefined template,
+            # or a placement is missing) — still a valid SAVE, just
+            # reports 0 surfaces/cells until the user fixes it.
+            pass
+    except loader.LoadError as e:
+        # Only reject truly malformed YAML (not a mapping, bad syntax)
         raise HTTPException(status_code=422, detail=str(e))
 
     gid = str(uuid.uuid4())
@@ -168,7 +184,8 @@ async def save_geometry(body: GeometryTextRequest) -> GeometrySummary:
     _geometry_store[gid] = {
         "name":       body.name or f"geometry_{gid[:8]}",
         "text":       body.text,
-        "geometry":   geom,
+        "n_surfaces": surfaces_count,
+        "n_cells":    cells_count,
         "created_at": created,
     }
 
@@ -176,8 +193,50 @@ async def save_geometry(body: GeometryTextRequest) -> GeometrySummary:
         id=gid,
         name=_geometry_store[gid]["name"],
         created_at=created,
-        n_surfaces=len(geom.surfaces),
-        n_cells=len(geom.cells),
+        n_surfaces=surfaces_count,
+        n_cells=cells_count,
+    )
+
+
+@router.put("/{geometry_id}", response_model=GeometrySummary)
+async def update_geometry(geometry_id: str, body: GeometryTextRequest) -> GeometrySummary:
+    """Update an existing geometry project's text (autosave target).
+
+    Same relaxed-validity rules as save_geometry — drafts save freely.
+    """
+    from datetime import datetime, timezone
+    from ..dsl import expander
+
+    entry = _geometry_store.get(geometry_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Geometry '{geometry_id}' not found.")
+
+    surfaces_count = 0
+    cells_count = 0
+
+    try:
+        schemas = loader.load(body.text)
+        try:
+            geom = expander.expand(schemas)
+            surfaces_count = len(geom.surfaces)
+            cells_count = len(geom.cells)
+        except Exception:
+            pass
+    except loader.LoadError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    entry["text"]       = body.text
+    entry["n_surfaces"] = surfaces_count
+    entry["n_cells"]    = cells_count
+    if body.name:
+        entry["name"] = body.name
+
+    return GeometrySummary(
+        id=geometry_id,
+        name=entry["name"],
+        created_at=entry["created_at"],
+        n_surfaces=surfaces_count,
+        n_cells=cells_count,
     )
 
 
@@ -188,15 +247,14 @@ async def get_geometry(geometry_id: str) -> GeometryDetail:
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Geometry '{geometry_id}' not found.")
 
-    geom = entry["geometry"]
     return GeometryDetail(
         id=geometry_id,
         name=entry["name"],
         created_at=entry["created_at"],
-        n_surfaces=len(geom.surfaces),
-        n_cells=len(geom.cells),
+        n_surfaces=entry["n_surfaces"],
+        n_cells=entry["n_cells"],
         yaml_text=entry["text"],
-        param_values=geom.param_values,
+        param_values={},
     )
 
 

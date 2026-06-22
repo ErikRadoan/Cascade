@@ -1,12 +1,25 @@
 """Sweep support for parametric geometry studies.
 
+Two sweep syntaxes are supported in YAML field values:
+
+    Numeric range:  sweep(0.38 to 0.43, step=0.01)
+                     -> [0.38, 0.39, 0.40, 0.41, 0.42, 0.43]
+
+    Discrete list:   sweep(UO2, ThO2, UC)
+                     -> ["UO2", "ThO2", "UC"]
+
+The discrete form exists for fields that aren't numeric — material IDs,
+template names, boundary_type, lattice orientation, etc. Anything that
+would otherwise be a fixed dropdown value in the frontend can be swept
+across its full set of options using this syntax.
+
 Two public functions:
 
-    parse_sweep(value) -> list[float] | None
+    parse_sweep(value) -> list[float] | list[str] | None
         Detects and parses "sweep(...)" strings from YAML field values.
         Returns None if the value is not a sweep expression.
 
-    expand_sweep(yaml_text) -> list[tuple[dict[str,float], CascadeGeometry]]
+    expand_sweep(yaml_text) -> list[tuple[dict[str, float | str], CascadeGeometry]]
         Full pipeline: YAML with sweep values -> list of (param_values, geometry).
         This is what GeometryService calls for a parametric study.
 """
@@ -24,12 +37,12 @@ from ..domain.geometry import CascadeGeometry
 
 
 # ---------------------------------------------------------------------------
-# Sweep expression parser
+# Sweep expression parsers
 # ---------------------------------------------------------------------------
 
-# Matches: sweep(0.38 to 0.43, step=0.01)
-#      or: sweep(20 to 30)              <- step defaults to 1.0
-_SWEEP_RE = re.compile(
+# Numeric range form: sweep(0.38 to 0.43, step=0.01)
+#                  or: sweep(20 to 30)              <- step defaults to 1.0
+_SWEEP_RANGE_RE = re.compile(
     r"^sweep\(\s*"
     r"(?P<start>-?[\d.]+)"
     r"\s+to\s+"
@@ -39,30 +52,66 @@ _SWEEP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Discrete list form: sweep(UO2, ThO2, UC)
+# Deliberately does NOT match if the content contains " to " — that's the
+# range form's job, and we want range syntax to fail loudly (via the range
+# regex's own validation) rather than silently being parsed as a one-token
+# discrete list containing the literal string "0.38 to 0.43".
+_SWEEP_LIST_RE = re.compile(
+    r"^sweep\(\s*(?P<items>[^()]+?)\s*\)$",
+    re.IGNORECASE,
+)
 
-def parse_sweep(value: Any) -> list[float] | None:
+
+def parse_sweep(value: Any) -> list[float] | list[str] | None:
     """Parse a sweep expression string into an explicit list of values.
 
+    Tries the numeric range form first, then the discrete list form.
     Args:
-        value: Any YAML field value. Non-string values are returned as None
+        value: Any YAML field value. Non-string values return None
                immediately — only strings can be sweep expressions.
 
     Returns:
-        List of float values if this is a sweep expression, None otherwise.
+        list[float] for a numeric range sweep,
+        list[str] for a discrete list sweep,
+        None if this is not a sweep expression at all.
 
     Examples:
-        parse_sweep("sweep(20 to 30, step=2)") -> [20.0, 22.0, 24.0, 26.0, 28.0, 30.0]
+        parse_sweep("sweep(20 to 30, step=2)")     -> [20.0, 22.0, ..., 30.0]
         parse_sweep("sweep(0.38 to 0.40, step=0.01)") -> [0.38, 0.39, 0.40]
-        parse_sweep(0.4096)  -> None
-        parse_sweep("UO2")   -> None
+        parse_sweep("sweep(UO2, ThO2, UC)")         -> ["UO2", "ThO2", "UC"]
+        parse_sweep("sweep(reflective, vacuum)")    -> ["reflective", "vacuum"]
+        parse_sweep(0.4096)                          -> None
+        parse_sweep("UO2")                           -> None
     """
     if not isinstance(value, str):
         return None
 
-    match = _SWEEP_RE.match(value.strip())
-    if not match:
-        return None
+    stripped = value.strip()
 
+    range_match = _SWEEP_RANGE_RE.match(stripped)
+    if range_match:
+        return _parse_range(range_match)
+
+    # Only attempt the list form if it actually looks like a sweep(...)
+    # call — otherwise plain strings like "UO2" would never reach here
+    # anyway since they don't start with "sweep(".
+    if stripped.lower().startswith("sweep(") and stripped.endswith(")"):
+        list_match = _SWEEP_LIST_RE.match(stripped)
+        if list_match:
+            return _parse_list(list_match)
+        # Looked like a sweep(...) call but matched neither form —
+        # this is a malformed sweep expression, not a bare string.
+        raise ValueError(
+            f"Could not parse sweep expression: '{value}'. "
+            f"Use 'sweep(start to stop, step=X)' for numeric ranges, "
+            f"or 'sweep(a, b, c)' for a discrete list of values."
+        )
+
+    return None
+
+
+def _parse_range(match: re.Match) -> list[float]:
     start = float(match.group("start"))
     stop  = float(match.group("stop"))
     step  = float(match.group("step")) if match.group("step") else 1.0
@@ -97,6 +146,29 @@ def parse_sweep(value: Any) -> list[float] | None:
     return values
 
 
+def _parse_list(match: re.Match) -> list[str]:
+    items_raw = match.group("items")
+    # Split on commas not inside the (already-stripped) parens.
+    # Items are plain tokens — material IDs, template names, enum values —
+    # none of which legitimately contain commas, so a simple split is safe.
+    items = [item.strip() for item in items_raw.split(",")]
+    items = [item for item in items if item]  # drop empties from trailing commas
+
+    if not items:
+        raise ValueError(
+            "Sweep list expression has no values: 'sweep()'. "
+            "Provide at least one value, e.g. 'sweep(UO2, ThO2)'."
+        )
+
+    if len(items) > 500:
+        raise ValueError(
+            f"Sweep list produces {len(items)} values. "
+            f"Reduce the number of items."
+        )
+
+    return items
+
+
 def _decimal_places(value: float) -> int:
     """Count decimal places in a float's string representation."""
     s = str(value)
@@ -112,11 +184,12 @@ def _decimal_places(value: float) -> int:
 def expand_sweep(
     yaml_text: str,
     geom_name: str = "cascade_geometry",
-) -> list[tuple[dict[str, float], CascadeGeometry]]:
+) -> list[tuple[dict[str, float | str], CascadeGeometry]]:
     """Expand a YAML geometry definition with sweep parameters.
 
-    Detects all sweep(...) values in the YAML, builds the cartesian product
-    of their value lists, then runs load() + expand() once per combination.
+    Detects all sweep(...) values in the YAML (both numeric range and
+    discrete list forms), builds the cartesian product of their value
+    lists, then runs load() + expand() once per combination.
 
     For a YAML with no sweep values, returns a single-element list —
     the caller doesn't need to special-case the no-sweep path.
@@ -129,7 +202,8 @@ def expand_sweep(
     Returns:
         List of (param_values, geometry) tuples. param_values is the dict
         of sweep parameter substitutions that produced that geometry —
-        e.g. {"pellet_radius": 0.40, "clad_thickness": 0.057}.
+        e.g. {"fuel_pin.pellet_radius": 0.40, "fuel_pin.pellet_material": "UO2"}.
+        Values may be float or str depending on which sweep form was used.
         Empty dict if no sweep parameters were present.
 
     Raises:
@@ -142,8 +216,12 @@ def expand_sweep(
 
     # --- Detect sweep fields ---
     # Walk all component fields, pull out any that are sweep expressions.
-    # Structure: sweep_fields[component_name][field_name] = [v1, v2, ...]
-    sweep_fields: dict[str, dict[str, list[float]]] = {}
+    # The "type" field is never sweepable — sweeping the TYPE of a
+    # component (e.g. turning a FuelPin into a Box mid-sweep) isn't a
+    # coherent geometry operation, so it's explicitly excluded here in
+    # addition to being excluded from the YAML form fields that produce
+    # sweep(...) values in the frontend.
+    sweep_fields: dict[str, dict[str, list]] = {}
     for comp_name, comp_data in raw.items():
         if not isinstance(comp_data, dict):
             continue
@@ -162,10 +240,9 @@ def expand_sweep(
 
     # --- Build cartesian product ---
     # Flatten to a list of (component, field, values) triples for product().
-    # e.g. [("fuel_pin", "pellet_radius", [0.38, 0.39, 0.40]),
-    #        ("fuel_pin", "clad_thickness", [0.055, 0.057])]
+    # Works identically whether values are floats or strings.
     sweep_keys: list[tuple[str, str]] = []
-    sweep_value_lists: list[list[float]] = []
+    sweep_value_lists: list[list] = []
     for comp_name, fields in sweep_fields.items():
         for field_name, values in fields.items():
             sweep_keys.append((comp_name, field_name))
@@ -180,12 +257,12 @@ def expand_sweep(
             f"Reduce the number of sweep points or parameters."
         )
 
-    results: list[tuple[dict[str, float], CascadeGeometry]] = []
+    results: list[tuple[dict[str, float | str], CascadeGeometry]] = []
 
     for combo in itertools.product(*sweep_value_lists):
         # Build a modified raw dict with sweep values substituted
         substituted = deepcopy(raw)
-        param_values: dict[str, float] = {}
+        param_values: dict[str, float | str] = {}
 
         for (comp_name, field_name), value in zip(sweep_keys, combo):
             substituted[comp_name][field_name] = value

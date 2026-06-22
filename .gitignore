@@ -39,7 +39,6 @@ yarn-error.log
 *.vtk
 *.csv
 outputs/
-results/
 
 # OS files
 .DS_Store

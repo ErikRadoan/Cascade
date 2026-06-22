@@ -1,5 +1,3 @@
-export type ApiResponse<T> = Promise<T>;
-
 // Typed API client — all fetch calls to the Cascade backend.
 // Base URL reads from VITE_API_URL env var, defaults to localhost:8000.
 
@@ -48,6 +46,27 @@ export const geometry = {
       method: 'POST',
       body: JSON.stringify({ text }),
     }),
+
+  list: (): Promise<{ id: string; name: string; created_at: string; n_surfaces: number; n_cells: number }[]> =>
+    request('/api/geometry/'),
+
+  get: (id: string): Promise<{ id: string; name: string; created_at: string; n_surfaces: number; n_cells: number; yaml_text: string }> =>
+    request(`/api/geometry/${id}`),
+
+  save: (text: string, name?: string): Promise<{ id: string; name: string }> =>
+    request('/api/geometry/', {
+      method: 'POST',
+      body: JSON.stringify({ text, name }),
+    }),
+
+  update: (id: string, text: string, name?: string): Promise<{ id: string; name: string }> =>
+    request(`/api/geometry/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ text, name }),
+    }),
+
+  delete: (id: string): Promise<{ deleted: boolean; id: string }> =>
+    request(`/api/geometry/${id}`, { method: 'DELETE' }),
 };
 
 // ---------------------------------------------------------------------------

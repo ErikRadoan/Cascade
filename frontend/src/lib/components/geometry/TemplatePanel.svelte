@@ -2,7 +2,7 @@
   // TemplatePanel — shows template definitions as thumbnail cards.
   // The "+" button now actually creates a new template block in the YAML.
 
-  import { editor, ui, setGeometryText } from '$lib/stores/index.svelte';
+  import { activeProject, ui, setGeometryText } from '$lib/stores/index.svelte';
   import yaml from './yamlParseHelper';
   import {dump} from 'js-yaml';
   import TypePickerMenu from './TypePickerMenu.svelte';
@@ -16,7 +16,7 @@
   const PLACEMENT_TYPES = new Set(['SinglePlacement', 'SquareLattice', 'HexLattice']);
 
   let parsedDoc = $derived((): Record<string, { type?: string }> | null => {
-    const raw = yaml.parse(editor.text);
+    const raw = yaml.parse(activeProject().text);
     if (!raw || typeof raw !== 'object') return null;
     return raw as Record<string, { type?: string }>;
   });

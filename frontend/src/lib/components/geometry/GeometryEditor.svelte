@@ -1,45 +1,59 @@
 <script lang="ts">
   // GeometryEditor — top-level layout for the geometry tab.
-  // Three-column layout: Object/Template panels | Viewport | Parameters panel
+  // Tab bar on top, then three-column layout below:
+  // Object/Template panels | Viewport | Parameters panel.
+  // Everything below the tab bar operates on the ACTIVE project.
 
   import { onMount } from 'svelte';
-  import { editor, setGeometryText } from '$lib/stores/index.svelte';
+  import { projects, activeProject, setGeometryText } from '$lib/stores/index.svelte';
+  import GeometryTabBar from './GeometryTabBar.svelte';
   import Viewport3D from './Viewport3D.svelte';
   import ObjectPanel from './ObjectPanel.svelte';
   import TemplatePanel from './TemplatePanel.svelte';
   import ParametersPanel from './ParametersPanel.svelte';
 
-  // Load the initial scene once when this tab first mounts.
-  // Subsequent edits go through setGeometryText() from wherever they
-  // originate (ParametersPanel, raw YAML editor, template creation, etc.)
-  // — this component no longer owns the validate/refresh logic.
-  onMount(() => {
-    if (!editor.scene) {
-      setGeometryText(editor.text, { immediate: true });
+  // Re-run scene load whenever the active tab changes AND that project
+  // has never had its scene loaded yet (switching back to an
+  // already-loaded tab shouldn't refetch).
+  $effect(() => {
+    const p = activeProject();
+    if (!p.scene && !p.isLoadingScene && !p.isValidating) {
+      setGeometryText(p.text, { immediate: true });
     }
   });
 </script>
 
-<div class="geometry-editor">
-  <aside class="left-panels">
-    <ObjectPanel />
-    <TemplatePanel />
-  </aside>
+<div class="geometry-tab">
+  <GeometryTabBar />
 
-  <section class="viewport-area">
-    <Viewport3D scene={editor.scene} isStale={editor.isSceneStale} />
-  </section>
+  <div class="geometry-editor">
+    <aside class="left-panels">
+      <ObjectPanel />
+      <TemplatePanel />
+    </aside>
 
-  <aside class="right-panel">
-    <ParametersPanel />
-  </aside>
+    <section class="viewport-area">
+      <Viewport3D scene={activeProject().scene} isStale={activeProject().isSceneStale} />
+    </section>
+
+    <aside class="right-panel">
+      <ParametersPanel />
+    </aside>
+  </div>
 </div>
 
 <style>
+  .geometry-tab {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    overflow: hidden;
+  }
+
   .geometry-editor {
     display: grid;
     grid-template-columns: var(--panel-left-w) 1fr var(--panel-right-w);
-    height: 100%;
+    flex: 1;
     overflow: hidden;
   }
 

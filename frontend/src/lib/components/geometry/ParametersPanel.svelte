@@ -1,7 +1,7 @@
 <script lang="ts">
   // ParametersPanel — shows editable fields for whatever is selected in
   // the Object or Template panel. Reads the current values from the
-  // parsed YAML, writes edits back into editor.text by patching the
+  // parsed YAML, writes edits back into the active project's text by patching the
   // corresponding YAML block.
   //
   // This is a thin, schema-agnostic editor: it renders one input per
@@ -10,10 +10,11 @@
   // that keeps it correct as new schema types are added on the backend
   // without needing frontend changes.
 
-  import { editor, ui, setGeometryText } from '$lib/stores/index.svelte';
+  import { activeProject, ui, setGeometryText } from '$lib/stores/index.svelte';
   import yaml from './yamlParseHelper';
   import {dump} from 'js-yaml';
   import { resolveFieldOptions } from './fieldOptions';
+  import SweepToggle from './SweepToggle.svelte';
 
   interface FieldEntry {
     key: string;
@@ -24,7 +25,7 @@
 
   // Parse the full document and extract the block for the selected item
   let parsedDoc = $derived((): Record<string, Record<string, unknown>> | null => {
-    const raw = yaml.parse(editor.text);
+    const raw = yaml.parse(activeProject().text);
     if (!raw || typeof raw !== 'object') return null;
     return raw as Record<string, Record<string, unknown>>;
   });
@@ -100,7 +101,7 @@
     const newText = dump(doc, { indent: 2, lineWidth: -1 });
 
     // Route through the shared handler so validation + scene refresh
-    // actually fire. Mutating editor.text directly here was the bug —
+    // actually fire. Mutating the project text directly here was the bug —
     // nothing was listening for that mutation.
     setGeometryText(newText);
   }
@@ -128,6 +129,27 @@
       return;
     }
     updateField(field.key, value);
+  }
+
+  // Sweep handlers — applying writes a sweep(...) string into the field,
+  // exactly like any other value. The expander/sweep.py backend treats
+  // it identically whether it came from this UI or hand-typed YAML.
+  function onApplySweep(field: FieldEntry, expression: string) {
+    updateField(field.key, expression);
+  }
+
+  function onClearSweep(field: FieldEntry) {
+    // Restore a sensible plain value: the field's default-ish fallback.
+    // We don't have the schema default here, so fall back to a neutral
+    // value per kind — the user will almost always immediately edit it
+    // anyway since removing a sweep implies they want a specific value.
+    if (field.kind === 'number') {
+      updateField(field.key, 0);
+    } else if (field.options && field.options.length > 0) {
+      updateField(field.key, field.options[0]);
+    } else {
+      updateField(field.key, '');
+    }
   }
 </script>
 
@@ -159,52 +181,66 @@
               {/if}
             </label>
 
-            {#if field.kind === 'boolean'}
-              <input
-                id="field-{field.key}"
-                type="checkbox"
-                checked={field.value as boolean}
-                onchange={(e) => onInputChange(field, e)}
-              />
-            {:else if isSweepExpression(field.value)}
-              <input
-                id="field-{field.key}"
-                type="text"
-                class="field-input sweep-input"
-                value={field.value}
-                onchange={(e) => onInputChange(field, e)}
-              />
-            {:else if field.options && !customFields.has(field.key)}
-              <select
-                id="field-{field.key}"
-                class="field-input field-select"
-                value={field.options.includes(String(field.value)) ? field.value : '__custom__'}
-                onchange={(e) => onSelectChange(field, e)}
-              >
-                {#each field.options as opt}
-                  <option value={opt}>{opt}</option>
-                {/each}
-                <option value="__custom__">Custom…</option>
-              </select>
-            {:else if field.kind === 'number'}
-              <input
-                id="field-{field.key}"
-                type="number"
-                step="any"
-                class="field-input"
-                value={field.value}
-                onchange={(e) => onInputChange(field, e)}
-              />
-            {:else}
-              <input
-                id="field-{field.key}"
-                type="text"
-                class="field-input"
-                value={field.value}
-                onchange={(e) => onInputChange(field, e)}
-                placeholder={field.options ? 'Custom value…' : undefined}
-              />
-            {/if}
+            <div class="field-input-row">
+              {#if field.kind !== 'boolean'}
+                <SweepToggle
+                  fieldKey={field.key}
+                  isActive={isSweepExpression(field.value)}
+                  isNumeric={field.kind === 'number'}
+                  options={field.options}
+                  currentValue={field.value as string | number}
+                  onApply={(expr) => onApplySweep(field, expr)}
+                  onClear={() => onClearSweep(field)}
+                />
+              {/if}
+
+              {#if field.kind === 'boolean'}
+                <input
+                  id="field-{field.key}"
+                  type="checkbox"
+                  checked={field.value as boolean}
+                  onchange={(e) => onInputChange(field, e)}
+                />
+              {:else if isSweepExpression(field.value)}
+                <input
+                  id="field-{field.key}"
+                  type="text"
+                  class="field-input sweep-input"
+                  value={field.value}
+                  onchange={(e) => onInputChange(field, e)}
+                />
+              {:else if field.options && !customFields.has(field.key)}
+                <select
+                  id="field-{field.key}"
+                  class="field-input field-select"
+                  value={field.options.includes(String(field.value)) ? field.value : '__custom__'}
+                  onchange={(e) => onSelectChange(field, e)}
+                >
+                  {#each field.options as opt}
+                    <option value={opt}>{opt}</option>
+                  {/each}
+                  <option value="__custom__">Custom…</option>
+                </select>
+              {:else if field.kind === 'number'}
+                <input
+                  id="field-{field.key}"
+                  type="number"
+                  step="any"
+                  class="field-input"
+                  value={field.value}
+                  onchange={(e) => onInputChange(field, e)}
+                />
+              {:else}
+                <input
+                  id="field-{field.key}"
+                  type="text"
+                  class="field-input"
+                  value={field.value}
+                  onchange={(e) => onInputChange(field, e)}
+                  placeholder={field.options ? 'Custom value…' : undefined}
+                />
+              {/if}
+            </div>
           </div>
         {/each}
       </div>
@@ -281,6 +317,17 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
+  }
+
+  .field-input-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .field-input-row .field-input {
+    flex: 1;
+    min-width: 0;
   }
 
   .field-label {

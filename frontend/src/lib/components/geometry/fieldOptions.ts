@@ -7,8 +7,6 @@
 // on their runtime JS type — this table only opts specific fields into
 // a <select>.
 
-import type { editor as EditorStore } from '$lib/stores/index.svelte';
-
 export type FieldOptions = string[] | ((doc: Record<string, { type?: string }>) => string[]);
 
 const BOUNDARY_TYPES = ['reflective', 'vacuum', 'periodic'];
