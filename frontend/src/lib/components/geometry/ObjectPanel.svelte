@@ -12,7 +12,6 @@
   import { PLACEMENT_DEFAULTS, PLACEMENT_TYPES, uniqueName } from './componentDefaults';
   import type { SceneComponent } from '$lib/types';
 
-  // No more filtering Box out — every placed component is a real object.
   let placements = $derived(activeProject().scene?.components ?? []);
 
   interface Group {

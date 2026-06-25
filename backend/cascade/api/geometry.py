@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from ..dsl import loader
+from ..dsl import sweep
 from ..services.scene_builder_service import SceneBuilder
 from .schemas import (
     BoundsOut,
@@ -43,7 +44,7 @@ async def validate_geometry(body: GeometryTextRequest) -> ValidationResponse:
     Returns a list of structured errors with component and field names
     so the editor can underline the offending lines.
     """
-    raw_errors = loader.validate(body.text)
+    raw_errors = sweep.validate_preview(body.text)
     errors = [ValidationError(**e) for e in raw_errors]
     return ValidationResponse(valid=len(errors) == 0, errors=errors)
 
@@ -58,7 +59,7 @@ async def build_scene(body: SceneRequest) -> SceneResponse:
 
     Called when validation passes and the preview needs to update.
     """
-    errors = loader.validate(body.text)
+    errors = sweep.validate_preview(body.text)
     if errors:
         return SceneResponse(
             components=[],
@@ -68,7 +69,7 @@ async def build_scene(body: SceneRequest) -> SceneResponse:
         )
 
     try:
-        schemas = loader.load(body.text)
+        schemas = sweep.preview_load(body.text)
         scene = _scene_builder.build(schemas)
     except Exception as e:
         return SceneResponse(
@@ -165,7 +166,7 @@ async def save_geometry(body: GeometryTextRequest) -> GeometrySummary:
     cells_count = 0
 
     try:
-        schemas = loader.load(body.text)
+        schemas = sweep.preview_load(body.text)
         try:
             geom = expander.expand(schemas)
             surfaces_count = len(geom.surfaces)
@@ -215,7 +216,7 @@ async def update_geometry(geometry_id: str, body: GeometryTextRequest) -> Geomet
     cells_count = 0
 
     try:
-        schemas = loader.load(body.text)
+        schemas = sweep.preview_load(body.text)
         try:
             geom = expander.expand(schemas)
             surfaces_count = len(geom.surfaces)

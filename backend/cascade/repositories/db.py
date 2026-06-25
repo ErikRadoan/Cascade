@@ -42,11 +42,23 @@ DATABASE_URL = os.getenv("CASCADE_DATABASE_URL", _DEFAULT_URL)
 
 _connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
+is_debug = os.environ.get('DEBUG', 'False').lower() == 'true'
+
 engine = create_engine(
     DATABASE_URL,
     connect_args=_connect_args,
-    echo=False,       # set True to log all SQL — useful for debugging
+    echo=is_debug,       # set True to log all SQL — useful for debugging
 )
+
+# Enable WAL mode for SQLite so readers don't block writers and concurrent
+# requests see committed writes immediately instead of a stale snapshot.
+if DATABASE_URL.startswith("sqlite"):
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_wal(dbapi_conn, _connection_record):
+        dbapi_conn.execute("PRAGMA journal_mode=WAL")
+        dbapi_conn.execute("PRAGMA synchronous=NORMAL")
 
 # ---------------------------------------------------------------------------
 # Session factory
@@ -83,6 +95,10 @@ def get_db():
     db = SessionLocal()
     try:
         yield db
+        db.commit()   # flush any uncommitted work at the end of the request
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 

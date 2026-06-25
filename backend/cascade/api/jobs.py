@@ -16,7 +16,7 @@ from ..repositories.sweep_repository import SweepRepository
 from ..adapters.openmc_adapter import OpenMCRunSettings
 from ..domain.job import JobStatus, SimulationJob
 from ..dsl import loader, expander
-from ..dsl.sweep import expand_sweep, parse_sweep
+from ..dsl.sweep import expand_sweep, parse_sweep, validate_preview
 from ..execution.backend_config import (
     BackendConfig,
     DockerBackendConfig,
@@ -134,15 +134,15 @@ def _extract_swept_params(geometry_text: str) -> dict[str, list[float]]:
 # they open their own short-lived sessions via SessionLocal().
 # ---------------------------------------------------------------------------
 
-def _backend_for_job(job_id: str):
+def _backend_for_job(job_id: str, db: Session):
     """Reconstruct the correct backend for a job using its stored config.
 
-    Opens its own session because it is called both inside and outside
-    of route handler scope — making it a Depends target would complicate
-    the call sites without benefit.
+    Accepts the caller's session so we never open a competing SessionLocal()
+    while the outer session is still active — that caused SQLite 'database is
+    locked' errors which were swallowed by the bare except, leaving jobs stuck
+    in RUNNING forever.
     """
-    with SessionLocal() as db:
-        raw_config = JobRepository(db).get_backend_config(job_id)
+    raw_config = JobRepository(db).get_backend_config(job_id)
 
     if raw_config is None:
         raise HTTPException(
@@ -161,11 +161,7 @@ def _backend_for_job(job_id: str):
 
 
 def _get_job_or_404(job_id: str, db: Session) -> SimulationJob:
-    """Fetch a job from the DB or raise 404.
-
-    Takes an injected session so callers don't open a second session
-    for this lookup when they already hold one.
-    """
+    """Fetch a job from the DB or raise 404."""
     job = JobRepository(db).get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
@@ -176,12 +172,31 @@ def _get_job_or_404(job_id: str, db: Session) -> SimulationJob:
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.post("/submit", response_model=JobSummary, status_code=202)
+@router.post(
+    "/submit",
+    response_model=JobSummary | SweepResponse,
+    status_code=202,
+)
 async def submit_job(
     body: JobSubmitRequest,
-    db:   Session = Depends(get_db),
-) -> JobSummary:
-    """Submit a single simulation job."""
+    db: Session = Depends(get_db),
+):
+    swept_params = _extract_swept_params(body.geometry_text)
+
+    if swept_params:
+        sweep_request = SweepSubmitRequest(
+            geometry_text=body.geometry_text,
+            material_ids=body.material_ids,
+            backend_config=body.backend_config,
+            particles=body.particles,
+            inactive=body.inactive,
+            batches=body.batches,
+            seed=body.seed,
+            notes=body.notes,
+        )
+
+        return await submit_sweep(sweep_request, db)
+
     errors = loader.validate(body.geometry_text)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
@@ -221,7 +236,7 @@ async def submit_sweep(
     db:   Session = Depends(get_db),
 ) -> SweepResponse:
     """Submit a parametric sweep — one job per parameter combination."""
-    errors = loader.validate(body.geometry_text)
+    errors = validate_preview(body.geometry_text)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
 
@@ -364,10 +379,19 @@ async def get_job(
 
     if job.status == JobStatus.RUNNING:
         try:
-            backend    = _backend_for_job(job_id)
-            new_status = backend.status(job)
-            if new_status != job.status:
-                job.status = new_status
+            backend     = _backend_for_job(job_id, db)
+            # Capture status BEFORE calling backend.status() because the
+            # backend mutates job.status in-place — comparing new_status to
+            # job.status after the call always yields equal, so the update
+            # block was never entered and the DB was never written.
+            old_status  = job.status
+            new_status  = backend.status(job)   # may mutate job in-place
+            if new_status != old_status:
+                # Ensure finished_at is set for terminal transitions
+                if new_status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+                    if not job.finished_at:
+                        from datetime import datetime, timezone
+                        job.finished_at = datetime.now(timezone.utc)
                 JobRepository(db).update_status(
                     job_id=      job_id,
                     status=      new_status,
@@ -375,10 +399,15 @@ async def get_job(
                     started_at=  job.started_at,
                     finished_at= job.finished_at,
                 )
+                db.expire_all()
+                db.commit()
         except HTTPException:
-            pass
-        except Exception:
-            pass
+            raise
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Failed to persist status update for job %s: %s", job_id, e
+            )
 
     return _to_detail(job)
 
@@ -397,7 +426,7 @@ async def cancel_job(
             detail=f"Job is already {job.status.value} — cannot cancel.",
         )
 
-    backend = _backend_for_job(job_id)
+    backend = _backend_for_job(job_id, db)
 
     try:
         job = backend.cancel(job)
@@ -432,3 +461,32 @@ async def delete_job(
 
     JobRepository(db).delete(job_id)
     return DeletedResponse(id=job_id)
+
+@router.get("/{job_id}/stdout")
+async def get_job_stdout(
+    job_id: str,
+    db:     Session = Depends(get_db),
+) -> dict:
+    """Return the raw stdout from a job's run.log file.
+
+    This is the actual OpenMC terminal output — particle transport
+    progress, k-eff per batch, timing, and errors.
+    Polled every 2s by the frontend while a job is running.
+
+    Returns:
+        { "lines": str, "available": bool }
+    """
+    job = _get_job_or_404(job_id, db)
+
+    if not job.working_dir:
+        return {"lines": "", "available": False}
+
+    log_path = job.working_dir / "run.log"
+    if not log_path.exists():
+        return {"lines": "", "available": False}
+
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+        return {"lines": content, "available": True}
+    except OSError:
+        return {"lines": "", "available": False}

@@ -278,3 +278,51 @@ def expand_sweep(
         results.append((param_values, geometry))
 
     return results
+
+def preview_yaml(yaml_text: str) -> str:
+    """
+    Replace every sweep(...) expression with its first value.
+
+    Used by validation and scene preview so sweep-enabled geometries
+    can be edited without generating the full cartesian product.
+    """
+    import yaml
+    from copy import deepcopy
+
+    raw = yaml.safe_load(yaml_text)
+
+    def walk(node):
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+
+        values = parse_sweep(node)
+        if values is not None:
+            return values[0]
+
+        return node
+
+    preview = walk(deepcopy(raw))
+    return yaml.safe_dump(preview, sort_keys=False)
+
+def preview_load(yaml_text: str):
+    """
+    Load a geometry containing sweep(...) expressions by substituting
+    the first sweep value everywhere.
+
+    Example:
+        pitch_x: sweep(1 to 2, step=0.5)
+
+    becomes:
+
+        pitch_x: 1.0
+    """
+    from .loader import load
+
+    return load(preview_yaml(yaml_text))
+
+def validate_preview(yaml_text: str):
+    from .loader import validate
+    return validate(preview_yaml(yaml_text))

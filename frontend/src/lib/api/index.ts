@@ -151,26 +151,25 @@ export const jobs = {
     request(`/api/jobs/${id}`),
 
   submit: (data: {
-    geometry_text: string;
-    material_ids: string[];
+    geometry_text:  string;
+    material_ids:   string[];
+    run_mode?:      string;
     backend_config?: Record<string, unknown>;
-    particles?: number;
-    inactive?: number;
-    batches?: number;
-    notes?: string;
-  }): Promise<JobSummary> =>
-    request('/api/jobs/submit', { method: 'POST', body: JSON.stringify(data) }),
-
-  sweep: (data: {
-    geometry_text: string;
-    material_ids: string[];
-    backend_config?: Record<string, unknown>;
-    particles?: number;
-    inactive?: number;
-    batches?: number;
-    notes?: string;
-  }): Promise<SweepResponse> =>
-    request('/api/jobs/sweep', { method: 'POST', body: JSON.stringify(data) }),
+    particles?:     number;
+    inactive?:      number;
+    batches?:       number;
+    seed?:          number;
+    notes?:         string;
+    // depletion
+    power_W?:       number;
+    timesteps?:     number[];
+    // r2s
+    neutron_source_file?: string;
+  }): Promise<JobSummary | SweepResponse> =>
+    request('/api/jobs/submit', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   cancel: (id: string): Promise<JobSummary> =>
     request(`/api/jobs/${id}/cancel`, { method: 'POST' }),
@@ -178,10 +177,15 @@ export const jobs = {
   delete: (id: string): Promise<{ deleted: boolean; id: string }> =>
     request(`/api/jobs/${id}`, { method: 'DELETE' }),
 
+  // Raw stdout from run.log — polled while job is running
+  stdout: (id: string): Promise<{ lines: string; available: boolean }> =>
+    request(`/api/jobs/${id}/stdout`),
+
   backends: (): Promise<
     { type: string; label: string; description: string; schema: unknown; default: unknown }[]
   > => request('/api/jobs/backends/available'),
 };
+
 
 // ---------------------------------------------------------------------------
 // Results
