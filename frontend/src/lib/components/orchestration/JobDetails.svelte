@@ -4,17 +4,14 @@
   import * as api from '$lib/api';
   import type { JobDetail } from '$lib/types';
 
-  let detail    = $state<JobDetail | null>(null);
-  let log       = $state<string>('');
-  let loading   = $state(false);
+  let detail     = $state<JobDetail | null>(null);
+  let log        = $state<string>('');
+  let loading    = $state(false);
   let cancelling = $state(false);
   let deleting   = $state(false);
-  let error     = $state<string | null>(null);
+  let error      = $state<string | null>(null);
   let logInterval: ReturnType<typeof setInterval> | null = null;
 
-  // Re-fetch detail whenever selectedJobId changes.
-  // Return a cleanup fn so Svelte tears down the interval before re-running
-  // (e.g. when the user switches jobs quickly).
   $effect(() => {
     const id = jobsState.selectedJobId;
     if (id) {
@@ -29,13 +26,13 @@
   async function loadDetail(id: string) {
     loading = true;
     error   = null;
+    log     = '';
     try {
       detail = await api.jobs.get(id);
+      // Always do an initial log fetch regardless of status
+      await fetchLog(id);
       if (detail.status === 'running' || detail.status === 'queued') {
         startLogPolling(id);
-      } else {
-        stopLogPolling();
-        await loadLog(id);
       }
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to load job.';
@@ -44,17 +41,24 @@
     }
   }
 
-  async function loadLog(id: string) {
+  // Fetch the full raw stdout for a job and replace log state.
+  // Primary: api.jobs.log (raw stdout string).
+  // Fallback: api.results.get — show all fields unfiltered.
+  async function fetchLog(id: string) {
+  try {
+    const res = await api.jobs.stdout(id);
+    log = res.available ? res.lines : '';
+  } catch {
     try {
       const res = await api.results.get(id);
-      // k-effective is the main output we have right now
-      if (res.k_effective != null) {
-        log = `k-effective (Track-length) = ${res.k_effective} +/- ${res.k_uncertainty ?? '?'}`;
-      }
+      log = Object.entries(res)
+        .map(([k, v]) => `${k} = ${v}`)
+        .join('\n');
     } catch {
-      // results not yet available — normal for running jobs
+      // results not yet available
     }
   }
+}
 
   function startLogPolling(id: string) {
     stopLogPolling();
@@ -62,22 +66,20 @@
       try {
         const updated = await api.jobs.get(id);
 
-        // Update detail panel fields in-place
         if (detail) {
           detail.status      = updated.status;
           detail.finished_at = updated.finished_at;
           detail.error       = updated.error;
         }
 
-        // Mutate the matching entry in jobsState.list directly so the
-        // sidebar pill updates immediately. refreshJobs() also does this
-        // now via its merge logic, but doing it here gives instant feedback.
         const listEntry = jobsState.list.find(j => j.id === id);
         if (listEntry) listEntry.status = updated.status;
 
+        // Re-fetch full log every tick so new lines appear
+        await fetchLog(id);
+
         if (updated.status !== 'running' && updated.status !== 'queued') {
           stopLogPolling();
-          await loadLog(id);
         }
       } catch { /* ignore transient errors */ }
     }, 3000);
@@ -342,6 +344,7 @@
     grid-template-columns: 1fr 1fr;
     gap: 10px;
     height: 100%;
+    min-height: 0;
   }
 
   .col {
@@ -349,6 +352,7 @@
     flex-direction: column;
     gap: 10px;
     min-width: 0;
+    min-height: 0;
   }
 
   /* Window sub-panels — bordered, sharp corners, titlebar */
@@ -357,6 +361,7 @@
     flex-direction: column;
     border: 1px solid var(--color-border);
     overflow: hidden;
+    min-height: 0;
   }
 
   .win-header {
@@ -380,17 +385,21 @@
   .win-body {
     padding: 10px;
     flex: 1;
+    min-height: 0;
   }
 
   /* Output window stretches to fill remaining space in its column */
   .output-win {
     flex: 1;
     min-height: 0;
+    height: 0;
   }
 
   .log-body {
     display: flex;
     flex-direction: column;
+    flex: 1;
+    min-height: 0;
     overflow: hidden;
     padding: 0;
   }
@@ -487,7 +496,10 @@
     white-space: pre-wrap;
     word-break: break-word;
     line-height: 1.6;
+
     flex: 1;
+    min-height: 0;
+
     overflow-y: auto;
   }
 

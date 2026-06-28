@@ -11,6 +11,7 @@ import type {
   SweepResultsResponse,
   TallyResultSet,
   ValidationResponse,
+  BackendProfile, ProfileCreatePayload, ProfileUpdatePayload,
 } from '$lib/types';
 
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
@@ -145,47 +146,71 @@ export const materials = {
 
 export const jobs = {
   list: (): Promise<JobSummary[]> =>
-    request('/api/jobs/'),
+      request('/api/jobs/'),
 
   get: (id: string): Promise<JobDetail> =>
-    request(`/api/jobs/${id}`),
+      request(`/api/jobs/${id}`),
 
   submit: (data: {
-    geometry_text:  string;
-    material_ids:   string[];
-    run_mode?:      string;
+    geometry_text: string;
+    material_ids: string[];
+    run_mode?: string;
     backend_config?: Record<string, unknown>;
-    particles?:     number;
-    inactive?:      number;
-    batches?:       number;
-    seed?:          number;
-    notes?:         string;
+    particles?: number;
+    inactive?: number;
+    batches?: number;
+    seed?: number;
+    notes?: string;
     // depletion
-    power_W?:       number;
-    timesteps?:     number[];
+    power_W?: number;
+    timesteps?: number[];
     // r2s
     neutron_source_file?: string;
   }): Promise<JobSummary | SweepResponse> =>
-    request('/api/jobs/submit', {
+      request('/api/jobs/submit', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+
+  cancel: (id: string): Promise<JobSummary> =>
+      request(`/api/jobs/${id}/cancel`, {method: 'POST'}),
+
+  delete: (id: string): Promise<{ deleted: boolean; id: string }> =>
+      request(`/api/jobs/${id}`, {method: 'DELETE'}),
+
+  // Raw stdout from run.log — polled while job is running
+  stdout: (id: string): Promise<{ lines: string; available: boolean }> =>
+      request(`/api/jobs/${id}/stdout`),
+};
+
+// ---------------------------------------------------------------------------
+// Backends
+// ---------------------------------------------------------------------------
+
+export const profiles = {
+  list: (): Promise<BackendProfile[]> =>
+    request('/api/jobs/backends/profiles/'),
+
+  get: (name: string): Promise<BackendProfile> =>
+    request(`/api/jobs/backends/profiles/${encodeURIComponent(name)}`),
+
+  create: (data: ProfileCreatePayload): Promise<BackendProfile> =>
+    request('/api/jobs/backends/profiles/', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
 
-  cancel: (id: string): Promise<JobSummary> =>
-    request(`/api/jobs/${id}/cancel`, { method: 'POST' }),
+  update: (name: string, data: ProfileUpdatePayload): Promise<BackendProfile> =>
+    request(`/api/jobs/backends/profiles/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
 
-  delete: (id: string): Promise<{ deleted: boolean; id: string }> =>
-    request(`/api/jobs/${id}`, { method: 'DELETE' }),
-
-  // Raw stdout from run.log — polled while job is running
-  stdout: (id: string): Promise<{ lines: string; available: boolean }> =>
-    request(`/api/jobs/${id}/stdout`),
-
-  backends: (): Promise<
-    { type: string; label: string; description: string; schema: unknown; default: unknown }[]
-  > => request('/api/jobs/backends/available'),
+  delete: (name: string): Promise<void> =>
+    request(`/api/jobs/backends/profiles/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    }),
 };
-
 
 // ---------------------------------------------------------------------------
 // Results

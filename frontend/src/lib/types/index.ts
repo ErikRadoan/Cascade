@@ -125,6 +125,81 @@ export interface SweepResultsResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Backend Profiles
+// ---------------------------------------------------------------------------
+
+export type BackendType = 'docker' | 'local' | 'slurm';
+
+/** Config shapes per backend type — stored as config_data on a BackendProfile. */
+export interface DockerBackendConfig {
+  type:                          'docker';
+  cli:                           'podman' | 'docker';
+  image:                         string;
+  openmc_bin:                    string;
+  nuclear_data_path:             string;
+  nuclear_data_container_path:   string;
+  jobs_base_dir:                 string;
+  memory_limit:                  string;
+  cpu_limit:                     string;
+}
+
+export interface LocalBackendConfig {
+  type:                'local';
+  openmc_bin:          string;
+  nuclear_data_path:   string;
+  jobs_base_dir:       string;
+}
+
+export interface SlurmBackendConfig {
+  type:              'slurm';
+  host:              string;
+  username:          string;
+  ssh_key_path:      string;
+  ssh_port:          number;
+  partition:         string;
+  nodes:             number;
+  tasks_per_node:    number;
+  walltime:          string;
+  memory_per_node:   string;
+  account:           string | null;
+  openmc_module:     string | null;
+  openmc_bin:        string;
+  remote_work_dir:   string;
+  nuclear_data_path: string;
+  jobs_base_dir:     string;
+}
+
+export type BackendConfigData =
+  | Omit<DockerBackendConfig, 'type'>
+  | Omit<LocalBackendConfig,  'type'>
+  | Omit<SlurmBackendConfig,  'type'>;
+
+/** A named, saved backend configuration — mirrors backend BackendProfile domain model. */
+export interface BackendProfile {
+  name:         string;
+  backend_type: BackendType;
+  config_data:  Record<string, unknown>;
+  description:  string | null;
+  created_at:   string;   // ISO-8601 UTC
+  updated_at:   string;   // ISO-8601 UTC
+}
+
+/** POST /api/jobs/backends/profiles/ */
+export interface ProfileCreatePayload {
+  name:          string;
+  backend_type:  BackendType;
+  config_data:   Record<string, unknown>;
+  description?:  string | null;
+}
+
+/** PUT /api/jobs/backends/profiles/{name} */
+export interface ProfileUpdatePayload {
+  backend_type:  BackendType;
+  config_data:   Record<string, unknown>;
+  description?:  string | null;
+}
+
+// ---------------------------------------------------------------------------
 // UI state types (not from backend)
 // ---------------------------------------------------------------------------
 

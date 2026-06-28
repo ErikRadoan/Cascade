@@ -24,7 +24,7 @@ const DEFAULT_TEXT = `# Cascade geometry definition
 my_fuel_pin:
   type: FuelPin
   pellet_radius: 0.4096
-  pellet_height: 365.76
+  pellet_height: 10.0
   pellet_material: UO2
   gap_thickness: 0.0082
   gap_material: He
@@ -35,7 +35,7 @@ my_box:
   type: Box
   x_size: 1.26
   y_size: 1.26
-  z_size: 365.76
+  z_size: 10.0
   material: H2O
   boundary_type: reflective
 

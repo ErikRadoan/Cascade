@@ -202,7 +202,7 @@
                   checked={field.value as boolean}
                   onchange={(e) => onInputChange(field, e)}
                 />
-              {:else if field.key === 'material' && !isSweepExpression(field.value)}
+              {:else if field.key.includes('material') && !isSweepExpression(field.value)}
                 <MaterialSearchSelect
                   value={String(field.value)}
                   onChange={(id) => updateField(field.key, id)}

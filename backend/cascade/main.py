@@ -9,6 +9,7 @@ from .api.geometry import router as geometry_router
 from .api.jobs import router as jobs_router
 from .api.materials import router as materials_router
 from .api.results import router as results_router
+from .api.backends import router as backends_router
 from .repositories.db import create_tables
 
 app = FastAPI(
@@ -53,6 +54,7 @@ app.include_router(geometry_router,  prefix="/api")
 app.include_router(materials_router, prefix="/api")
 app.include_router(jobs_router,      prefix="/api")
 app.include_router(results_router,   prefix="/api")
+app.include_router(backends_router,  prefix="/api")
 
 
 # ---------------------------------------------------------------------------
