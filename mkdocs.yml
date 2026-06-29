@@ -1,0 +1,41 @@
+site_name: Cascade
+site_description: Scientific MSR Reactor Simulation Platform
+site_author: Erik Radovan
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+
+nav:
+  - Home: index.md
+
+  - User Guide:
+      - Overview: User Guide/overview.md
+
+  - API:
+      - Explorer: API/index.md
+      - Overview: API/overview.md
+
+  - Decisions (ADR):
+      - ADR 001 - Svelte + FastAPI + uv: Decisions/001-svelte-fastapi-uv.md
+      - ADR 002 - Geometry DSL: Decisions/002-geometry-definition-langugage.md
+      - Template: Decisions/ADR_TEMPLATE.md
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight
+
+plugins:
+  - search
