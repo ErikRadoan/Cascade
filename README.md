@@ -1,9 +1,9 @@
 <p align="center">
-  <img src="docs/assets/Cascade_Banner.svg" alt="Cascade" width="100%"/>
+  <img src="docs/Assets/Cascade_Banner.svg" alt="Cascade" width="100%"/>
 </p>
 
 <p align="center">
-  <img src="docs/assets/Cascade_Geometry_Editor.png" alt="Cascade Geometry Editor" width="2868" style="border-radius: 8px; margin-top: 16px;"/>
+  <img src="docs/Assets/Cascade_Geometry_Editor.png" alt="Cascade Geometry Editor" width="2868" style="border-radius: 8px; margin-top: 16px;"/>
 </p>
 
 ---

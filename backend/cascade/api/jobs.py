@@ -15,6 +15,17 @@ from ..repositories.job_repository import JobRepository
 from ..repositories.sweep_repository import SweepRepository
 from ..adapters.openmc_adapter import OpenMCRunSettings
 from ..domain.job import JobStatus, SimulationJob
+from ..domain.results_config import (
+    DiagnosticsConfig,
+    EnergyGroupStructure,
+    EnergySpectraConfig,
+    MeshTallyConfig,
+    MeshType,
+    ResultsConfig,
+    ScalarTallyConfig,
+    SimulationSummaryConfig,
+    TallyScore,
+)
 from ..dsl import loader, expander
 from ..dsl.sweep import expand_sweep, parse_sweep, validate_preview
 from ..execution.backend_config import (
@@ -47,26 +58,102 @@ _DEFAULT_BACKEND_CONFIG = DockerBackendConfig(
 # Request models
 # ---------------------------------------------------------------------------
 
+class ScalarTallyRequest(BaseModel):
+    """Controls per-cell scalar tallies (flux, fission, absorption, heating)."""
+    enabled:   bool            = True
+    scores:    list[str]       = Field(
+        default=["flux", "fission", "absorption", "heating"],
+        description="TallyScore values to measure per cell.",
+    )
+    all_cells: bool            = False
+
+
+class MeshTallyRequest(BaseModel):
+    """Controls the 3-D mesh tally (power/flux map)."""
+    enabled:   bool       = False
+    mesh_type: str        = "regular"   # "regular" | "cylindrical"
+    nx:        int        = Field(20, gt=0)
+    ny:        int        = Field(20, gt=0)
+    nz:        int        = Field(20, gt=0)
+    nr:        int        = Field(20, gt=0)   # cylindrical only
+    nz_cyl:    int        = Field(20, gt=0)   # cylindrical only
+    scores:    list[str]  = Field(default=["flux", "fission", "heating-local"])
+
+
+class EnergySpectraRequest(BaseModel):
+    """Controls flux-vs-energy spectra per material region."""
+    enabled:         bool = False
+    group_structure: str  = "69"    # "33" | "69" | "252"
+    per_material:    bool = True
+
+
+class DiagnosticsRequest(BaseModel):
+    stochastic_volumes: bool = False
+    particle_tracks:    bool = False
+    n_tracks:           int  = Field(100, gt=0)
+
+
+class ResultsConfigRequest(BaseModel):
+    """What to ask OpenMC to capture.  All groups default to the cheapest option."""
+    scalars:     ScalarTallyRequest   = Field(default_factory=ScalarTallyRequest)
+    mesh:        MeshTallyRequest     = Field(default_factory=MeshTallyRequest)
+    spectra:     EnergySpectraRequest = Field(default_factory=EnergySpectraRequest)
+    diagnostics: DiagnosticsRequest   = Field(default_factory=DiagnosticsRequest)
+
+    def to_domain(self) -> ResultsConfig:
+        """Convert Pydantic request model → domain ResultsConfig."""
+        return ResultsConfig(
+            summary=SimulationSummaryConfig(),  # always on
+            scalars=ScalarTallyConfig(
+                enabled=self.scalars.enabled,
+                scores=[TallyScore(s) for s in self.scalars.scores],
+                all_cells=self.scalars.all_cells,
+            ),
+            mesh=MeshTallyConfig(
+                enabled=self.mesh.enabled,
+                mesh_type=MeshType(self.mesh.mesh_type),
+                nx=self.mesh.nx,
+                ny=self.mesh.ny,
+                nz=self.mesh.nz,
+                nr=self.mesh.nr,
+                nz_cyl=self.mesh.nz_cyl,
+                scores=[TallyScore(s) for s in self.mesh.scores],
+            ),
+            spectra=EnergySpectraConfig(
+                enabled=self.spectra.enabled,
+                group_structure=EnergyGroupStructure(self.spectra.group_structure),
+                per_material=self.spectra.per_material,
+            ),
+            diagnostics=DiagnosticsConfig(
+                stochastic_volumes=self.diagnostics.stochastic_volumes,
+                particle_tracks=self.diagnostics.particle_tracks,
+                n_tracks=self.diagnostics.n_tracks,
+            ),
+        )
+
+
 class JobSubmitRequest(BaseModel):
     geometry_text:  str
     material_ids:   list[str]
-    backend_config: BackendConfig = Field(default=_DEFAULT_BACKEND_CONFIG)
-    particles: int  = Field(1000, gt=0)
-    inactive:  int  = Field(20,   gt=0)
-    batches:   int  = Field(100,  gt=0)
-    seed:      int  = 1
-    notes:     str | None = None
+    backend_config: BackendConfig          = Field(default=_DEFAULT_BACKEND_CONFIG)
+    particles:      int                    = Field(1000, gt=0)
+    inactive:       int                    = Field(20,   gt=0)
+    batches:        int                    = Field(100,  gt=0)
+    seed:           int                    = 1
+    results_config: ResultsConfigRequest   = Field(default_factory=ResultsConfigRequest)
+    notes:          str | None             = None
 
 
 class SweepSubmitRequest(BaseModel):
     geometry_text:  str
     material_ids:   list[str]
-    backend_config: BackendConfig = Field(default=_DEFAULT_BACKEND_CONFIG)
-    particles: int  = Field(1000, gt=0)
-    inactive:  int  = Field(20,   gt=0)
-    batches:   int  = Field(100,  gt=0)
-    seed:      int  = 1
-    notes:     str | None = None
+    backend_config: BackendConfig          = Field(default=_DEFAULT_BACKEND_CONFIG)
+    particles:      int                    = Field(1000, gt=0)
+    inactive:       int                    = Field(20,   gt=0)
+    batches:        int                    = Field(100,  gt=0)
+    seed:           int                    = 1
+    results_config: ResultsConfigRequest   = Field(default_factory=ResultsConfigRequest)
+    notes:          str | None             = None
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +279,7 @@ async def submit_job(
             inactive=body.inactive,
             batches=body.batches,
             seed=body.seed,
+            results_config=body.results_config,
             notes=body.notes,
         )
 
@@ -217,6 +305,7 @@ async def submit_job(
         materials=materials,
         param_values={},
         backend=body.backend_config.type,
+        results_config=body.results_config.to_domain(),
         working_dir=Path(body.backend_config.jobs_base_dir) / job_id,
         notes=body.notes,
     )
@@ -269,6 +358,7 @@ async def submit_sweep(
             materials=materials,
             param_values=param_values,
             backend=body.backend_config.type,
+            results_config=body.results_config.to_domain(),
             working_dir=Path(body.backend_config.jobs_base_dir) / job_id,
             notes=body.notes,
         )

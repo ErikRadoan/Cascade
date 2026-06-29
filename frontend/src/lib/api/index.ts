@@ -16,19 +16,28 @@ import type {
 
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 
-async function request<T>(
-  path: string,
-  options: RequestInit = {},
-): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options.headers },
-    ...options,
-  });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`API ${res.status}: ${detail}`);
-  }
-  return res.json() as Promise<T>;
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const url = `${BASE}${path}`;
+
+    console.log("GET", url);
+
+    const res = await fetch(url, {
+        headers: {
+            "Content-Type": "application/json",
+            ...options.headers,
+        },
+        ...options,
+    });
+
+    const text = await res.text();
+
+    console.log(res.status, text);
+
+    if (!res.ok) {
+        throw new Error(`API ${res.status}: ${text}`);
+    }
+
+    return JSON.parse(text);
 }
 
 // ---------------------------------------------------------------------------
@@ -217,12 +226,16 @@ export const profiles = {
 // ---------------------------------------------------------------------------
 
 export const results = {
-  get: (jobId: string): Promise<TallyResultSet> =>
-    request(`/api/results/${jobId}`),
+  summary: (id: string)  =>
+      request(`/api/results/${id}/summary`),
 
-  sweep: (sweepId: string): Promise<SweepResultsResponse> =>
-    request(`/api/results/sweep/${sweepId}`),
+  tallies: (id: string)  =>
+      request(`/api/results/${id}/tallies`),
 
-  downloadUrl: (jobId: string): string =>
-    `${BASE}/api/results/${jobId}/download`,
+  mesh:    (id: string)  =>
+      request(`/api/results/${id}/mesh`),
+  spectra: (id: string)  =>
+      request(`/api/results/${id}/spectra`),
+
+  downloadUrl: (id: string) => `${BASE}/api/results/${id}/statepoint/path`,
 };
