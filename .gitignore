@@ -45,3 +45,4 @@ outputs/
 Thumbs.db
 
 /backend/tests/
+/site/

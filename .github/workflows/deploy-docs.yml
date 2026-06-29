@@ -1,0 +1,30 @@
+name: Deploy Documentation
+
+on:
+  push:
+    branches:
+      - feat/docs  # Triggers the automation whenever you push to main
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version" # or specify "3.11" / "3.12"
+
+      - name: Install dependencies
+        run: uv pip install mkdocs-material # add any other plugins you use here
+
+      - name: Deploy to GitHub Pages
+        run: uv run mkdocs gh-deploy --force
