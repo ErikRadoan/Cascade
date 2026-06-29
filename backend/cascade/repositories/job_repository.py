@@ -26,6 +26,7 @@ from ..domain.geometry import CascadeGeometry, Surface, Cell, SurfaceType, Bound
 from ..domain.geometry import Inside, Outside, Intersection, Union, Complement
 from ..domain.material import Material
 from .models import JobRow
+from ..domain.results_config import ResultsConfig
 
 
 class JobRepository:
@@ -61,6 +62,7 @@ class JobRepository:
                 backend_config= backend_config,
                 geometry_json=  job.geometry.to_dict(),
                 materials_json= [m.to_dict() for m in job.materials],
+                results_config= job.results_config.to_dict(),
                 working_dir=    str(job.working_dir) if job.working_dir else None,
                 notes=          job.notes,
                 error=          job.error,
@@ -70,11 +72,12 @@ class JobRepository:
             )
             self._db.add(row)
         else:
-            existing.status      = job.status.value
-            existing.error       = job.error
+            existing.status = job.status.value
+            existing.error = job.error
             existing.working_dir = str(job.working_dir) if job.working_dir else None
-            existing.started_at  = job.started_at
+            existing.started_at = job.started_at
             existing.finished_at = job.finished_at
+            existing.results_config = job.results_config.to_dict()
 
         self._db.commit()
         return job
@@ -151,18 +154,23 @@ class JobRepository:
     def _row_to_domain(self, row: JobRow) -> SimulationJob:
         """Convert a JobRow back to a SimulationJob domain object."""
         return SimulationJob(
-            id=           row.id,
-            geometry=     _geometry_from_dict(row.geometry_json),
-            materials=    [_material_from_dict(m) for m in row.materials_json],
-            param_values= row.param_values or {},
-            backend=      row.backend,
-            status=       JobStatus(row.status),
-            working_dir=  Path(row.working_dir) if row.working_dir else None,
-            notes=        row.notes,
-            error=        row.error,
-            created_at=   row.created_at,
-            started_at=   row.started_at,
-            finished_at=  row.finished_at,
+            id=row.id,
+            geometry=_geometry_from_dict(row.geometry_json),
+            materials=[_material_from_dict(m) for m in row.materials_json],
+            param_values=row.param_values or {},
+            backend=row.backend,
+            status=JobStatus(row.status),
+            results_config=(
+                ResultsConfig.from_dict(row.results_config)
+                if row.results_config
+                else ResultsConfig.default()
+            ),
+            working_dir=Path(row.working_dir) if row.working_dir else None,
+            notes=row.notes,
+            error=row.error,
+            created_at=row.created_at,
+            started_at=row.started_at,
+            finished_at=row.finished_at,
         )
 
 

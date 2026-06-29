@@ -46,6 +46,7 @@ class JobRow(Base):
     backend_config: Mapped[dict]          = mapped_column(JSON,   nullable=False, default=dict)
     geometry_json:  Mapped[dict]          = mapped_column(JSON,   nullable=False)
     materials_json: Mapped[list]          = mapped_column(JSON,   nullable=False)
+    results_config: Mapped[dict]          = mapped_column(JSON,   nullable=False, default=dict)
     working_dir:    Mapped[str | None]    = mapped_column(String, nullable=True)
     notes:          Mapped[str | None]    = mapped_column(Text,   nullable=True)
     error:          Mapped[str | None]    = mapped_column(Text,   nullable=True)

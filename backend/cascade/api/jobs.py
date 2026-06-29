@@ -310,6 +310,8 @@ async def submit_job(
         notes=body.notes,
     )
 
+    print(f"Job submited with config {body.results_config.model_dump_json()}")
+
     try:
         job = backend.submit(job)
     except Exception as e:

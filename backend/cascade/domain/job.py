@@ -23,23 +23,21 @@ class JobStatus(StrEnum):
 class SimulationJob:
     """A single simulation job carrying everything needed to run it.
 
-    The job is self-contained — the execution backend receives this object
-    and has everything it needs to stage input files and submit the run.
-    It never needs to query a database or service layer.
-
     Attributes:
         id:             Unique job identifier (UUID string).
         geometry:       Fully resolved CascadeGeometry for this job.
         materials:      All materials referenced by cells in geometry.
-        param_values:   Sweep parameter values that produced this geometry.
-                        Empty dict for single (non-sweep) jobs.
-        backend:        Which execution backend to use ("docker", "local", "slurm").
-        results_config: What to capture — tallies, mesh, spectra, diagnostics.
-                        Translated to tallies.xml by the adapter at staging time.
+        param_values:   Sweep parameter values (empty for single jobs).
+        backend:        Which execution backend to use.
+        run_settings:   MC run parameters as a plain dict so the domain model
+                        has no dependency on the adapter layer.
+                        Keys: particles, inactive, batches, seed, run_mode.
+                        The backend reconstructs OpenMCRunSettings from this.
+        results_config: What to capture — drives tallies.xml generation.
         status:         Current lifecycle state.
         working_dir:    Where the backend stages input/output files.
         created_at:     UTC timestamp of job creation.
-        started_at:     UTC timestamp when the backend began execution.
+        started_at:     UTC timestamp when execution began.
         finished_at:    UTC timestamp when the job completed or failed.
         error:          Error message if status is FAILED, else None.
         notes:          Optional human-readable label.
@@ -49,6 +47,13 @@ class SimulationJob:
     materials:      list[Material]
     param_values:   dict[str, float | str]  = field(default_factory=dict)
     backend:        str                     = "docker"
+    run_settings:   dict[str, object]       = field(default_factory=lambda: {
+        "particles": 1000,
+        "inactive":  20,
+        "batches":   100,
+        "seed":      1,
+        "run_mode":  "eigenvalue",
+    })
     results_config: ResultsConfig           = field(default_factory=ResultsConfig.default)
     status:         JobStatus               = JobStatus.QUEUED
     working_dir:    Path | None             = None
@@ -77,6 +82,7 @@ class SimulationJob:
             "geometry_id":    self.geometry.id,
             "param_values":   self.param_values,
             "backend":        self.backend,
+            "run_settings":   self.run_settings,
             "results_config": self.results_config.to_dict(),
             "status":         self.status.value,
             "working_dir":    str(self.working_dir) if self.working_dir else None,

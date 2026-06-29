@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import subprocess
-import shutil
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,10 +39,30 @@ class DockerBackend(ExecutionBackend):
         job.input_dir().mkdir(parents=True, exist_ok=True)
         job.output_dir().mkdir(parents=True, exist_ok=True)
 
+        # Reconstruct OpenMCRunSettings from the plain dict stored on the job.
+        # The domain model stores settings as a dict to avoid an import cycle
+        # (domain → adapter). The backend is the right place to reconstitute it.
+        rs = job.run_settings
+        try:
+            run_settings = OpenMCRunSettings(
+                particles = int(rs.get("particles", 1000)),
+                inactive  = int(rs.get("inactive",  20)),
+                batches   = int(rs.get("batches",   100)),
+                seed      = int(rs.get("seed",      1)),
+                run_mode  = str(rs.get("run_mode",  "eigenvalue")),
+            )
+        except (ValueError, TypeError) as exc:
+            job.status = JobStatus.FAILED
+            job.error  = f"Invalid run settings: {exc}"
+            job.finished_at = datetime.now(timezone.utc)
+            return job
+
         self._adapter.write_input_files(
             geometry=job.geometry,
             materials=job.materials,
             output_dir=job.input_dir(),
+            settings=run_settings,
+            results_config=job.results_config,
         )
 
         cmd = self._build_run_command(job)
@@ -101,15 +120,10 @@ class DockerBackend(ExecutionBackend):
             _running_processes.pop(job.id, None)
 
         if return_code == 0:
-            try:
-                self._finalize_job_outputs(job)
-                job.status = JobStatus.COMPLETED
-            except Exception as e:
-                job.status = JobStatus.FAILED
-                job.error = f"Post-processing failed: {e}"
+            job.status = JobStatus.COMPLETED
         else:
             job.status = JobStatus.FAILED
-            job.error = self._read_last_error(job)
+            job.error  = self._read_last_error(job)
 
         return job.status
 
@@ -134,7 +148,7 @@ class DockerBackend(ExecutionBackend):
 
         result_files = []
         for pattern in ("statepoint.*.h5", "tallies.out", "summary.h5"):
-            result_files.extend(job.output_dir().glob(pattern))
+            result_files.extend(job.input_dir().glob(pattern))
 
         if not result_files:
             raise RuntimeError(f"No result files found in {job.input_dir()}.")
@@ -150,7 +164,6 @@ class DockerBackend(ExecutionBackend):
             "--name", f"cascade-job-{job.id[:8]}",
             "--volume", f"{job.input_dir()}:/work:z",
             "--volume", f"{nuclear_host}:{cfg.nuclear_data_container_path}:ro,z",
-            "--volume", f"{job.output_dir()}:/output:z",
             "--workdir", "/work",
             "--env", f"OPENMC_CROSS_SECTIONS={cfg.cross_sections_container_path}",
         ]
@@ -176,7 +189,7 @@ class DockerBackend(ExecutionBackend):
     def _output_exists(self, job: SimulationJob) -> bool:
         if job.working_dir is None:
             return False
-        return any(job.output_dir().glob("statepoint*.h5"))
+        return any(job.input_dir().glob("statepoint.*.h5"))
 
     def _read_last_error(self, job: SimulationJob) -> str:
         log_path = job.working_dir / "run.log"
@@ -184,26 +197,3 @@ class DockerBackend(ExecutionBackend):
             return "No log file found."
         lines = log_path.read_text().splitlines()
         return "\n".join(lines[-20:] if len(lines) > 20 else lines)
-
-    def _finalize_job_outputs(self, job: SimulationJob) -> None:
-        """Copy OpenMC outputs from working dir to output dir."""
-
-        src_dir = job.input_dir()
-        dst_dir = job.output_dir()
-
-        dst_dir.mkdir(parents=True, exist_ok=True)
-
-        patterns = ("statepoint*.h5", "tallies.out", "summary.h5")
-
-        copied_any = False
-
-        for pattern in patterns:
-            for file in src_dir.glob(pattern):
-                target = dst_dir / file.name
-                shutil.copy2(file, target)
-                copied_any = True
-
-        if not copied_any:
-            raise RuntimeError(
-                f"OpenMC finished but no output files found in {src_dir}"
-            )

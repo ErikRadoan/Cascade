@@ -3,35 +3,44 @@
 Endpoints
 ---------
 GET /results/{job_id}/summary
-    k-eff (all three estimators), neutron balance, timing, batch convergence.
+    k-eff (all three estimators + combined), neutron balance, timing,
+    per-batch k history, Shannon entropy history.
 
 GET /results/{job_id}/tallies
-    Scalar cell tallies — mean + relative std dev per cell per score.
-    Returns the tally index in the same ID scheme used by export_tallies()
-    (101+ for cells, 200 for mesh, 301+ for spectra) so the frontend can
-    correlate results with request config without a separate mapping table.
+    Scalar cell tallies — mean + std dev per cell per score (tally IDs 101–199).
 
 GET /results/{job_id}/mesh
-    3-D mesh tally as a flat array of {x, y, z, score, mean, std_dev} dicts.
-    The mesh shape and bounds are included in the response envelope so the
-    frontend can reconstruct the spatial grid.
+    3-D mesh tally as a structured response (tally ID 200).
 
 GET /results/{job_id}/spectra
-    Energy spectra per material — list of {material_id, group_boundaries, flux}
-    where flux is a list of mean values matching the boundary bins.
+    Energy flux spectra per material (tally IDs 301+).
 
 GET /results/{job_id}/statepoint/path
-    Returns the path to the statepoint file so the frontend can link to it.
-
-All endpoints return 404 when the job doesn't exist or hasn't produced output
-yet, and 422 when the statepoint exists but is malformed.
+    Filesystem path of the final statepoint file (for download links).
 
 HDF5 layout reference:
     https://docs.openmc.org/en/stable/io_formats/statepoint.html
+
+Key HDF5 facts that bit us during development:
+  - global_tallies shape is (4, 3): columns are [sum, sum_sq, ???].
+    Mean = sum / n_realizations. The four rows are:
+    [0] leakage, [1] absorption, [2] fission, [3] nu-fission.
+  - k_combined = [mean, std_dev] (already computed by OpenMC).
+  - k_col_abs, k_abs_tra, k_col_tra are pairwise combined estimators,
+    each [mean, std_dev]. There is no separate k_col/k_abs/k_tracklength.
+  - Individual batch k-eff values live in k_generation (length = n_batches).
+  - Shannon entropy lives in source_shannon_entropy (not "entropy").
+  - results datasets shape: (n_filter_bins, n_score_bins, 2) where
+    dim-2 is [sum, sum_sq]. NOT [mean, rel_err].
+    mean    = sum / n_realizations
+    std_dev = sqrt(max(0, sum_sq/n - mean^2) / (n - 1))
+  - Statepoints are written to the OpenMC working directory, which is
+    job.input_dir() (the /work mount), NOT job.output_dir().
 """
 
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -72,25 +81,30 @@ def _require_completed(job: SimulationJob) -> None:
 
 
 def _find_statepoint(job: SimulationJob) -> Path:
-    """Locate the statepoint HDF5 file in the job output directory.
+    """Locate the statepoint HDF5 file in the job's OpenMC working directory.
 
-    OpenMC names statepoints 'statepoint.<batch>.h5'.  We return the one
-    with the highest batch number (the final, fully-converged result).
-
-    Raises:
-        HTTPException 404: No statepoint file found.
+    OpenMC writes statepoint.<batch>.h5 to the directory it runs in,
+    which for the Docker backend is job.input_dir() (the /work mount).
+    We return the file with the highest batch number — the final result.
     """
-    output_dir = job.output_dir()
-    candidates = sorted(output_dir.glob("statepoint.*.h5"))
+    # OpenMC runs in input_dir (the /work container mount) so statepoints
+    # land there, not in output_dir.
+    search_dirs = [job.input_dir(), job.output_dir()]
+
+    candidates: list[Path] = []
+    for d in search_dirs:
+        if d.exists():
+            candidates.extend(d.glob("statepoint.*.h5"))
+
     if not candidates:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"No statepoint file found in '{output_dir}'. "
-                "The job may have failed before writing output."
+                f"No statepoint file found for job '{job.id}'. "
+                "The job may have failed before writing output, or is still running."
             ),
         )
-    # Sort by batch number embedded in the filename
+
     def _batch_num(p: Path) -> int:
         m = re.search(r"statepoint\.(\d+)\.h5", p.name)
         return int(m.group(1)) if m else 0
@@ -99,7 +113,6 @@ def _find_statepoint(job: SimulationJob) -> Path:
 
 
 def _open_statepoint(job: SimulationJob) -> tuple[Path, h5py.File]:
-    """Open the statepoint HDF5 file, raising 422 on corruption."""
     sp_path = _find_statepoint(job)
     try:
         f = h5py.File(sp_path, "r")
@@ -109,6 +122,33 @@ def _open_statepoint(job: SimulationJob) -> tuple[Path, h5py.File]:
             detail=f"Could not open statepoint '{sp_path}': {exc}",
         )
     return sp_path, f
+
+
+def _kstat(arr: np.ndarray) -> dict[str, float]:
+    """Unpack a 2-element [mean, std_dev] k-eff estimator array."""
+    return {"mean": float(arr[0]), "std_dev": float(arr[1])}
+
+
+def _tally_mean_stddev(
+    total: float,
+    sum_sq: float,
+    n: int,
+) -> tuple[float, float]:
+    """Convert OpenMC's raw sum and sum-of-squares to mean and std dev.
+
+    OpenMC stores per-batch running sums, not means. Conversion:
+        mean    = total / n
+        std_dev = sqrt(max(0, sum_sq/n - mean^2) / (n - 1))
+
+    The max(0, ...) guard prevents tiny negative values due to floating
+    point cancellation when variance is near zero.
+    """
+    if n <= 0:
+        return 0.0, 0.0
+    mean = total / n
+    variance_estimate = (sum_sq / n - mean ** 2) / max(1, n - 1)
+    std_dev = math.sqrt(max(0.0, variance_estimate))
+    return mean, std_dev
 
 
 # ---------------------------------------------------------------------------
@@ -129,31 +169,27 @@ async def get_summary(
           "batches": 100,
           "inactive": 20,
           "particles_per_batch": 1000,
+          "n_realizations": 80,
           "k_effective": {
-            "collision":  {"mean": 1.0023, "std_dev": 0.0004},
-            "absorption": {"mean": 1.0019, "std_dev": 0.0005},
-            "tracklength":{"mean": 1.0021, "std_dev": 0.0003},
-            "combined":   {"mean": 1.0021, "std_dev": 0.0003}
+            "combined":   {"mean": 1.3437, "std_dev": 0.0034},
+            "col_abs":    {"mean": 1.3438, "std_dev": 0.0035},
+            "abs_tra":    {"mean": 1.4413, "std_dev": 0.0001},
+            "col_tra":    {"mean": 1.4352, "std_dev": 0.0001}
           },
-          "entropy_history":   [0.91, 0.93, ...],   # one per active batch
-          "keff_history":      [1.01, 1.00, ...],   # one per active batch
-          "neutron_balance":   {"absorption": 0.62, "fission": 0.38, "leakage": 0.0},
-          "timing":            {"transport": 14.3, "total": 15.1}
+          "entropy_history":   [0.91, 0.93, ...],
+          "keff_history":      [1.40, 1.37, ...],
+          "neutron_balance":   {
+            "leakage":     0.0,
+            "absorption":  107.25,
+            "fission":     143.99,
+            "nu_fission":  0.0
+          },
+          "timing":            {}
         }
     """
     job = _get_job_or_404(job_id, db)
     _require_completed(job)
-
     sp_path, sp = _open_statepoint(job)
-
-    # with h5py.File(sp_path, "r") as f:
-    #     for name, obj in f.items():
-    #         if isinstance(obj, h5py.Dataset):
-    #             if obj.shape == ():
-    #                 print(name, "=", obj[()])
-    #             else:
-    #                 print(name, "=", obj[:])
-
     try:
         return _parse_summary(job_id, sp)
     finally:
@@ -161,80 +197,78 @@ async def get_summary(
 
 
 def _parse_summary(job_id: str, sp: h5py.File) -> dict[str, Any]:
-    batches  = int(sp["n_batches"][()]) if "n_batches" in sp else 0
-    inactive = int(sp["n_inactive"][()]) if "n_inactive" in sp else 0
-    pps      = int(sp["n_particles"][()]) if "n_particles" in sp else 0
+    # ── Basic run parameters ────────────────────────────────────────────────
+    batches       = int(sp["n_batches"][()]) if "n_batches" in sp else 0
+    inactive      = int(sp["n_inactive"][()]) if "n_inactive" in sp else 0
+    pps           = int(sp["n_particles"][()]) if "n_particles" in sp else 0
+    n_realizations = int(sp["n_realizations"][()]) if "n_realizations" in sp else max(1, batches - inactive)
 
-    # n_realizations = active batches actually accumulated; used to normalise
-    # the raw sums that OpenMC stores in the HDF5 results datasets.
-    n_real = int(sp["n_realizations"][()]) if "n_realizations" in sp else max(batches - inactive, 1)
+    # ── k-effective estimators ───────────────────────────────────────────────
+    # k_combined, k_col_abs, k_abs_tra, k_col_tra are all [mean, std_dev] arrays.
+    # Individual estimator values are encoded in global_tallies (see below).
+    k_effective: dict[str, dict] = {}
 
-    # k_combined is shape (2,) → [mean, std_dev]  (already normalised by OpenMC)
-    def _keff_combined(key: str) -> dict[str, float] | None:
-        node = sp.get(key)
-        if node is None:
-            return None
-        arr = node[()]
-        if arr.ndim == 1 and arr.shape[0] >= 2:
-            return {"mean": float(arr[0]), "std_dev": float(arr[1])}
-        return None
+    for key, label in [
+        ("k_combined", "combined"),
+        ("k_col_abs",  "col_abs"),
+        ("k_abs_tra",  "abs_tra"),
+        ("k_col_tra",  "col_tra"),
+    ]:
+        if key in sp:
+            arr = sp[key][()]
+            if arr.ndim == 1 and len(arr) >= 2:
+                k_effective[label] = _kstat(arr)
 
-    # k_col_abs / k_col_tra / k_abs_tra are plain scalars (single float) —
-    # OpenMC writes these as the ratio k already divided by n_realizations.
-    def _keff_scalar(key: str) -> dict[str, float] | None:
-        node = sp.get(key)
-        if node is None:
-            return None
-        return {"mean": float(node[()]), "std_dev": None}
-
-    k_effective: dict[str, Any] = {
-        "col_absorption":  _keff_scalar("k_col_abs"),
-        "col_tracklength": _keff_scalar("k_col_tra"),
-        "abs_tracklength": _keff_scalar("k_abs_tra"),
-        "combined":        _keff_combined("k_combined"),
-    }
-    # Remove missing estimators
-    k_effective = {k: v for k, v in k_effective.items() if v is not None}
-
-    # Per-batch histories (active batches only)
+    # ── Per-batch histories ──────────────────────────────────────────────────
+    # k_generation has one value per batch (inactive + active combined).
+    # source_shannon_entropy has one value per active batch.
+    keff_history: list[float] = []
     entropy_history: list[float] = []
-    keff_history:    list[float] = []
 
-    if "entropy" in sp:
-        entropy_history = sp["entropy"][()].tolist()
     if "k_generation" in sp:
         keff_history = sp["k_generation"][()].tolist()
 
-    # Neutron balance
-    # global_tallies shape: (4, 3) — columns are [sum, sum_sq, ???]
-    # Row order per OpenMC docs: leakage, absorption, fission, nu-fission
-    # Divide column 1 (sum) by n_realizations to get the per-batch mean.
+    # OpenMC uses "source_shannon_entropy" in recent versions; fall back to
+    # "entropy" for older builds.
+    for entropy_key in ("source_shannon_entropy", "entropy"):
+        if entropy_key in sp:
+            entropy_history = sp[entropy_key][()].tolist()
+            break
+
+    # ── Neutron balance from global_tallies ─────────────────────────────────
+    # global_tallies shape: (4, 3) — rows are [leakage, absorption, fission, nu-fission]
+    # Columns are [sum, sum_sq, <unused>].
+    # Mean per source neutron = sum / n_realizations.
     neutron_balance: dict[str, float] = {}
     if "global_tallies" in sp:
         gt = sp["global_tallies"][()]
-        if gt.ndim == 2 and gt.shape[1] >= 2:
-            labels = ["leakage", "absorption", "fission", "nu_fission"]
-            for i, label in enumerate(labels):
-                if i < gt.shape[0]:
-                    neutron_balance[label] = float(gt[i, 1]) / n_real
+        labels = ["leakage", "absorption", "fission", "nu_fission"]
+        for i, label in enumerate(labels):
+            if i < gt.shape[0]:
+                raw_sum = float(gt[i, 0])
+                neutron_balance[label] = raw_sum / n_realizations if n_realizations > 0 else 0.0
 
-    # Timing
+    # ── Timing ───────────────────────────────────────────────────────────────
     timing: dict[str, float] = {}
     if "runtime" in sp:
         rt = sp["runtime"]
         for key in rt.keys():
-            timing[key] = float(rt[key][()])
+            try:
+                timing[key] = float(rt[key][()])
+            except Exception:
+                pass
 
     return {
-        "job_id":               job_id,
-        "batches":              batches,
-        "inactive":             inactive,
-        "particles_per_batch":  pps,
-        "k_effective":          k_effective,
-        "entropy_history":      entropy_history,
-        "keff_history":         keff_history,
-        "neutron_balance":      neutron_balance,
-        "timing":               timing,
+        "job_id":              job_id,
+        "batches":             batches,
+        "inactive":            inactive,
+        "particles_per_batch": pps,
+        "n_realizations":      n_realizations,
+        "k_effective":         k_effective,
+        "entropy_history":     entropy_history,
+        "keff_history":        keff_history,
+        "neutron_balance":     neutron_balance,
+        "timing":              timing,
     }
 
 
@@ -247,7 +281,7 @@ async def get_tallies(
     job_id: str,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Return scalar cell tally results — mean + relative std dev per cell/score.
+    """Return scalar cell tally results — mean + std dev per cell per score.
 
     Response schema::
 
@@ -258,41 +292,37 @@ async def get_tallies(
               "tally_id": 101,
               "name": "cell_1_scalars",
               "scores": {
-                "flux":       {"mean": 3.14e12, "std_dev": 0.0023},
-                "fission":    {"mean": 1.02e11, "std_dev": 0.0031},
-                ...
+                "flux":    {"mean": 3.14e12, "std_dev": 7.2e10, "rel_err": 0.023},
+                "fission": {"mean": 1.02e11, "std_dev": 3.2e9,  "rel_err": 0.031}
               }
-            },
-            ...
+            }
           ]
         }
     """
     job = _get_job_or_404(job_id, db)
     _require_completed(job)
-
     sp_path, sp = _open_statepoint(job)
     try:
-        return _parse_tallies(job_id, sp)
+        n_real = int(sp["n_realizations"][()]) if "n_realizations" in sp else 1
+        return _parse_tallies(job_id, sp, n_real)
     finally:
         sp.close()
 
 
-def _parse_tallies(job_id: str, sp: h5py.File) -> dict[str, Any]:
+def _parse_tallies(job_id: str, sp: h5py.File, n_realizations: int) -> dict[str, Any]:
     tallies_grp = sp.get("tallies")
     if tallies_grp is None:
         return {"job_id": job_id, "tallies": []}
-
-    # n_realizations is needed to convert raw sums → per-batch means.
-    n_real = int(sp["n_realizations"][()]) if "n_realizations" in sp else 1
 
     result: list[dict] = []
 
     for tally_key in tallies_grp.keys():
         t = tallies_grp[tally_key]
+        if not isinstance(t, h5py.Group):
+            continue
         tally_id = int(t.attrs.get("id", 0))
 
-        # Only surface scalar tallies (101–199); mesh and spectra have
-        # dedicated endpoints.
+        # Only scalar tallies (101–199); mesh and spectra have dedicated endpoints.
         if not (100 < tally_id < 200):
             continue
 
@@ -300,36 +330,28 @@ def _parse_tallies(job_id: str, sp: h5py.File) -> dict[str, Any]:
         if isinstance(name, bytes):
             name = name.decode()
 
+        # Decode score names — only one read, no double-fetch
         scores_list: list[str] = []
         if "score_bins" in t:
             scores_list = [
-                s.decode() if isinstance(s, bytes) else s
+                s.decode() if isinstance(s, bytes) else str(s)
                 for s in t["score_bins"][()]
             ]
 
-        # results shape: (n_filter_bins, n_score_bins, 2)
-        # arr[..., 0] = sum of scores across realizations
-        # arr[..., 1] = sum of squares across realizations
         results_data = t.get("results")
         if results_data is None:
             continue
+        # arr shape: (n_filter_bins, n_score_bins, 2)  — [sum, sum_sq]
         arr = results_data[()]
-
-        print(f"[DEBUG] tally {tally_id} arr[0,:,:] =\n{arr[0, :, :]}")
 
         scores_out: dict[str, dict] = {}
         for si, score in enumerate(scores_list):
             if si >= arr.shape[1]:
                 break
-            raw_sum = float(arr[0, si, 0])
-            raw_sum_sq = float(arr[0, si, 1]) if arr.shape[2] > 1 else 0.0
-
-            mean = raw_sum / n_real
-            # Population variance of the batch means, then std dev of the mean
-            variance = (raw_sum_sq / n_real - mean ** 2) / n_real
-            std_dev  = float(np.sqrt(max(variance, 0.0)))
-            rel_err  = (std_dev / mean) if mean != 0.0 else 0.0
-
+            total  = float(arr[0, si, 0])
+            sum_sq = float(arr[0, si, 1]) if arr.shape[2] > 1 else 0.0
+            mean, std_dev = _tally_mean_stddev(total, sum_sq, n_realizations)
+            rel_err = (std_dev / mean) if mean != 0.0 else 0.0
             scores_out[score] = {
                 "mean":    mean,
                 "std_dev": std_dev,
@@ -370,14 +392,11 @@ async def get_mesh(
           },
           "scores": ["flux", "fission", "heating-local"],
           "data": [
-            {"ix": 0, "iy": 0, "iz": 0, "flux_mean": ..., "flux_std_dev": ...},
+            {"ix": 0, "iy": 0, "iz": 0,
+             "flux_mean": 1.2e13, "flux_std_dev": 3.1e11, ...},
             ...
           ]
         }
-
-    The ``data`` array is ordered (ix, iy, iz) with ix varying slowest —
-    consistent with NumPy C-order flattening of a (nx, ny, nz) array.
-    For large meshes (>50³) consider the binary /mesh/raw endpoint instead.
     """
     job = _get_job_or_404(job_id, db)
     _require_completed(job)
@@ -390,7 +409,8 @@ async def get_mesh(
 
     sp_path, sp = _open_statepoint(job)
     try:
-        return _parse_mesh(job_id, sp, job.results_config.mesh.mesh_type)
+        n_real = int(sp["n_realizations"][()]) if "n_realizations" in sp else 1
+        return _parse_mesh(job_id, sp, job.results_config.mesh.mesh_type, n_real)
     finally:
         sp.close()
 
@@ -399,53 +419,59 @@ def _parse_mesh(
     job_id: str,
     sp: h5py.File,
     mesh_type: MeshType,
+    n_realizations: int,
 ) -> dict[str, Any]:
     tallies_grp = sp.get("tallies")
     if tallies_grp is None:
         raise HTTPException(status_code=404, detail="No tallies in statepoint.")
 
-    # Find tally ID 200
+    # Find tally with id=200
     mesh_tally = None
     for key in tallies_grp.keys():
         t = tallies_grp[key]
-        if int(t.attrs.get("id", -1)) == 200:
+        if isinstance(t, h5py.Group) and int(t.attrs.get("id", -1)) == 200:
             mesh_tally = t
             break
 
     if mesh_tally is None:
         raise HTTPException(status_code=404, detail="Mesh tally (id=200) not found.")
 
-    # Locate mesh metadata under /tallies/meshes
-    meshes_grp = tallies_grp.get("meshes")
+    # Mesh metadata lives under /tallies/meshes/1 (or the mesh id)
     mesh_meta: dict[str, Any] = {}
-    if meshes_grp is not None and "1" in meshes_grp:
-        m = meshes_grp["1"]
-        shape       = m["dimension"][()] if "dimension" in m else []
-        lower_left  = m["lower_left"][()] .tolist() if "lower_left"  in m else []
-        upper_right = m["upper_right"][()].tolist() if "upper_right" in m else []
-        mesh_meta   = {
-            "type":        mesh_type.value,
-            "shape":       shape.tolist() if hasattr(shape, "tolist") else list(shape),
-            "lower_left":  lower_left,
-            "upper_right": upper_right,
-        }
+    meshes_grp = tallies_grp.get("meshes")
+    if meshes_grp is not None:
+        for mesh_key in meshes_grp.keys():
+            m = meshes_grp[mesh_key]
+            if not isinstance(m, h5py.Group):
+                continue
+            shape       = m["dimension"][()] if "dimension" in m else np.array([1, 1, 1])
+            lower_left  = m["lower_left"][()].tolist() if "lower_left" in m else [0, 0, 0]
+            upper_right = m["upper_right"][()].tolist() if "upper_right" in m else [1, 1, 1]
+            mesh_meta   = {
+                "type":        mesh_type.value,
+                "shape":       shape.tolist() if hasattr(shape, "tolist") else list(shape),
+                "lower_left":  lower_left,
+                "upper_right": upper_right,
+            }
+            break  # use the first mesh found
 
     # Score names
     scores_list: list[str] = []
     if "score_bins" in mesh_tally:
         scores_list = [
-            s.decode() if isinstance(s, bytes) else s
+            s.decode() if isinstance(s, bytes) else str(s)
             for s in mesh_tally["score_bins"][()]
         ]
 
-    results = mesh_tally.get("results")
-    if results is None:
+    results_data = mesh_tally.get("results")
+    if results_data is None:
         return {"job_id": job_id, "tally_id": 200, "mesh": mesh_meta,
                 "scores": scores_list, "data": []}
 
-    arr = results[()]  # shape: (nx*ny*nz, n_scores, 2)
+    # arr shape: (nx*ny*nz, n_scores, 2) — [sum, sum_sq]
+    arr = results_data[()]
     shape = mesh_meta.get("shape", [1, 1, 1])
-    nx, ny, nz = (shape + [1, 1, 1])[:3]
+    nx, ny, nz = (list(shape) + [1, 1, 1])[:3]
 
     data: list[dict] = []
     idx = 0
@@ -458,19 +484,20 @@ def _parse_mesh(
                 for si, score in enumerate(scores_list):
                     if si >= arr.shape[1]:
                         break
-                    mean    = float(arr[idx, si, 0])
-                    rel_err = float(arr[idx, si, 1]) if arr.shape[2] > 1 else 0.0
+                    total  = float(arr[idx, si, 0])
+                    sum_sq = float(arr[idx, si, 1]) if arr.shape[2] > 1 else 0.0
+                    mean, std_dev = _tally_mean_stddev(total, sum_sq, n_realizations)
                     row[f"{score}_mean"]    = mean
-                    row[f"{score}_std_dev"] = rel_err * mean if mean != 0.0 else 0.0
+                    row[f"{score}_std_dev"] = std_dev
                 data.append(row)
                 idx += 1
 
     return {
-        "job_id":    job_id,
-        "tally_id":  200,
-        "mesh":      mesh_meta,
-        "scores":    scores_list,
-        "data":      data,
+        "job_id":   job_id,
+        "tally_id": 200,
+        "mesh":     mesh_meta,
+        "scores":   scores_list,
+        "data":     data,
     }
 
 
@@ -483,7 +510,7 @@ async def get_spectra(
     job_id: str,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Return energy flux spectra per material (or global if per_material=False).
+    """Return energy flux spectra per material (tally IDs 301+).
 
     Response schema::
 
@@ -493,17 +520,17 @@ async def get_spectra(
           "spectra": [
             {
               "tally_id": 301,
-              "name": "spectrum_fuel",
-              "group_boundaries_ev": [1e-5, 1e-4, ...],
-              "flux_mean":    [3.1e12, 2.8e12, ...],
-              "flux_std_dev": [1.2e10, 9.8e9,  ...]
-            },
-            ...
+              "name": "spectrum_H2O",
+              "group_boundaries_ev": [1e-5, ...],
+              "flux_mean":    [3.1e12, ...],
+              "flux_std_dev": [7.2e10, ...]
+            }
           ]
         }
     """
     job = _get_job_or_404(job_id, db)
     _require_completed(job)
+    print(job.results_config.spectra)
 
     if not job.results_config.spectra.enabled:
         raise HTTPException(
@@ -513,7 +540,8 @@ async def get_spectra(
 
     sp_path, sp = _open_statepoint(job)
     try:
-        return _parse_spectra(job_id, sp, job.results_config)
+        n_real = int(sp["n_realizations"][()]) if "n_realizations" in sp else 1
+        return _parse_spectra(job_id, sp, job.results_config, n_real)
     finally:
         sp.close()
 
@@ -521,46 +549,72 @@ async def get_spectra(
 def _parse_spectra(
     job_id: str,
     sp: h5py.File,
-    results_config,
+    results_config: Any,
+    n_realizations: int,
 ) -> dict[str, Any]:
     tallies_grp = sp.get("tallies")
+
+    print("Tallies:", list(tallies_grp.keys()))
+
     if tallies_grp is None:
         return {"job_id": job_id, "spectra": []}
 
     group_structure = results_config.spectra.group_structure.value
     boundaries      = results_config.spectra.boundaries()
-
     spectra_out: list[dict] = []
 
     for key in tallies_grp.keys():
         t = tallies_grp[key]
-        tally_id = int(t.attrs.get("id", -1))
-        if tally_id < 301:
+
+        if not isinstance(t, h5py.Group):
+            continue
+
+        # ONLY real tallies
+        if not key.startswith("tally"):
+            continue
+
+        try:
+            tally_id = int(key.split()[1])
+        except (IndexError, ValueError):
             continue
 
         name = t.attrs.get("name", key)
         if isinstance(name, bytes):
             name = name.decode()
 
-        results = t.get("results")
-        if results is None:
+        results_data = t.get("results")
+        if results_data is None:
             continue
-        arr = results[()]   # shape: (n_energy_bins, 1_score, 2)
 
-        n_bins = arr.shape[0]
-        flux_mean    = [float(arr[i, 0, 0]) for i in range(n_bins)]
-        flux_std_dev = [
-            float(arr[i, 0, 1]) * float(arr[i, 0, 0])
-            if arr.shape[2] > 1 and float(arr[i, 0, 0]) != 0.0 else 0.0
-            for i in range(n_bins)
-        ]
+        # arr shape: (n_material_bins * n_energy_bins, n_scores, 2)
+        # Each tally has exactly one material bin, so shape[0] == n_energy_bins.
+        # OpenMC stores one value per *group* (interval between boundaries),
+        # so n_energy_bins == len(boundaries) - 1.
+        arr = results_data[()]
+        n_energy_bins = arr.shape[0]
 
+        flux_mean:    list[float] = []
+        flux_std_dev: list[float] = []
+
+        for i in range(n_energy_bins):
+            total  = float(arr[i, 0, 0])
+            sum_sq = float(arr[i, 0, 1]) if arr.shape[2] > 1 else 0.0
+            mean, std_dev = _tally_mean_stddev(total, sum_sq, n_realizations)
+            flux_mean.append(mean)
+            flux_std_dev.append(std_dev)
+
+        # group_boundaries_ev has len = n_energy_bins + 1 (fence-post values).
+        # flux_mean/flux_std_dev have len = n_energy_bins (one per group).
         spectra_out.append({
-            "tally_id":           tally_id,
-            "name":               name,
+            "tally_id":            tally_id,
+            "name":                name,
             "group_boundaries_ev": boundaries,
-            "flux_mean":          flux_mean,
-            "flux_std_dev":       flux_std_dev,
+            "group_midpoints_ev":  [
+                math.sqrt(boundaries[i] * boundaries[i + 1])
+                for i in range(len(boundaries) - 1)
+            ],
+            "flux_mean":           flux_mean,
+            "flux_std_dev":        flux_std_dev,
         })
 
     spectra_out.sort(key=lambda x: x["tally_id"])
@@ -572,7 +626,7 @@ def _parse_spectra(
 
 
 # ---------------------------------------------------------------------------
-# /statepoint/path  (utility — lets UI build a download link)
+# /statepoint/path
 # ---------------------------------------------------------------------------
 
 @router.get("/{job_id}/statepoint/path")
@@ -580,17 +634,8 @@ async def get_statepoint_path(
     job_id: str,
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
-    """Return the filesystem path of the final statepoint file.
-
-    Useful for the frontend to construct a download link or display
-    the file location to advanced users who want to load it themselves.
-
-    Response::
-
-        {"job_id": "...", "path": "/home/user/.cascade/jobs/<id>/output/statepoint.100.h5"}
-    """
+    """Return the filesystem path of the final statepoint file."""
     job = _get_job_or_404(job_id, db)
     _require_completed(job)
-
     sp_path = _find_statepoint(job)
     return {"job_id": job_id, "path": str(sp_path)}
