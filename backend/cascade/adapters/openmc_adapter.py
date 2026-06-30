@@ -41,6 +41,15 @@ from ..domain.geometry import (
 )
 from ..domain.material import Material
 from ..domain.result import TallyResult
+from ..domain.results_config import (
+    DiagnosticsConfig,
+    EnergySpectraConfig,
+    MeshTallyConfig,
+    MeshType,
+    ResultsConfig,
+    ScalarTallyConfig,
+    TallyScore,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +113,7 @@ _SURFACE_TYPE_MAP: dict[SurfaceType, str] = {
 }
 
 # Maps our SurfaceType to the ordered parameter names OpenMC expects in coeffs.
-# The expander may use shorthand keys ("z", "r") — we normalise these below
+# The expander may use shorthand keys ("z", "r") — we normalize these below
 # via _PARAM_ALIASES before building the coeffs string.
 _SURFACE_PARAMS_MAP: dict[SurfaceType, list[str]] = {
     SurfaceType.PLANE_X:    ["x0"],
@@ -365,8 +374,12 @@ _FISSILE_NUCLIDES = frozenset({
 })
 
 
-def _is_fissile(material: Material) -> bool:
-    return any(nuc in _FISSILE_NUCLIDES for nuc in material.composition)
+def _material_is_fissile(mat: Material) -> bool:
+    """Return True if a material contains any fissile or fertile nuclide."""
+    return any(
+        any(nuc.startswith(prefix) for prefix in _FISSILE_NUCLIDES)
+        for nuc in mat.composition
+    )
 
 
 def _compute_fissile_source_box(
@@ -380,7 +393,7 @@ def _compute_fissile_source_box(
     Contracts the box by 1% on each side to ensure particles are
     born strictly inside surfaces, never on them.
     """
-    fissile_ids = {m.id for m in materials if _is_fissile(m)}
+    fissile_ids = {m.id for m in materials if _material_is_fissile(m)}
     fissile_cells = [c for c in geometry.cells if c.material_id in fissile_ids]
 
     if not fissile_cells:
@@ -437,6 +450,43 @@ def _surface_ids_in_region(region) -> list[str]:
         return _surface_ids_in_region(region.region)
     return []
 
+def _geometry_z_bounds(geometry: CascadeGeometry) -> tuple[float, float]:
+    """Return (z_min, z_max) from PLANE_Z surfaces."""
+    zvals = [
+        float(s.params.get("z", s.params.get("z0", 0.0)))
+        for s in geometry.surfaces
+        if s.type_ == SurfaceType.PLANE_Z
+    ]
+    if not zvals:
+        return (-10.0, 10.0)
+    return (min(zvals), max(zvals))
+
+
+def _geometry_r_max(geometry: CascadeGeometry) -> float:
+    """Return the maximum radius from CYLINDER_Z surfaces."""
+    radii = [
+        float(s.params.get("r", 1.0))
+        for s in geometry.surfaces
+        if s.type_ == SurfaceType.CYLINDER_Z
+    ]
+    return max(radii) if radii else 10.0
+
+
+def _geometry_bounds(geometry: CascadeGeometry) -> tuple[float, ...]:
+    """Return (xmin, ymin, zmin, xmax, ymax, zmax) enclosing all surfaces."""
+    r = _geometry_r_max(geometry)
+    z_min, z_max = _geometry_z_bounds(geometry)
+    return (-r, -r, z_min, r, r, z_max)
+
+
+def _linspace_str(start: float, stop: float, n: int) -> str:
+    """Return n evenly-spaced values from start to stop as a space-separated string."""
+    if n < 2:
+        return f"{start} {stop}"
+    step = (stop - start) / (n - 1)
+    return " ".join(f"{start + i * step:.6g}" for i in range(n))
+
+
 # ---------------------------------------------------------------------------
 # Main adapter class
 # ---------------------------------------------------------------------------
@@ -458,39 +508,237 @@ class OpenMCAdapter:
     # ------------------------------------------------------------------
 
     def export(
-        self,
-        geometry: CascadeGeometry,
-        materials: list[Material],
-        settings: OpenMCRunSettings | None = None,
+            self,
+            geometry: CascadeGeometry,
+            materials: list[Material],
+            settings: OpenMCRunSettings | None = None,
+            results_config: ResultsConfig | None = None,
     ) -> dict[str, str]:
-        """Export a complete set of OpenMC input files.
+        """Return all OpenMC input file contents as a filename → content dict.
+
+        Always produces geometry.xml, materials.xml, settings.xml.
+        Produces tallies.xml when results_config requests any tally group.
 
         Args:
-            geometry: Resolved CascadeGeometry (surfaces + cells).
-            materials: All materials referenced by cells in this geometry.
-                       Any material_id used in a cell must appear here.
-            settings: Run parameters. Uses conservative defaults if None.
+            geometry:       Fully expanded CascadeGeometry.
+            materials:      Materials referenced by cells in geometry.
+            settings:       Run parameters. Defaults are used if None.
+            results_config: Results capture config. Tallies.xml is only
+                            generated when this is non-None and
+                            results_config.needs_tallies_xml() is True.
 
         Returns:
-            Dict mapping filename to XML string content:
-                "geometry.xml"  — surface and cell definitions
-                "materials.xml" — material compositions
-                "settings.xml"  — Monte Carlo run parameters
-
-        Raises:
-            ValueError: If a cell references a material not in the materials list.
-            KeyError: If a surface type has no OpenMC mapping.
+            dict mapping filename -> XML string content.
         """
         if settings is None:
             settings = OpenMCRunSettings()
 
         material_id_map = {mat.id: i + 1 for i, mat in enumerate(materials)}
 
-        return {
+        files = {
             "geometry.xml": self.export_geometry(geometry, material_id_map),
             "materials.xml": self.export_materials(materials, material_id_map),
-            "settings.xml": self.export_settings(settings, geometry, materials),
+            "settings.xml": self.export_settings(
+                settings, geometry, materials, results_config
+            ),
         }
+
+        if results_config is not None and results_config.needs_tallies_xml():
+            files["tallies.xml"] = self.export_tallies(
+                results_config, geometry, materials, material_id_map
+            )
+
+        return files
+
+    # ------------------------------------------------------------------
+    # Tallies XML
+    # ------------------------------------------------------------------
+
+    def export_tallies(
+        self,
+        config: ResultsConfig,
+        geometry: CascadeGeometry,
+        materials: list[Material],
+        material_id_map: dict[str, int] | None = None,
+    ) -> str:
+        """Serialize ResultsConfig to OpenMC tallies.xml.
+
+        Tally IDs are assigned in fixed order so that result parsing can
+        reconstruct which tally corresponds to which config group without
+        storing a mapping in the DB:
+            1xx — scalar cell tallies   (101, 102, … one per cell)
+            200 — mesh tally
+            3xx — energy spectra        (301, 302, … one per material)
+
+        Args:
+            config:          ResultsConfig carrying user tally choices.
+            geometry:        CascadeGeometry — needed for cell IDs and bounds.
+            materials:       Material list — needed for spectra filters.
+            material_id_map: String material ID → integer OpenMC ID.
+                             Generated from materials if None.
+
+        Returns:
+            tallies.xml content as a string.
+        """
+        if material_id_map is None:
+            material_id_map = {mat.id: i + 1 for i, mat in enumerate(materials)}
+
+        root = ET.Element("tallies")
+
+        # --- Group 2: scalar cell tallies -----------------------------------
+        if config.scalars.enabled:
+            self._append_scalar_tallies(
+                root, config.scalars, geometry, materials, material_id_map
+            )
+
+        # --- Group 3: mesh tally --------------------------------------------
+        if config.mesh.enabled:
+            self._append_mesh_tally(root, config.mesh, geometry)
+
+        # --- Group 4: energy spectra ----------------------------------------
+        if config.spectra.enabled:
+            self._append_spectra_tallies(
+                root, config.spectra, materials, material_id_map
+            )
+
+        return _pretty_xml(root)
+
+    def _append_scalar_tallies(
+        self,
+        root: ET.Element,
+        cfg: ScalarTallyConfig,
+        geometry: CascadeGeometry,
+        materials: list[Material],
+        material_id_map: dict[str, int],
+    ) -> None:
+        """Append one tally per cell (or fissile cell) to *root*."""
+        fissile_ids: set[str] = set()
+        if not cfg.all_cells:
+            fissile_ids = {m.id for m in materials if _material_is_fissile(m)}
+
+        tally_id = 101
+        for cell in geometry.cells:
+            # Skip void cells — they carry no material
+            if cell.material_id is None:
+                continue
+            # If restricted to fissile cells, skip non-fissile
+            if not cfg.all_cells and cell.material_id not in fissile_ids:
+                continue
+
+            tally_el = ET.SubElement(root, "tally")
+            tally_el.set("id", str(tally_id))
+            tally_el.set("name", f"cell_{_int_id(cell.id)}_scalars")
+
+            # CellFilter
+            filters_el = ET.SubElement(tally_el, "filters")
+            cf = ET.SubElement(filters_el, "filter")
+            cf.set("type", "cell")
+            cf.set("bins", _int_id(cell.id))
+
+            # Scores
+            scores_el = ET.SubElement(tally_el, "scores")
+            scores_el.text = " ".join(s.value for s in cfg.scores)
+
+            tally_id += 1
+
+    def _append_mesh_tally(
+        self,
+        root: ET.Element,
+        cfg: MeshTallyConfig,
+        geometry: CascadeGeometry,
+    ) -> None:
+        """Append mesh definition + mesh tally (ID 200) to *root*."""
+        # --- Mesh definition ------------------------------------------------
+        mesh_el = ET.SubElement(root, "mesh")
+        mesh_el.set("id", "1")
+
+        if cfg.mesh_type == MeshType.REGULAR:
+            mesh_el.set("type", "regular")
+            dimension_el = ET.SubElement(mesh_el, "dimension")
+            dimension_el.text = f"{cfg.nx} {cfg.ny} {cfg.nz}"
+
+            # Derive bounds from geometry surfaces
+            bounds = _geometry_bounds(geometry)
+            lower_el = ET.SubElement(mesh_el, "lower_left")
+            lower_el.text = f"{bounds[0]} {bounds[1]} {bounds[2]}"
+            upper_el = ET.SubElement(mesh_el, "upper_right")
+            upper_el.text = f"{bounds[3]} {bounds[4]} {bounds[5]}"
+
+        else:  # CYLINDRICAL
+            mesh_el.set("type", "cylindrical")
+            r_grid_el = ET.SubElement(mesh_el, "r_grid")
+            r_grid_el.text = _linspace_str(0.0, _geometry_r_max(geometry), cfg.nr + 1)
+            z_grid_el = ET.SubElement(mesh_el, "z_grid")
+            z_bounds = _geometry_z_bounds(geometry)
+            z_grid_el.text = _linspace_str(z_bounds[0], z_bounds[1], cfg.nz_cyl + 1)
+
+        # --- Tally referencing the mesh -------------------------------------
+        tally_el = ET.SubElement(root, "tally")
+        tally_el.set("id", "200")
+        tally_el.set("name", "mesh_tally")
+
+        filters_el = ET.SubElement(tally_el, "filters")
+        mf = ET.SubElement(filters_el, "filter")
+        mf.set("type", "mesh")
+        mf.set("bins", "1")
+
+        scores_el = ET.SubElement(tally_el, "scores")
+        scores_el.text = " ".join(s.value for s in cfg.scores)
+
+    def _append_spectra_tallies(
+        self,
+        root: ET.Element,
+        cfg: EnergySpectraConfig,
+        materials: list[Material],
+        material_id_map: dict[str, int],
+    ) -> None:
+        """Append energy spectrum tally/tallies (IDs 301+) to *root*."""
+        boundaries = cfg.boundaries()
+        if not boundaries:
+            return  # ULTRA_252 not yet populated — skip silently
+
+        bounds_str = " ".join(str(b) for b in boundaries)
+
+        if cfg.per_material:
+            tally_id = 301
+            for mat in materials:
+                int_id = material_id_map.get(mat.id)
+                if int_id is None:
+                    continue
+
+                tally_el = ET.SubElement(root, "tally")
+                tally_el.set("id", str(tally_id))
+                tally_el.set("name", f"spectrum_{mat.id}")
+
+                filters_el = ET.SubElement(tally_el, "filters")
+
+                # MaterialFilter
+                mf = ET.SubElement(filters_el, "filter")
+                mf.set("type", "material")
+                mf.set("bins", str(int_id))
+
+                # EnergyFilter
+                ef = ET.SubElement(filters_el, "filter")
+                ef.set("type", "energy")
+                ef.set("bins", bounds_str)
+
+                scores_el = ET.SubElement(tally_el, "scores")
+                scores_el.text = TallyScore.FLUX.value
+
+                tally_id += 1
+        else:
+            # Single global spectrum — no material filter
+            tally_el = ET.SubElement(root, "tally")
+            tally_el.set("id", "301")
+            tally_el.set("name", "spectrum_global")
+
+            filters_el = ET.SubElement(tally_el, "filters")
+            ef = ET.SubElement(filters_el, "filter")
+            ef.set("type", "energy")
+            ef.set("bins", bounds_str)
+
+            scores_el = ET.SubElement(tally_el, "scores")
+            scores_el.text = TallyScore.FLUX.value
 
     def export_geometry(
         self,
@@ -574,11 +822,16 @@ class OpenMCAdapter:
                         settings: OpenMCRunSettings,
                         geometry: CascadeGeometry | None = None,
                         materials: list[Material] | None = None,
+                        results_config: ResultsConfig | None = None,
                         ) -> str:
         """Serialize run settings to OpenMC settings.xml format.
 
         Args:
-            settings: OpenMCRunSettings dataclass.
+            settings:       OpenMCRunSettings dataclass.
+            geometry:       Used for automatic source-box detection.
+            materials:      Used for fissile-cell detection.
+            results_config: When diagnostics.stochastic_volumes is True, emits
+                            a <volume_calc> block required by OpenMC.
 
         Returns:
             settings.xml content as a string.
@@ -621,6 +874,34 @@ class OpenMCAdapter:
             params_el = ET.SubElement(space_el, "parameters")
             params_el.text = " ".join(str(v) for v in source_box)
 
+        # Diagnostics — particle tracks
+        if results_config is not None and results_config.diagnostics.particle_tracks:
+            tracks_el = ET.SubElement(root, "track")
+            tracks_el.text = str(results_config.diagnostics.n_tracks)
+
+        # Diagnostics — stochastic volume calculation
+        # OpenMC requires a <volume_calc> block in settings.xml; it cannot
+        # appear in tallies.xml. Only emitted when explicitly requested.
+        if results_config is not None and results_config.diagnostics.stochastic_volumes:
+            bounds = _geometry_bounds(geometry) if geometry else (-10, -10, -10, 10, 10, 10)
+            vol_el = ET.SubElement(root, "volume_calc")
+            domain_type_el = ET.SubElement(vol_el, "domain_type")
+            domain_type_el.text = "cell"
+            # Tally all cells that carry material
+            cell_ids = [
+                _int_id(c.id) for c in (geometry.cells if geometry else [])
+                if c.material_id is not None
+            ]
+            if cell_ids:
+                domain_ids_el = ET.SubElement(vol_el, "domain_ids")
+                domain_ids_el.text = " ".join(cell_ids)
+            lower_el = ET.SubElement(vol_el, "lower_left")
+            lower_el.text = f"{bounds[0]} {bounds[1]} {bounds[2]}"
+            upper_el = ET.SubElement(vol_el, "upper_right")
+            upper_el.text = f"{bounds[3]} {bounds[4]} {bounds[5]}"
+            samples_el = ET.SubElement(vol_el, "samples")
+            samples_el.text = "100000"
+
         return _pretty_xml(root)
 
     def write_input_files(
@@ -629,6 +910,7 @@ class OpenMCAdapter:
         materials: list[Material],
         output_dir: Path,
         settings: OpenMCRunSettings | None = None,
+        results_config: ResultsConfig | None = None,
     ) -> list[Path]:
         """Export and write all input files to a directory.
 
@@ -640,12 +922,14 @@ class OpenMCAdapter:
             materials: Material library entries referenced by this geometry.
             output_dir: Directory to write files into. Created if absent.
             settings: Run parameters.
+            results_config: Tally capture config. Produces tallies.xml when
+                            any tally group is enabled.
 
         Returns:
             List of Path objects for the written files.
         """
         output_dir.mkdir(parents=True, exist_ok=True)
-        files = self.export(geometry, materials, settings)
+        files = self.export(geometry, materials, settings, results_config)
 
         written: list[Path] = []
         for filename, content in files.items():
@@ -686,3 +970,174 @@ class OpenMCAdapter:
         #   3. Extract mean + std dev per tally bin
         #   4. Map to TallyResult domain objects
         return []
+
+    # ------------------------------------------------------------------
+    # Export tallies - exports tallies from the OpenMC output
+    # ------------------------------------------------------------------
+
+    def export_tallies(
+            self,
+            results_config: ResultsConfig,
+            geometry: CascadeGeometry,
+            materials: list[Material],
+            material_id_map: dict[str, int] | None = None,
+    ) -> str:
+        """Generate tallies.xml for OpenMC.
+
+        Tally ID ranges (must match results.py parser):
+            101–199  Scalar cell tallies (one tally per cell)
+            200      Mesh tally
+            301+     Energy spectra (one tally per material)
+
+        Args:
+            results_config: Which tally groups to emit.
+            geometry:       Used to enumerate cells for scalar tallies.
+            materials:      Used to enumerate materials for spectra tallies.
+            material_id_map: Maps material.id -> integer id (same map used
+                             for materials.xml). Auto-generated if None.
+
+        Returns:
+            tallies.xml content as a UTF-8 string.
+        """
+        if material_id_map is None:
+            material_id_map = {mat.id: i + 1 for i, mat in enumerate(materials)}
+
+        root = ET.Element("tallies")
+
+        # Filter ID counter — all filters are top-level; tallies reference by ID.
+        # OpenMC schema: <filter id="N" type="..."><bins>...</bins></filter>
+        #                <tally id="M"><filters>N ...</filters><scores>...</scores></tally>
+        next_filter_id = 1
+
+        # ── Group 2: Scalar cell tallies (IDs 101+) ─────────────────────────
+        if results_config.scalars.enabled:
+            fissile_mat_ids: set[str] = set()
+            if not results_config.scalars.all_cells:
+                for mat in materials:
+                    if _material_is_fissile(mat):
+                        fissile_mat_ids.add(mat.id)
+
+            tally_id = 101
+            for cell in geometry.cells:
+                if cell.material_id is None:
+                    continue  # void cells have nothing to tally
+
+                if not results_config.scalars.all_cells:
+                    if cell.material_id not in fissile_mat_ids:
+                        continue
+
+                # Top-level CellFilter
+                cell_filter_id = next_filter_id
+                next_filter_id += 1
+                f_el = ET.SubElement(root, "filter")
+                f_el.set("id", str(cell_filter_id))
+                f_el.set("type", "cell")
+                bins_el = ET.SubElement(f_el, "bins")
+                bins_el.text = _int_id(cell.id)
+
+                tally_el = ET.SubElement(root, "tally")
+                tally_el.set("id", str(tally_id))
+                tally_el.set("name", f"cell_{_int_id(cell.id)}_scalars")
+                filters_el = ET.SubElement(tally_el, "filters")
+                filters_el.text = str(cell_filter_id)
+                scores_el = ET.SubElement(tally_el, "scores")
+                scores_el.text = " ".join(s.value for s in results_config.scalars.scores)
+
+                tally_id += 1
+
+        # ── Group 3: Mesh tally (ID 200) ─────────────────────────────────────
+        if results_config.mesh.enabled:
+            cfg = results_config.mesh
+
+            # Mesh definition — must appear before the filter that references it
+            mesh_el = ET.SubElement(root, "mesh")
+            mesh_el.set("id", "1")
+            if cfg.mesh_type == MeshType.REGULAR:
+                mesh_el.set("type", "regular")
+                bounds = _geometry_bounds(geometry)
+                lower_el = ET.SubElement(mesh_el, "lower_left")
+                lower_el.text = f"{bounds[0]} {bounds[1]} {bounds[2]}"
+                upper_el = ET.SubElement(mesh_el, "upper_right")
+                upper_el.text = f"{bounds[3]} {bounds[4]} {bounds[5]}"
+                dim_el = ET.SubElement(mesh_el, "dimension")
+                dim_el.text = f"{cfg.nx} {cfg.ny} {cfg.nz}"
+            else:
+                mesh_el.set("type", "cylindrical")
+                bounds = _geometry_bounds(geometry)
+                origin_el = ET.SubElement(mesh_el, "origin")
+                origin_el.text = "0.0 0.0 0.0"
+                r_el = ET.SubElement(mesh_el, "r_grid")
+                max_r = max(abs(bounds[0]), abs(bounds[1]),
+                            abs(bounds[2]), abs(bounds[3]))
+                r_step = max_r / cfg.nr
+                r_el.text = " ".join(f"{i * r_step:.6g}" for i in range(cfg.nr + 1))
+                z_el = ET.SubElement(mesh_el, "z_grid")
+                z_step = (bounds[5] - bounds[4]) / cfg.nz_cyl
+                z_el.text = " ".join(
+                    f"{bounds[4] + i * z_step:.6g}" for i in range(cfg.nz_cyl + 1)
+                )
+
+            # Top-level MeshFilter
+            mesh_filter_id = next_filter_id
+            next_filter_id += 1
+            mf_el = ET.SubElement(root, "filter")
+            mf_el.set("id", str(mesh_filter_id))
+            mf_el.set("type", "mesh")
+            mf_bins_el = ET.SubElement(mf_el, "bins")
+            mf_bins_el.text = "1"
+
+            tally_el = ET.SubElement(root, "tally")
+            tally_el.set("id", "200")
+            tally_el.set("name", "power_flux_mesh")
+            filters_el = ET.SubElement(tally_el, "filters")
+            filters_el.text = str(mesh_filter_id)
+            scores_el = ET.SubElement(tally_el, "scores")
+            scores_el.text = " ".join(s.value for s in cfg.scores)
+
+        # ── Group 4: Energy spectra (IDs 301+) ───────────────────────────────
+        if results_config.spectra.enabled:
+            cfg = results_config.spectra
+            boundaries = cfg.boundaries()
+
+            if boundaries:
+                energy_bins_text = " ".join(f"{e:.6g}" for e in boundaries)
+
+                # One shared top-level EnergyFilter for all spectrum tallies
+                energy_filter_id = next_filter_id
+                next_filter_id += 1
+                ef_el = ET.SubElement(root, "filter")
+                ef_el.set("id", str(energy_filter_id))
+                ef_el.set("type", "energy")
+                ef_bins_el = ET.SubElement(ef_el, "bins")
+                ef_bins_el.text = energy_bins_text
+
+                if cfg.per_material:
+                    for tally_id, mat in enumerate(materials, start=301):
+                        mat_int_id = material_id_map.get(mat.id, tally_id - 300)
+
+                        # Top-level MaterialFilter for this material
+                        mat_filter_id = next_filter_id
+                        next_filter_id += 1
+                        mat_f_el = ET.SubElement(root, "filter")
+                        mat_f_el.set("id", str(mat_filter_id))
+                        mat_f_el.set("type", "material")
+                        mat_bins_el = ET.SubElement(mat_f_el, "bins")
+                        mat_bins_el.text = str(mat_int_id)
+
+                        tally_el = ET.SubElement(root, "tally")
+                        tally_el.set("id", str(tally_id))
+                        tally_el.set("name", f"spectrum_{mat.id}")
+                        filters_el = ET.SubElement(tally_el, "filters")
+                        filters_el.text = f"{energy_filter_id} {mat_filter_id}"
+                        scores_el = ET.SubElement(tally_el, "scores")
+                        scores_el.text = "flux"
+                else:
+                    tally_el = ET.SubElement(root, "tally")
+                    tally_el.set("id", "301")
+                    tally_el.set("name", "spectrum_global")
+                    filters_el = ET.SubElement(tally_el, "filters")
+                    filters_el.text = str(energy_filter_id)
+                    scores_el = ET.SubElement(tally_el, "scores")
+                    scores_el.text = "flux"
+
+        return _pretty_xml(root)

@@ -72,6 +72,60 @@
   let submitError = $state<string | null>(null);
 
   // ---------------------------------------------------------------------------
+  // Results config state
+  // ---------------------------------------------------------------------------
+
+  // Group 2 — scalar cell tallies
+  let scalarsEnabled  = $state(true);
+  let scalarsAllCells = $state(false);
+  const ALL_SCORES = ['flux', 'fission', 'absorption', 'heating', 'nu-fission', 'heating-local', 'scatter'] as const;
+  type Score = typeof ALL_SCORES[number];
+  let scalarsScores = $state<Set<Score>>(new Set(['flux', 'fission', 'absorption', 'heating']));
+
+  // Group 3 — mesh tally
+  let meshEnabled  = $state(false);
+  let meshType     = $state<'regular' | 'cylindrical'>('regular');
+  let meshNx       = $state(20);
+  let meshNy       = $state(20);
+  let meshNz       = $state(20);
+  let meshNr       = $state(20);
+  let meshNzCyl    = $state(20);
+  let meshScores   = $state<Set<Score>>(new Set(['flux', 'fission', 'heating-local']));
+
+  // Group 4 — energy spectra
+  let spectraEnabled      = $state(false);
+  let spectraGroups       = $state<'33' | '69' | '252'>('69');
+  let spectraPerMaterial  = $state(true);
+
+  // Group 5 — diagnostics
+  let diagStochVol  = $state(false);
+  let diagTracks    = $state(false);
+  let diagNTracks   = $state(100);
+
+  function toggleScore(set: Set<Score>, score: Score): Set<Score> {
+    const next = new Set(set);
+    if (next.has(score)) { if (next.size > 1) next.delete(score); }
+    else next.add(score);
+    return next;
+  }
+
+  const SCORE_LABELS: Record<Score, string> = {
+    'flux':          'Flux',
+    'fission':       'Fission',
+    'absorption':    'Absorption',
+    'heating':       'Heating',
+    'nu-fission':    'ν-Fission',
+    'heating-local': 'Local heat',
+    'scatter':       'Scatter',
+  };
+
+  const GROUP_STRUCTURE_OPTS = [
+    { value: '33',  label: '33-group',  desc: 'CASMO — fast, LWR-appropriate' },
+    { value: '69',  label: '69-group',  desc: 'WIMS — standard PWR analysis'  },
+    { value: '252', label: '252-group', desc: 'Ultra-fine — high cost'         },
+  ] as const;
+
+  // ---------------------------------------------------------------------------
   // Helpers
   // ---------------------------------------------------------------------------
 
@@ -139,6 +193,30 @@
         notes:          notes || undefined,
         run_mode:       runMode,
         backend_config: { type: profile.backend_type, ...profile.config_data },
+        results_config: {
+          scalars: {
+            enabled:   scalarsEnabled,
+            scores:    [...scalarsScores],
+            all_cells: scalarsAllCells,
+          },
+          mesh: {
+            enabled:   meshEnabled,
+            mesh_type: meshType,
+            nx: meshNx, ny: meshNy, nz: meshNz,
+            nr: meshNr, nz_cyl: meshNzCyl,
+            scores: [...meshScores],
+          },
+          spectra: {
+            enabled:         spectraEnabled,
+            group_structure: spectraGroups,
+            per_material:    spectraPerMaterial,
+          },
+          diagnostics: {
+            stochastic_volumes: diagStochVol,
+            particle_tracks:    diagTracks,
+            n_tracks:           diagNTracks,
+          },
+        },
       };
 
       if (RUN_MODES[runMode].needsInactive) body.inactive = inactive;
@@ -337,6 +415,197 @@
           <span class="section-label" style="margin-bottom:0">Notes <span class="optional">(optional)</span></span>
           <input type="text" placeholder="e.g. baseline run, pin cell sweep…" bind:value={notes} />
         </label>
+      </section>
+
+      <!-- ── Results capture ── -->
+      <section class="section">
+        <div class="section-label">Results capture</div>
+
+        <!-- Always-on summary note -->
+        <p class="note" style="margin-bottom:2px">
+          ✓ Simulation summary always captured — k-eff, entropy, batch history, timing.
+        </p>
+
+        <!-- Group 2: Scalar tallies -->
+        <div class="rc-group" class:rc-group-off={!scalarsEnabled}>
+          <div class="rc-group-header">
+            <label class="rc-toggle-label">
+              <input type="checkbox" bind:checked={scalarsEnabled} class="rc-checkbox" />
+              <span class="rc-group-title">Scalar cell tallies</span>
+            </label>
+            <span class="rc-cost">tiny cost</span>
+          </div>
+          {#if scalarsEnabled}
+            <div class="rc-group-body">
+              <div class="rc-row">
+                <span class="rc-field-label">Scores</span>
+                <div class="rc-pill-row">
+                  {#each ALL_SCORES as score}
+                    <button
+                      class="rc-pill"
+                      class:rc-pill-on={scalarsScores.has(score)}
+                      onclick={() => scalarsScores = toggleScore(scalarsScores, score)}
+                      title={scalarsScores.has(score) && scalarsScores.size === 1 ? 'At least one score required' : ''}
+                    >{SCORE_LABELS[score]}</button>
+                  {/each}
+                </div>
+              </div>
+              <div class="rc-row">
+                <span class="rc-field-label">Cell filter</span>
+                <div class="rc-pill-row">
+                  <button class="rc-pill" class:rc-pill-on={!scalarsAllCells} onclick={() => scalarsAllCells = false}>
+                    Fissile only
+                  </button>
+                  <button class="rc-pill" class:rc-pill-on={scalarsAllCells} onclick={() => scalarsAllCells = true}>
+                    All cells
+                  </button>
+                </div>
+              </div>
+            </div>
+          {/if}
+        </div>
+
+        <!-- Group 3: Mesh tally -->
+        <div class="rc-group" class:rc-group-off={!meshEnabled}>
+          <div class="rc-group-header">
+            <label class="rc-toggle-label">
+              <input type="checkbox" bind:checked={meshEnabled} class="rc-checkbox" />
+              <span class="rc-group-title">3-D mesh tally</span>
+            </label>
+            <span class="rc-cost">cost ∝ nx·ny·nz</span>
+          </div>
+          {#if meshEnabled}
+            <div class="rc-group-body">
+              <div class="rc-row">
+                <span class="rc-field-label">Type</span>
+                <div class="rc-pill-row">
+                  <button class="rc-pill" class:rc-pill-on={meshType === 'regular'}     onclick={() => meshType = 'regular'}>Cartesian</button>
+                  <button class="rc-pill" class:rc-pill-on={meshType === 'cylindrical'} onclick={() => meshType = 'cylindrical'}>Cylindrical</button>
+                </div>
+              </div>
+
+              {#if meshType === 'regular'}
+                <div class="rc-row">
+                  <span class="rc-field-label">Voxels</span>
+                  <div class="rc-dim-row">
+                    <label class="rc-dim-field">
+                      <span>nx</span>
+                      <input type="number" min="1" max="500" bind:value={meshNx} />
+                    </label>
+                    <label class="rc-dim-field">
+                      <span>ny</span>
+                      <input type="number" min="1" max="500" bind:value={meshNy} />
+                    </label>
+                    <label class="rc-dim-field">
+                      <span>nz</span>
+                      <input type="number" min="1" max="500" bind:value={meshNz} />
+                    </label>
+                  </div>
+                  <span class="rc-dim-note">{(meshNx * meshNy * meshNz).toLocaleString()} voxels</span>
+                </div>
+              {:else}
+                <div class="rc-row">
+                  <span class="rc-field-label">Bins</span>
+                  <div class="rc-dim-row">
+                    <label class="rc-dim-field">
+                      <span>nr</span>
+                      <input type="number" min="1" max="500" bind:value={meshNr} />
+                    </label>
+                    <label class="rc-dim-field">
+                      <span>nz</span>
+                      <input type="number" min="1" max="500" bind:value={meshNzCyl} />
+                    </label>
+                  </div>
+                  <span class="rc-dim-note">{(meshNr * meshNzCyl).toLocaleString()} bins</span>
+                </div>
+              {/if}
+
+              <div class="rc-row">
+                <span class="rc-field-label">Scores</span>
+                <div class="rc-pill-row">
+                  {#each ALL_SCORES as score}
+                    <button
+                      class="rc-pill"
+                      class:rc-pill-on={meshScores.has(score)}
+                      onclick={() => meshScores = toggleScore(meshScores, score)}
+                    >{SCORE_LABELS[score]}</button>
+                  {/each}
+                </div>
+              </div>
+
+              {#if meshNx * meshNy * meshNz > 100_000 || meshNr * meshNzCyl > 10_000}
+                <p class="note warning">⚠ Large mesh — statepoint file may exceed 200 MB.</p>
+              {/if}
+            </div>
+          {/if}
+        </div>
+
+        <!-- Group 4: Energy spectra -->
+        <div class="rc-group" class:rc-group-off={!spectraEnabled}>
+          <div class="rc-group-header">
+            <label class="rc-toggle-label">
+              <input type="checkbox" bind:checked={spectraEnabled} class="rc-checkbox" />
+              <span class="rc-group-title">Energy spectra</span>
+            </label>
+            <span class="rc-cost">flux vs energy</span>
+          </div>
+          {#if spectraEnabled}
+            <div class="rc-group-body">
+              <div class="rc-row">
+                <span class="rc-field-label">Group structure</span>
+                <div class="rc-structure-grid">
+                  {#each GROUP_STRUCTURE_OPTS as opt}
+                    <button
+                      class="rc-structure-btn"
+                      class:rc-structure-on={spectraGroups === opt.value}
+                      onclick={() => spectraGroups = opt.value}
+                    >
+                      <span class="rc-structure-label">{opt.label}</span>
+                      <span class="rc-structure-desc">{opt.desc}</span>
+                    </button>
+                  {/each}
+                </div>
+              </div>
+              <div class="rc-row">
+                <span class="rc-field-label">Scope</span>
+                <div class="rc-pill-row">
+                  <button class="rc-pill" class:rc-pill-on={spectraPerMaterial}  onclick={() => spectraPerMaterial = true}>Per material</button>
+                  <button class="rc-pill" class:rc-pill-on={!spectraPerMaterial} onclick={() => spectraPerMaterial = false}>Global</button>
+                </div>
+              </div>
+            </div>
+          {/if}
+        </div>
+
+        <!-- Group 5: Diagnostics -->
+        <div class="rc-group" class:rc-group-off={!diagStochVol && !diagTracks}>
+          <div class="rc-group-header">
+            <span class="rc-group-title" style="opacity:0.7">Diagnostics</span>
+            <span class="rc-cost">optional</span>
+          </div>
+          <div class="rc-group-body" style="padding-top:0">
+            <div class="rc-row" style="flex-wrap:wrap; gap:6px">
+              <label class="rc-toggle-label" style="flex:none">
+                <input type="checkbox" bind:checked={diagStochVol} class="rc-checkbox" />
+                <span class="rc-field-label" style="color: var(--color-text)">Stochastic volumes</span>
+              </label>
+              <label class="rc-toggle-label" style="flex:none">
+                <input type="checkbox" bind:checked={diagTracks} class="rc-checkbox" />
+                <span class="rc-field-label" style="color: var(--color-text)">Particle tracks</span>
+              </label>
+            </div>
+            {#if diagTracks}
+              <div class="rc-row">
+                <label class="field" style="max-width:140px">
+                  <span>Track count</span>
+                  <input type="number" min="1" max="10000" bind:value={diagNTracks} />
+                </label>
+                <p class="note warning" style="align-self:flex-end; margin:0">⚠ Large files at high counts.</p>
+              </div>
+            {/if}
+          </div>
+        </div>
+
       </section>
 
     </div>
@@ -693,8 +962,200 @@
     transition: border-color 0.1s;
 }
 
-.field select:focus {
-    outline: none;
+  /* ── Results capture ── */
+
+  .rc-group {
+    border: 1px solid var(--color-border);
+    border-radius: 7px;
+    overflow: hidden;
+    transition: border-color 0.15s;
+  }
+  .rc-group:not(.rc-group-off) { border-color: rgba(6,182,212,0.3); }
+
+  .rc-group-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 10px;
+    background: var(--color-bg-raised);
+  }
+
+  .rc-toggle-label {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    cursor: pointer;
+  }
+
+  .rc-checkbox {
+    appearance: none;
+    width: 13px;
+    height: 13px;
+    border: 1px solid var(--color-border);
+    border-radius: 3px;
+    background: var(--color-bg-deep);
+    cursor: pointer;
+    flex-shrink: 0;
+    position: relative;
+    transition: background 0.1s, border-color 0.1s;
+  }
+  .rc-checkbox:checked {
+    background: var(--color-accent);
     border-color: var(--color-accent);
-}
+  }
+  .rc-checkbox:checked::after {
+    content: '';
+    position: absolute;
+    left: 2px; top: 0px;
+    width: 5px; height: 8px;
+    border: 2px solid var(--color-bg-deep);
+    border-top: none;
+    border-left: none;
+    transform: rotate(40deg);
+  }
+
+  .rc-group-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--color-text);
+    font-family: var(--font-mono);
+  }
+
+  .rc-cost {
+    font-size: 9px;
+    color: var(--color-subtext);
+    font-family: var(--font-mono);
+    opacity: 0.7;
+  }
+
+  .rc-group-body {
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    border-top: 1px solid var(--color-border);
+    background: rgba(15,23,42,0.35);
+  }
+
+  .rc-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+
+  .rc-field-label {
+    font-size: 9px;
+    color: var(--color-subtext);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    min-width: 64px;
+    padding-top: 4px;
+    flex-shrink: 0;
+  }
+
+  .rc-pill-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .rc-pill {
+    font-size: 10px;
+    font-family: var(--font-mono);
+    padding: 3px 8px;
+    border-radius: 4px;
+    border: 1px solid var(--color-border);
+    background: var(--color-bg-raised);
+    color: var(--color-subtext);
+    cursor: pointer;
+    transition: border-color 0.1s, color 0.1s, background 0.1s;
+    line-height: 1.4;
+  }
+  .rc-pill:hover { color: var(--color-text); border-color: #475569; }
+  .rc-pill.rc-pill-on {
+    border-color: var(--color-accent);
+    color: var(--color-accent-hi);
+    background: rgba(6,182,212,0.1);
+  }
+
+  /* Dim structure: when group is off, the whole card fades */
+  .rc-group-off { opacity: 0.55; }
+  .rc-group-off .rc-group-header { background: transparent; }
+
+  /* Dimension inputs (nx/ny/nz) */
+  .rc-dim-row {
+    display: flex;
+    gap: 6px;
+  }
+
+  .rc-dim-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 9px;
+    color: var(--color-subtext);
+    font-family: var(--font-mono);
+  }
+
+  .rc-dim-field input {
+    width: 58px;
+    background: var(--color-bg-raised);
+    border: 1px solid var(--color-border);
+    border-radius: 4px;
+    color: var(--color-text);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    padding: 4px 6px;
+    transition: border-color 0.1s;
+  }
+  .rc-dim-field input:focus { outline: none; border-color: var(--color-accent); }
+
+  .rc-dim-note {
+    font-size: 9px;
+    color: var(--color-subtext);
+    font-family: var(--font-mono);
+    padding-top: 18px;   /* align with input value, below the label */
+    opacity: 0.6;
+  }
+
+  /* Group structure selector (for spectra) */
+  .rc-structure-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1;
+  }
+
+  .rc-structure-btn {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 9px;
+    border-radius: 5px;
+    border: 1px solid var(--color-border);
+    background: var(--color-bg-raised);
+    cursor: pointer;
+    text-align: left;
+    transition: border-color 0.1s, background 0.1s;
+  }
+  .rc-structure-btn:hover { background: #334155; }
+  .rc-structure-btn.rc-structure-on {
+    border-color: var(--color-accent);
+    background: rgba(6,182,212,0.08);
+  }
+
+  .rc-structure-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--color-text);
+    font-family: var(--font-mono);
+    min-width: 62px;
+  }
+  .rc-structure-btn.rc-structure-on .rc-structure-label { color: var(--color-accent-hi); }
+
+  .rc-structure-desc {
+    font-size: 9px;
+    color: var(--color-subtext);
+  }
 </style>

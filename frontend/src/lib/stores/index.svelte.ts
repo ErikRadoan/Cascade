@@ -10,6 +10,7 @@ import * as api from '$lib/api';
 export const ui = $state({
   activeTab:    'geometry' as ActiveTab,
   selectedItem: null as SelectedItem | null,
+  resultsJobId: null as string | null,
 });
 
 // ---------------------------------------------------------------------------

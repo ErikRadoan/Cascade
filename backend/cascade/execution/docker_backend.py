@@ -39,10 +39,30 @@ class DockerBackend(ExecutionBackend):
         job.input_dir().mkdir(parents=True, exist_ok=True)
         job.output_dir().mkdir(parents=True, exist_ok=True)
 
+        # Reconstruct OpenMCRunSettings from the plain dict stored on the job.
+        # The domain model stores settings as a dict to avoid an import cycle
+        # (domain → adapter). The backend is the right place to reconstitute it.
+        rs = job.run_settings
+        try:
+            run_settings = OpenMCRunSettings(
+                particles = int(rs.get("particles", 1000)),
+                inactive  = int(rs.get("inactive",  20)),
+                batches   = int(rs.get("batches",   100)),
+                seed      = int(rs.get("seed",      1)),
+                run_mode  = str(rs.get("run_mode",  "eigenvalue")),
+            )
+        except (ValueError, TypeError) as exc:
+            job.status = JobStatus.FAILED
+            job.error  = f"Invalid run settings: {exc}"
+            job.finished_at = datetime.now(timezone.utc)
+            return job
+
         self._adapter.write_input_files(
             geometry=job.geometry,
             materials=job.materials,
             output_dir=job.input_dir(),
+            settings=run_settings,
+            results_config=job.results_config,
         )
 
         cmd = self._build_run_command(job)

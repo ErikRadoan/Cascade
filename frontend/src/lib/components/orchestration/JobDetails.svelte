@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { jobsState, refreshJobs } from '$lib/stores/index.svelte';
+  import { jobsState, refreshJobs, ui } from '$lib/stores/index.svelte';
   import { onMount, onDestroy } from 'svelte';
   import * as api from '$lib/api';
   import type { JobDetail } from '$lib/types';
@@ -49,14 +49,7 @@
     const res = await api.jobs.stdout(id);
     log = res.available ? res.lines : '';
   } catch {
-    try {
-      const res = await api.results.get(id);
-      log = Object.entries(res)
-        .map(([k, v]) => `${k} = ${v}`)
-        .join('\n');
-    } catch {
-      // results not yet available
-    }
+    // Results not yet available
   }
 }
 
@@ -273,7 +266,7 @@
             </div>
             <div class="win-body results-body">
               {#if detail.status === 'completed'}
-                <button class="icon-text-btn accent" onclick={() => console.log('TODO: navigate to results', detail?.id)}>
+                <button class="icon-text-btn accent" onclick={() => { ui.resultsJobId = detail?.id ?? null; ui.activeTab = 'results'; }}>
                   View results →
                 </button>
               {:else if detail.status === 'failed'}
