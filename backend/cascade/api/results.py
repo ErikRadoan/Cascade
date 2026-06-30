@@ -320,7 +320,14 @@ def _parse_tallies(job_id: str, sp: h5py.File, n_realizations: int) -> dict[str,
         t = tallies_grp[tally_key]
         if not isinstance(t, h5py.Group):
             continue
-        tally_id = int(t.attrs.get("id", 0))
+        if not tally_key.startswith("tally"):
+            continue
+        # OpenMC statepoints don't store an "id" attr on tally groups;
+        # the id is embedded in the group name, e.g. "tally 101"
+        try:
+            tally_id = int(tally_key.split()[1])
+        except (IndexError, ValueError):
+            continue
 
         # Only scalar tallies (101–199); mesh and spectra have dedicated endpoints.
         if not (100 < tally_id < 200):
@@ -409,6 +416,19 @@ async def get_mesh(
 
     sp_path, sp = _open_statepoint(job)
     try:
+        import h5py
+        tallies = sp["tallies"]
+        for key in tallies.keys():
+            t = tallies[key]
+            if isinstance(t, h5py.Group):
+                print(key, dict(t.attrs))
+
+        meshes = tallies.get("meshes")
+        if meshes is not None:
+            for k in meshes.keys():
+                m = meshes[k]
+                print(k, dict(m.attrs) if isinstance(m, h5py.Group) else m[()])
+
         n_real = int(sp["n_realizations"][()]) if "n_realizations" in sp else 1
         return _parse_mesh(job_id, sp, job.results_config.mesh.mesh_type, n_real)
     finally:
@@ -429,7 +449,15 @@ def _parse_mesh(
     mesh_tally = None
     for key in tallies_grp.keys():
         t = tallies_grp[key]
-        if isinstance(t, h5py.Group) and int(t.attrs.get("id", -1)) == 200:
+        if not isinstance(t, h5py.Group) or not key.startswith("tally"):
+            continue
+        # OpenMC statepoints don't store an "id" attr on tally groups;
+        # the id is embedded in the group name, e.g. "tally 200"
+        try:
+            tally_id = int(key.split()[1])
+        except (IndexError, ValueError):
+            continue
+        if tally_id == 200:
             mesh_tally = t
             break
 
@@ -530,7 +558,6 @@ async def get_spectra(
     """
     job = _get_job_or_404(job_id, db)
     _require_completed(job)
-    print(job.results_config.spectra)
 
     if not job.results_config.spectra.enabled:
         raise HTTPException(
@@ -553,8 +580,6 @@ def _parse_spectra(
     n_realizations: int,
 ) -> dict[str, Any]:
     tallies_grp = sp.get("tallies")
-
-    print("Tallies:", list(tallies_grp.keys()))
 
     if tallies_grp is None:
         return {"job_id": job_id, "spectra": []}

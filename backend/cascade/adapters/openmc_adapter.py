@@ -1056,16 +1056,11 @@ class OpenMCAdapter:
                 mesh_el.set("type", "regular")
                 bounds = _geometry_bounds(geometry)
                 lower_el = ET.SubElement(mesh_el, "lower_left")
-                lower_el.text = f"{bounds[0]} {bounds[2]} {bounds[4]}"
+                lower_el.text = f"{bounds[0]} {bounds[1]} {bounds[2]}"
                 upper_el = ET.SubElement(mesh_el, "upper_right")
-                upper_el.text = f"{bounds[1]} {bounds[3]} {bounds[5]}"
+                upper_el.text = f"{bounds[3]} {bounds[4]} {bounds[5]}"
                 dim_el = ET.SubElement(mesh_el, "dimension")
                 dim_el.text = f"{cfg.nx} {cfg.ny} {cfg.nz}"
-                width_el = ET.SubElement(mesh_el, "width")
-                dx = (bounds[1] - bounds[0]) / cfg.nx
-                dy = (bounds[3] - bounds[2]) / cfg.ny
-                dz = (bounds[5] - bounds[4]) / cfg.nz
-                width_el.text = f"{dx:.6g} {dy:.6g} {dz:.6g}"
             else:
                 mesh_el.set("type", "cylindrical")
                 bounds = _geometry_bounds(geometry)
