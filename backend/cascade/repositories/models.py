@@ -46,6 +46,19 @@ class JobRow(Base):
     backend_config: Mapped[dict]          = mapped_column(JSON,   nullable=False, default=dict)
     geometry_json:  Mapped[dict]          = mapped_column(JSON,   nullable=False)
     materials_json: Mapped[list]          = mapped_column(JSON,   nullable=False)
+
+    # run_mode/monte_carlo/source/mode_specific/variance_reduction —
+    # job-settings-model.md's per-mode settings shape (domain/run_settings.py).
+    # Nullable so existing SQLite databases don't need a migration to load
+    # this schema change; every job created going forward always sets
+    # run_mode, so a NULL here after this change means a pre-existing row
+    # from before the r2s restructure, not a bug in a new save().
+    run_mode:                Mapped[str | None]  = mapped_column(String, nullable=True)
+    monte_carlo_json:        Mapped[dict | None] = mapped_column(JSON,   nullable=True)
+    source_json:              Mapped[dict | None] = mapped_column(JSON,   nullable=True)
+    mode_specific_json:       Mapped[dict | None] = mapped_column(JSON,   nullable=True)
+    variance_reduction_json:  Mapped[dict | None] = mapped_column(JSON,   nullable=True)
+
     results_config: Mapped[dict]          = mapped_column(JSON,   nullable=False, default=dict)
     working_dir:    Mapped[str | None]    = mapped_column(String, nullable=True)
     notes:          Mapped[str | None]    = mapped_column(Text,   nullable=True)

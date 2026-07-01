@@ -18,11 +18,11 @@
 
   type RunMode = 'eigenvalue' | 'fixed_source' | 'depletion' | 'r2s';
 
-  const RUN_MODES: Record<RunMode, { label: string; description: string; needsInactive: boolean }> = {
-    eigenvalue:   { label: 'Eigenvalue (k-eff)', description: 'Criticality calculation. Returns k-effective.',           needsInactive: true  },
-    fixed_source: { label: 'Fixed Source',        description: 'Fixed neutron source transport. No k-eff.',              needsInactive: false },
-    depletion:    { label: 'Depletion / Burnup',  description: 'Time-dependent burnup using a depletion chain.',         needsInactive: true  },
-    r2s:          { label: 'R2S (activation)',     description: 'Rigorous Two-Step activation analysis.',                needsInactive: false },
+  const RUN_MODES: Record<RunMode, { label: string; description: string }> = {
+    eigenvalue:   { label: 'Eigenvalue (k-eff)', description: 'Criticality calculation. Returns k-effective.' },
+    fixed_source: { label: 'Fixed Source',        description: 'Fixed neutron/photon source transport. No k-eff.' },
+    depletion:    { label: 'Depletion / Burnup',  description: 'Time-dependent burnup using a depletion chain.' },
+    r2s:          { label: 'R2S (activation)',     description: 'Rigorous Two-Step: neutron leg → activation → photon leg.' },
   };
 
   // ---------------------------------------------------------------------------
@@ -58,29 +58,84 @@
   // ---------------------------------------------------------------------------
 
   let runMode         = $state<RunMode>('eigenvalue');
-  let particles       = $state(1000);
-  let inactive        = $state(20);
-  let batches         = $state(100);
-  let seed            = $state(1);
   let notes           = $state('');
-  let power_W         = $state(1000.0);
-  let timesteps       = $state('10, 20, 30');
-  let neutronSrcFile  = $state('');
   let selectedProfile = $state<string>(profiles[0]?.name ?? 'default');
+
+  // ---------------------------------------------------------------------------
+  // Monte Carlo settings — single leg (eigenvalue / fixed_source / depletion)
+  //
+  // `inactive` only applies to eigenvalue and depletion (a k-eigenvalue
+  // source-convergence concept — job-settings-model.md §2). It is simply
+  // never read for fixed_source, and r2s doesn't use this block at all —
+  // each of its two legs has independent settings below. This replaces a
+  // single particles/batches/seed section that was previously shown
+  // unconditionally for every mode, including r2s, where it was ambiguous
+  // which leg (if either) it was supposed to describe.
+  // ---------------------------------------------------------------------------
+  let mcParticles = $state(1000);
+  let mcBatches   = $state(100);
+  let mcSeed      = $state(1);
+  let mcInactive  = $state(20);
+
+  const needsInactive = $derived(runMode === 'eigenvalue' || runMode === 'depletion');
+
+  // ---------------------------------------------------------------------------
+  // Source — required for fixed_source (job-settings-model.md §3.2: this was
+  // previously impossible to submit at all). Not used for eigenvalue
+  // (geometry-driven) or depletion.
+  // ---------------------------------------------------------------------------
+  let fsParticle     = $state<'neutron' | 'photon'>('neutron');
+  let fsSpaceType    = $state<'point' | 'box'>('point');
+  let fsSpaceParams  = $state('0, 0, 0');
+  let fsEnergyMev    = $state<number | null>(null);   // required if fsParticle === 'photon'
+
+  // ---------------------------------------------------------------------------
+  // Depletion-specific
+  // ---------------------------------------------------------------------------
+  let depPowerW     = $state(1000.0);
+  let depTimesteps  = $state('10, 20, 30');
+  let depChainFile  = $state('');           // NEW — was only a free-text warning before, now a real required field
+  let depIntegrator = $state('predictor');
+  let depSubsteps   = $state(1);
+
+  // ---------------------------------------------------------------------------
+  // R2S — a pipeline, not a parameterized single run (job-settings-model.md §4).
+  // Independent particles/batches/seed per leg — a photon leg typically needs
+  // far more particles than the neutron leg, so these are never shared.
+  // ---------------------------------------------------------------------------
+  let r2sNeutronSpaceType = $state<'point' | 'box'>('box');
+  let r2sNeutronParams    = $state('-5, -5, -5, 5, 5, 5');
+  let r2sNeutronParticles = $state(10000);
+  let r2sNeutronBatches   = $state(50);
+  let r2sNeutronSeed      = $state(1);
+
+  let r2sPowerW        = $state(1000.0);
+  let r2sTimesteps     = $state('30');
+  let r2sCoolingTimes  = $state('0, 3600, 86400');
+  let r2sDecayLibrary  = $state('');        // NEW — previously missing entirely
+
+  let r2sPhotonParticles     = $state(500000);
+  let r2sPhotonBatches       = $state(50);
+  let r2sPhotonSeed          = $state(2);
+  let r2sPhotonWeightWindows = $state(false);
 
   let submitting  = $state(false);
   let submitError = $state<string | null>(null);
 
   // ---------------------------------------------------------------------------
-  // Results config state
+  // Results config state — NEUTRON leg.
+  //
+  // Used directly for eigenvalue / fixed_source / depletion (their only
+  // leg), and as r2s's neutron_leg. Scores here are the full neutron-context
+  // set (job-settings-model.md §5).
   // ---------------------------------------------------------------------------
 
   // Group 2 — scalar cell tallies
   let scalarsEnabled  = $state(true);
   let scalarsAllCells = $state(false);
-  const ALL_SCORES = ['flux', 'fission', 'absorption', 'heating', 'nu-fission', 'heating-local', 'scatter'] as const;
-  type Score = typeof ALL_SCORES[number];
-  let scalarsScores = $state<Set<Score>>(new Set(['flux', 'fission', 'absorption', 'heating']));
+  const ALL_SCORES_NEUTRON = ['flux', 'fission', 'absorption', 'heating', 'nu-fission', 'heating-local', 'scatter'] as const;
+  type NeutronScore = typeof ALL_SCORES_NEUTRON[number];
+  let scalarsScores = $state<Set<NeutronScore>>(new Set(['flux', 'fission', 'absorption', 'heating']));
 
   // Group 3 — mesh tally
   let meshEnabled  = $state(false);
@@ -90,9 +145,11 @@
   let meshNz       = $state(20);
   let meshNr       = $state(20);
   let meshNzCyl    = $state(20);
-  let meshScores   = $state<Set<Score>>(new Set(['flux', 'fission', 'heating-local']));
+  let meshScores   = $state<Set<NeutronScore>>(new Set(['flux', 'fission', 'heating-local']));
 
-  // Group 4 — energy spectra
+  // Group 4 — energy spectra (neutron-only — job-settings-model.md §5: not
+  // meaningful for a photon leg, since group structures are neutron
+  // multigroup library names)
   let spectraEnabled      = $state(false);
   let spectraGroups       = $state<'33' | '69' | '252'>('69');
   let spectraPerMaterial  = $state(true);
@@ -102,14 +159,14 @@
   let diagTracks    = $state(false);
   let diagNTracks   = $state(100);
 
-  function toggleScore(set: Set<Score>, score: Score): Set<Score> {
+  function toggleScore<S extends string>(set: Set<S>, score: S): Set<S> {
     const next = new Set(set);
     if (next.has(score)) { if (next.size > 1) next.delete(score); }
     else next.add(score);
     return next;
   }
 
-  const SCORE_LABELS: Record<Score, string> = {
+  const SCORE_LABELS: Record<NeutronScore, string> = {
     'flux':          'Flux',
     'fission':       'Fission',
     'absorption':    'Absorption',
@@ -124,6 +181,43 @@
     { value: '69',  label: '69-group',  desc: 'WIMS — standard PWR analysis'  },
     { value: '252', label: '252-group', desc: 'Ultra-fine — high cost'         },
   ] as const;
+
+  // ---------------------------------------------------------------------------
+  // Results config state — PHOTON leg (r2s only).
+  //
+  // NEVER shares scalarsEnabled/meshEnabled/etc. above with the neutron
+  // leg — this is the core structural fix from job-settings-model.md §1:
+  // r2s must produce a per-leg R2SResultsConfig, not one global config.
+  // Fission/nu-fission are not offered at all here (job-settings-model.md
+  // §5 — there is no fission reaction for photons to score), and there is
+  // no energy-spectra group here either (neutron-only).
+  // ---------------------------------------------------------------------------
+  const ALL_SCORES_PHOTON = ['flux', 'absorption', 'heating', 'heating-local', 'scatter'] as const;
+  type PhotonScore = typeof ALL_SCORES_PHOTON[number];
+  const PHOTON_SCORE_LABELS: Record<PhotonScore, string> = {
+    'flux':          'Flux',
+    'absorption':    'Absorption',
+    'heating':       'Heating',
+    'heating-local': 'Local heat',
+    'scatter':       'Scatter',
+  };
+
+  let photonScalarsEnabled  = $state(false);
+  let photonScalarsAllCells = $state(false);
+  let photonScalarsScores   = $state<Set<PhotonScore>>(new Set(['flux']));
+
+  let photonMeshEnabled  = $state(true);
+  let photonMeshType     = $state<'regular' | 'cylindrical'>('regular');
+  let photonMeshNx       = $state(20);
+  let photonMeshNy       = $state(20);
+  let photonMeshNz       = $state(20);
+  let photonMeshNr       = $state(20);
+  let photonMeshNzCyl    = $state(20);
+  let photonMeshScores   = $state<Set<PhotonScore>>(new Set(['flux', 'heating']));
+
+  // Only meaningful on a photon leg — dose-conversion-weighted flux
+  // (job-settings-model.md §5's "dose conversion factors" row).
+  let photonApplyDoseConversion = $state(true);
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -148,6 +242,10 @@
       if (val && val !== 'null') ids.add(val);
     }
     return [...ids];
+  }
+
+  function parseNumberList(text: string): number[] {
+    return text.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n));
   }
 
   let selectedProjectId = $state(projects.activeId);
@@ -184,50 +282,151 @@
     }
 
     try {
+      // Per-mode client-side checks — the backend enforces all of this too
+      // (job-settings-model.md §6), but catching it here avoids a round trip
+      // for the most common mistakes.
+      if (runMode === 'fixed_source') {
+        const expectedLen = fsSpaceType === 'point' ? 3 : 6;
+        if (parseNumberList(fsSpaceParams).length !== expectedLen) {
+          submitError = `Source ${fsSpaceType} needs ${expectedLen} space parameters.`;
+          submitting = false;
+          return;
+        }
+        if (fsParticle === 'photon' && fsEnergyMev == null) {
+          submitError = 'A photon source has no default spectrum — set an energy (MeV).';
+          submitting = false;
+          return;
+        }
+      }
+      if (runMode === 'depletion' && !depChainFile.trim()) {
+        submitError = 'Depletion requires a depletion chain file reference.';
+        submitting = false;
+        return;
+      }
+      if (runMode === 'r2s') {
+        const expectedLen = r2sNeutronSpaceType === 'point' ? 3 : 6;
+        if (parseNumberList(r2sNeutronParams).length !== expectedLen) {
+          submitError = `Neutron leg source (${r2sNeutronSpaceType}) needs ${expectedLen} space parameters.`;
+          submitting = false;
+          return;
+        }
+        if (!r2sDecayLibrary.trim()) {
+          submitError = 'R2S requires a decay/activation library reference.';
+          submitting = false;
+          return;
+        }
+        if (parseNumberList(r2sCoolingTimes).length === 0) {
+          submitError = 'R2S requires at least one cooling time.';
+          submitting = false;
+          return;
+        }
+      }
+
+      const backend_config = { type: profile.backend_type, ...profile.config_data };
+
       const body: Record<string, unknown> = {
         geometry_text:  project.text,
         material_ids:   materialIds,
-        particles,
-        batches,
-        seed,
         notes:          notes || undefined,
         run_mode:       runMode,
-        backend_config: { type: profile.backend_type, ...profile.config_data },
-        results_config: {
-          scalars: {
-            enabled:   scalarsEnabled,
-            scores:    [...scalarsScores],
-            all_cells: scalarsAllCells,
-          },
-          mesh: {
-            enabled:   meshEnabled,
-            mesh_type: meshType,
-            nx: meshNx, ny: meshNy, nz: meshNz,
-            nr: meshNr, nz_cyl: meshNzCyl,
-            scores: [...meshScores],
-          },
-          spectra: {
-            enabled:         spectraEnabled,
-            group_structure: spectraGroups,
-            per_material:    spectraPerMaterial,
-          },
-          diagnostics: {
-            stochastic_volumes: diagStochVol,
-            particle_tracks:    diagTracks,
-            n_tracks:           diagNTracks,
-          },
-        },
+        backend_config,
       };
 
-      if (RUN_MODES[runMode].needsInactive) body.inactive = inactive;
-
-      if (runMode === 'depletion') {
-        body.power_W   = power_W;
-        body.timesteps = timesteps.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n));
-      }
-
       if (runMode === 'r2s') {
-        body.neutron_source_file = neutronSrcFile;
+        body.r2s = {
+          neutron_leg_source: {
+            particle:     'neutron',
+            space_type:   r2sNeutronSpaceType,
+            space_params: parseNumberList(r2sNeutronParams),
+          },
+          neutron_leg_mc: {
+            particles: r2sNeutronParticles,
+            batches:   r2sNeutronBatches,
+            seed:      r2sNeutronSeed,
+            // no `inactive` — r2s legs are always fixed-source-shaped.
+          },
+          activation: {
+            irradiation_schedule: {
+              power_W:   r2sPowerW,
+              timesteps: parseNumberList(r2sTimesteps),
+            },
+            cooling_times: parseNumberList(r2sCoolingTimes),
+            decay_library: r2sDecayLibrary,
+          },
+          photon_leg_mc: {
+            particles: r2sPhotonParticles,
+            batches:   r2sPhotonBatches,
+            seed:      r2sPhotonSeed,
+          },
+          photon_leg_vr: {
+            weight_windows_enabled: r2sPhotonWeightWindows,
+          },
+        };
+
+        body.r2s_results_config = {
+          neutron_leg: {
+            particle_type: 'neutron',
+            scalars: { enabled: scalarsEnabled, scores: [...scalarsScores], all_cells: scalarsAllCells },
+            mesh: {
+              enabled: meshEnabled, mesh_type: meshType,
+              nx: meshNx, ny: meshNy, nz: meshNz, nr: meshNr, nz_cyl: meshNzCyl,
+              scores: [...meshScores],
+            },
+            spectra: { enabled: spectraEnabled, group_structure: spectraGroups, per_material: spectraPerMaterial },
+            diagnostics: { stochastic_volumes: diagStochVol, particle_tracks: diagTracks, n_tracks: diagNTracks },
+          },
+          photon_leg: {
+            particle_type: 'photon',
+            scalars: { enabled: photonScalarsEnabled, scores: [...photonScalarsScores], all_cells: photonScalarsAllCells },
+            mesh: {
+              enabled: photonMeshEnabled, mesh_type: photonMeshType,
+              nx: photonMeshNx, ny: photonMeshNy, nz: photonMeshNz,
+              nr: photonMeshNr, nz_cyl: photonMeshNzCyl,
+              scores: [...photonMeshScores],
+            },
+            // spectra intentionally omitted — not offered on a photon leg.
+            apply_dose_conversion: photonApplyDoseConversion,
+          },
+        };
+
+      } else {
+        body.monte_carlo = {
+          particles: mcParticles,
+          batches:   mcBatches,
+          seed:      mcSeed,
+          ...(needsInactive ? { inactive: mcInactive } : {}),
+        };
+
+        if (runMode === 'fixed_source') {
+          body.source = {
+            particle:     fsParticle,
+            space_type:   fsSpaceType,
+            space_params: parseNumberList(fsSpaceParams),
+            ...(fsEnergyMev != null ? { energy_mev: fsEnergyMev } : {}),
+          };
+        }
+
+        if (runMode === 'depletion') {
+          body.depletion = {
+            power_W:    depPowerW,
+            timesteps:  parseNumberList(depTimesteps),
+            chain_file: depChainFile,
+            integrator: depIntegrator,
+            substeps:   depSubsteps,
+          };
+        }
+
+        body.results_config = {
+          particle_type: 'neutron',
+          scalars: { enabled: scalarsEnabled, scores: [...scalarsScores], all_cells: scalarsAllCells },
+          mesh: {
+            enabled: meshEnabled, mesh_type: meshType,
+            nx: meshNx, ny: meshNy, nz: meshNz, nr: meshNr, nz_cyl: meshNzCyl,
+            scores: [...meshScores],
+          },
+          spectra: { enabled: spectraEnabled, group_structure: spectraGroups, per_material: spectraPerMaterial },
+          diagnostics: { stochastic_volumes: diagStochVol, particle_tracks: diagTracks, n_tracks: diagNTracks },
+        };
       }
 
       const result = await api.jobs.submit(body as Parameters<typeof api.jobs.submit>[0]);
@@ -319,30 +518,69 @@
         </div>
       </section>
 
-      <!-- ── Monte Carlo settings ── -->
-      <section class="section">
-        <div class="section-label">Monte Carlo settings</div>
-        <div class="fields-grid">
-          <label class="field">
-            <span>Particles / batch</span>
-            <input type="number" min="1" bind:value={particles} />
-          </label>
-          {#if RUN_MODES[runMode].needsInactive}
+      <!-- ── Monte Carlo settings — single leg (not shown for r2s) ── -->
+      {#if runMode !== 'r2s'}
+        <section class="section">
+          <div class="section-label">Monte Carlo settings</div>
+          <div class="fields-grid">
             <label class="field">
-              <span>Inactive batches</span>
-              <input type="number" min="1" bind:value={inactive} />
+              <span>Particles / batch</span>
+              <input type="number" min="1" bind:value={mcParticles} />
             </label>
+            {#if needsInactive}
+              <label class="field">
+                <span>Inactive batches</span>
+                <input type="number" min="1" bind:value={mcInactive} />
+              </label>
+            {/if}
+            <label class="field">
+              <span>Total batches</span>
+              <input type="number" min="2" bind:value={mcBatches} />
+            </label>
+            <label class="field">
+              <span>Random seed</span>
+              <input type="number" min="1" bind:value={mcSeed} />
+            </label>
+          </div>
+          {#if runMode === 'depletion'}
+            <p class="note">Inactive/batches apply <strong>per timestep</strong> — cost scales with {parseNumberList(depTimesteps).length || '…'}× this.</p>
           {/if}
-          <label class="field">
-            <span>Total batches</span>
-            <input type="number" min="2" bind:value={batches} />
-          </label>
-          <label class="field">
-            <span>Random seed</span>
-            <input type="number" min="1" bind:value={seed} />
-          </label>
-        </div>
-      </section>
+        </section>
+      {/if}
+
+      <!-- ── Source — required for fixed_source ── -->
+      {#if runMode === 'fixed_source'}
+        <section class="section">
+          <div class="section-label">Source</div>
+          <div class="fields-grid">
+            <label class="field">
+              <span>Particle</span>
+              <select bind:value={fsParticle}>
+                <option value="neutron">Neutron</option>
+                <option value="photon">Photon</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Shape</span>
+              <select bind:value={fsSpaceType}>
+                <option value="point">Point</option>
+                <option value="box">Box</option>
+              </select>
+            </label>
+            <label class="field wide">
+              <span>{fsSpaceType === 'point' ? 'Position (x, y, z)' : 'Bounds (xmin, ymin, zmin, xmax, ymax, zmax)'}</span>
+              <input type="text" bind:value={fsSpaceParams} placeholder={fsSpaceType === 'point' ? '0, 0, 0' : '-5, -5, -5, 5, 5, 5'} />
+            </label>
+            <label class="field">
+              <span>Energy (MeV) {#if fsParticle === 'photon'}<span class="optional">required</span>{:else}<span class="optional">optional</span>{/if}</span>
+              <input type="number" step="any" min="0" bind:value={fsEnergyMev} placeholder={fsParticle === 'neutron' ? 'default: Watt spectrum' : 'required'} />
+            </label>
+          </div>
+          {#if fsParticle === 'photon' && fsEnergyMev == null}
+            <p class="note warning">⚠ A photon source has no default spectrum — energy is required.</p>
+          {/if}
+        </section>
+      {/if}
 
       <!-- ── Depletion-specific ── -->
       {#if runMode === 'depletion'}
@@ -351,28 +589,117 @@
           <div class="fields-grid">
             <label class="field">
               <span>Power (W)</span>
-              <input type="number" min="0" step="any" bind:value={power_W} />
+              <input type="number" min="0" step="any" bind:value={depPowerW} />
             </label>
             <label class="field wide">
               <span>Timesteps (days, comma-separated)</span>
-              <input type="text" placeholder="10, 30, 60, 90" bind:value={timesteps} />
+              <input type="text" placeholder="10, 30, 60, 90" bind:value={depTimesteps} />
+            </label>
+            <label class="field wide">
+              <span>Depletion chain file</span>
+              <input type="text" placeholder="chain_endfb71_pwr.xml" bind:value={depChainFile} />
+            </label>
+            <label class="field">
+              <span>Integrator</span>
+              <select bind:value={depIntegrator}>
+                <option value="predictor">Predictor</option>
+                <option value="cecm">CE/CM</option>
+                <option value="celi">CE/LI</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>Substeps</span>
+              <input type="number" min="1" bind:value={depSubsteps} />
             </label>
           </div>
-          <p class="note warning">⚠ Depletion requires a depletion chain file configured in the backend.</p>
+          {#if !depChainFile.trim()}
+            <p class="note warning">⚠ A depletion chain file is required to run.</p>
+          {/if}
         </section>
       {/if}
 
-      <!-- ── R2S-specific ── -->
+      <!-- ── R2S — neutron leg ── -->
       {#if runMode === 'r2s'}
         <section class="section">
-          <div class="section-label">R2S settings</div>
+          <div class="section-label">Neutron leg</div>
           <div class="fields-grid">
+            <label class="field">
+              <span>Shape</span>
+              <select bind:value={r2sNeutronSpaceType}>
+                <option value="point">Point</option>
+                <option value="box">Box</option>
+              </select>
+            </label>
             <label class="field wide">
-              <span>Neutron source file path (on host)</span>
-              <input type="text" placeholder="/path/to/source.h5" bind:value={neutronSrcFile} />
+              <span>{r2sNeutronSpaceType === 'point' ? 'Position (x, y, z)' : 'Bounds (xmin, ymin, zmin, xmax, ymax, zmax)'}</span>
+              <input type="text" bind:value={r2sNeutronParams} />
+            </label>
+            <label class="field">
+              <span>Particles / batch</span>
+              <input type="number" min="1" bind:value={r2sNeutronParticles} />
+            </label>
+            <label class="field">
+              <span>Total batches</span>
+              <input type="number" min="2" bind:value={r2sNeutronBatches} />
+            </label>
+            <label class="field">
+              <span>Random seed</span>
+              <input type="number" min="1" bind:value={r2sNeutronSeed} />
             </label>
           </div>
-          <p class="note warning">⚠ R2S requires additional backend configuration. See documentation.</p>
+          <p class="note">No inactive batches — this is a fixed-source leg, not an eigenvalue solve.</p>
+        </section>
+
+        <!-- ── R2S — activation (NOT a transport run) ── -->
+        <section class="section">
+          <div class="section-label">Activation</div>
+          <p class="note" style="margin-bottom:6px">Consumes the neutron leg's reaction-rate mesh; produces the photon leg's source. Not an OpenMC transport calculation.</p>
+          <div class="fields-grid">
+            <label class="field">
+              <span>Power (W)</span>
+              <input type="number" min="0" step="any" bind:value={r2sPowerW} />
+            </label>
+            <label class="field wide">
+              <span>Irradiation timesteps (days, comma-separated)</span>
+              <input type="text" placeholder="30" bind:value={r2sTimesteps} />
+            </label>
+            <label class="field wide">
+              <span>Cooling times (seconds, comma-separated) — one dose result per value</span>
+              <input type="text" placeholder="0, 3600, 86400" bind:value={r2sCoolingTimes} />
+            </label>
+            <label class="field wide">
+              <span>Decay/activation library</span>
+              <input type="text" placeholder="endf_decay" bind:value={r2sDecayLibrary} />
+            </label>
+          </div>
+          {#if !r2sDecayLibrary.trim()}
+            <p class="note warning">⚠ A decay library reference is required to run.</p>
+          {/if}
+        </section>
+
+        <!-- ── R2S — photon leg ── -->
+        <section class="section">
+          <div class="section-label">Photon leg</div>
+          <p class="note" style="margin-bottom:6px">Source is derived from the activation step — not user-entered.</p>
+          <div class="fields-grid">
+            <label class="field">
+              <span>Particles / batch</span>
+              <input type="number" min="1" bind:value={r2sPhotonParticles} />
+            </label>
+            <label class="field">
+              <span>Total batches</span>
+              <input type="number" min="2" bind:value={r2sPhotonBatches} />
+            </label>
+            <label class="field">
+              <span>Random seed</span>
+              <input type="number" min="1" bind:value={r2sPhotonSeed} />
+            </label>
+          </div>
+          <label class="rc-toggle-label" style="margin-top:8px">
+            <input type="checkbox" bind:checked={r2sPhotonWeightWindows} class="rc-checkbox" />
+            <span class="rc-field-label" style="color: var(--color-text)">Variance reduction (weight windows)</span>
+          </label>
+          <p class="note">Strongly recommended — shielding/dose problems are usually unusable without it.</p>
         </section>
       {/if}
 
@@ -419,11 +746,11 @@
 
       <!-- ── Results capture ── -->
       <section class="section">
-        <div class="section-label">Results capture</div>
+        <div class="section-label">Results capture{#if runMode === 'r2s'} — neutron leg{/if}</div>
 
         <!-- Always-on summary note -->
         <p class="note" style="margin-bottom:2px">
-          ✓ Simulation summary always captured — k-eff, entropy, batch history, timing.
+          ✓ Simulation summary always captured{#if runMode === 'r2s'} (neutron leg){/if} — {#if runMode === 'eigenvalue'}k-eff, entropy, batch history, timing.{:else}entropy, batch history, timing.{/if}
         </p>
 
         <!-- Group 2: Scalar tallies -->
@@ -440,7 +767,7 @@
               <div class="rc-row">
                 <span class="rc-field-label">Scores</span>
                 <div class="rc-pill-row">
-                  {#each ALL_SCORES as score}
+                  {#each ALL_SCORES_NEUTRON as score}
                     <button
                       class="rc-pill"
                       class:rc-pill-on={scalarsScores.has(score)}
@@ -523,7 +850,7 @@
               <div class="rc-row">
                 <span class="rc-field-label">Scores</span>
                 <div class="rc-pill-row">
-                  {#each ALL_SCORES as score}
+                  {#each ALL_SCORES_NEUTRON as score}
                     <button
                       class="rc-pill"
                       class:rc-pill-on={meshScores.has(score)}
@@ -540,7 +867,7 @@
           {/if}
         </div>
 
-        <!-- Group 4: Energy spectra -->
+        <!-- Group 4: Energy spectra (neutron-only) -->
         <div class="rc-group" class:rc-group-off={!spectraEnabled}>
           <div class="rc-group-header">
             <label class="rc-toggle-label">
@@ -607,6 +934,131 @@
         </div>
 
       </section>
+
+      <!-- ── Results capture — PHOTON leg (r2s only) ──
+           Never merged with the neutron-leg block above: different valid
+           scores (no fission/nu-fission), no energy spectra, plus a
+           dose-conversion option that only makes sense here
+           (job-settings-model.md §1, §5). -->
+      {#if runMode === 'r2s'}
+        <section class="section">
+          <div class="section-label">Results capture — photon leg</div>
+
+          <div class="rc-group" class:rc-group-off={!photonScalarsEnabled}>
+            <div class="rc-group-header">
+              <label class="rc-toggle-label">
+                <input type="checkbox" bind:checked={photonScalarsEnabled} class="rc-checkbox" />
+                <span class="rc-group-title">Scalar cell tallies</span>
+              </label>
+              <span class="rc-cost">tiny cost</span>
+            </div>
+            {#if photonScalarsEnabled}
+              <div class="rc-group-body">
+                <div class="rc-row">
+                  <span class="rc-field-label">Scores</span>
+                  <div class="rc-pill-row">
+                    {#each ALL_SCORES_PHOTON as score}
+                      <button
+                        class="rc-pill"
+                        class:rc-pill-on={photonScalarsScores.has(score)}
+                        onclick={() => photonScalarsScores = toggleScore(photonScalarsScores, score)}
+                        title={photonScalarsScores.has(score) && photonScalarsScores.size === 1 ? 'At least one score required' : ''}
+                      >{PHOTON_SCORE_LABELS[score]}</button>
+                    {/each}
+                  </div>
+                </div>
+                <p class="note">No fission/ν-fission — not meaningful for a photon leg.</p>
+                <div class="rc-row">
+                  <span class="rc-field-label">Cell filter</span>
+                  <div class="rc-pill-row">
+                    <button class="rc-pill" class:rc-pill-on={!photonScalarsAllCells} onclick={() => photonScalarsAllCells = false}>
+                      Fissile only
+                    </button>
+                    <button class="rc-pill" class:rc-pill-on={photonScalarsAllCells} onclick={() => photonScalarsAllCells = true}>
+                      All cells
+                    </button>
+                  </div>
+                </div>
+              </div>
+            {/if}
+          </div>
+
+          <div class="rc-group" class:rc-group-off={!photonMeshEnabled}>
+            <div class="rc-group-header">
+              <label class="rc-toggle-label">
+                <input type="checkbox" bind:checked={photonMeshEnabled} class="rc-checkbox" />
+                <span class="rc-group-title">3-D dose mesh</span>
+              </label>
+              <span class="rc-cost">cost ∝ nx·ny·nz</span>
+            </div>
+            {#if photonMeshEnabled}
+              <div class="rc-group-body">
+                <div class="rc-row">
+                  <span class="rc-field-label">Type</span>
+                  <div class="rc-pill-row">
+                    <button class="rc-pill" class:rc-pill-on={photonMeshType === 'regular'}     onclick={() => photonMeshType = 'regular'}>Cartesian</button>
+                    <button class="rc-pill" class:rc-pill-on={photonMeshType === 'cylindrical'} onclick={() => photonMeshType = 'cylindrical'}>Cylindrical</button>
+                  </div>
+                </div>
+
+                {#if photonMeshType === 'regular'}
+                  <div class="rc-row">
+                    <span class="rc-field-label">Voxels</span>
+                    <div class="rc-dim-row">
+                      <label class="rc-dim-field"><span>nx</span><input type="number" min="1" max="500" bind:value={photonMeshNx} /></label>
+                      <label class="rc-dim-field"><span>ny</span><input type="number" min="1" max="500" bind:value={photonMeshNy} /></label>
+                      <label class="rc-dim-field"><span>nz</span><input type="number" min="1" max="500" bind:value={photonMeshNz} /></label>
+                    </div>
+                    <span class="rc-dim-note">{(photonMeshNx * photonMeshNy * photonMeshNz).toLocaleString()} voxels</span>
+                  </div>
+                {:else}
+                  <div class="rc-row">
+                    <span class="rc-field-label">Bins</span>
+                    <div class="rc-dim-row">
+                      <label class="rc-dim-field"><span>nr</span><input type="number" min="1" max="500" bind:value={photonMeshNr} /></label>
+                      <label class="rc-dim-field"><span>nz</span><input type="number" min="1" max="500" bind:value={photonMeshNzCyl} /></label>
+                    </div>
+                    <span class="rc-dim-note">{(photonMeshNr * photonMeshNzCyl).toLocaleString()} bins</span>
+                  </div>
+                {/if}
+
+                <div class="rc-row">
+                  <span class="rc-field-label">Scores</span>
+                  <div class="rc-pill-row">
+                    {#each ALL_SCORES_PHOTON as score}
+                      <button
+                        class="rc-pill"
+                        class:rc-pill-on={photonMeshScores.has(score)}
+                        onclick={() => photonMeshScores = toggleScore(photonMeshScores, score)}
+                      >{PHOTON_SCORE_LABELS[score]}</button>
+                    {/each}
+                  </div>
+                </div>
+
+                <!-- job-settings-model.md §6.2: photon dose meshes are
+                     commonly LARGER than the neutron flux mesh — the same
+                     size warning must apply here independently. -->
+                {#if photonMeshNx * photonMeshNy * photonMeshNz > 100_000 || photonMeshNr * photonMeshNzCyl > 10_000}
+                  <p class="note warning">⚠ Large mesh — statepoint file may exceed 200 MB.</p>
+                {/if}
+              </div>
+            {/if}
+          </div>
+
+          <div class="rc-group">
+            <div class="rc-group-header">
+              <label class="rc-toggle-label">
+                <input type="checkbox" bind:checked={photonApplyDoseConversion} class="rc-checkbox" />
+                <span class="rc-group-title">Dose conversion</span>
+              </label>
+              <span class="rc-cost">shutdown dose</span>
+            </div>
+            {#if photonApplyDoseConversion && !photonScalarsScores.has('flux') && !photonMeshScores.has('flux')}
+              <p class="note warning" style="margin:6px 0 0">⚠ Dose conversion wraps a flux score — enable `flux` in scalars or mesh above.</p>
+            {/if}
+          </div>
+        </section>
+      {/if}
 
     </div>
 

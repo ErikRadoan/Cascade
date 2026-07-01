@@ -46,52 +46,130 @@ from ..domain.results_config import (
     EnergySpectraConfig,
     MeshTallyConfig,
     MeshType,
+    ParticleType,
     ResultsConfig,
     ScalarTallyConfig,
     TallyScore,
 )
+from ..domain.run_settings import McSettings, RunMode, SourceDef, SourceSpaceType
 
 
 # ---------------------------------------------------------------------------
-# Run settings dataclass — what the user configures per job
+# Run settings dataclass — what a SINGLE OpenMC transport leg needs
 # ---------------------------------------------------------------------------
+#
+# OpenMC itself only has two run modes at the settings.xml level:
+# "eigenvalue" and "fixed source". Cascade's higher-level RunMode
+# (eigenvalue / fixed_source / depletion / r2s — see domain/run_settings.py)
+# decomposes into one or more calls into THIS adapter, each producing one
+# OpenMCRunSettings for one transport leg:
+#   - eigenvalue   -> one call, run_mode="eigenvalue"
+#   - fixed_source -> one call, run_mode="fixed source", with a real source
+#   - depletion    -> NOT expressible as repeated calls to this adapter.
+#                     Each step's materials depend on the previous step's
+#                     reaction rates, which requires OpenMC's Python
+#                     depletion API (openmc.deplete), not XML files driven
+#                     by the CLI binary. See execution/docker_backend.py.
+#   - r2s          -> neutron leg: one call, run_mode="fixed source".
+#                     photon leg: one call, run_mode="fixed source", with a
+#                     source derived from the (not-yet-implemented)
+#                     activation step. See execution/docker_backend.py.
 
 @dataclass
 class OpenMCRunSettings:
-    """Parameters for an OpenMC Monte Carlo run.
+    """Parameters for ONE OpenMC transport leg.
 
-    These map directly to OpenMC's settings.xml fields.
-    Defaults are conservative — fast enough for geometry checking,
-    not production quality. Users should increase for real results.
+    These map directly to OpenMC's settings.xml fields. Defaults are
+    conservative — fast enough for geometry checking, not production
+    quality. Users should increase for real results.
 
     Attributes:
-        particles:      Neutrons per batch.
+        particles:      Neutrons (or photons) per batch.
         inactive:       Inactive (warmup) batches — discarded from tallies.
-        batches:        Total batches (inactive + active).
+                        None for a fixed-source leg (job-settings-model.md §2).
+        batches:        Total batches (inactive + active, if inactive is set).
         seed:           Random number seed. Fixed default for reproducibility.
         run_mode:       "eigenvalue" for criticality, "fixed source" for shielding.
+                        These are OpenMC's own two values — see module docstring.
+        source:         User-specified source. Required when run_mode is
+                        "fixed source"; must be None for "eigenvalue" (the
+                        criticality source is geometry-driven — see
+                        `source_box` / `_compute_fissile_source_box`).
         energy_groups:  Number of energy groups for multi-group mode.
                         None = continuous energy (default, recommended).
+        source_box:     Manual override for the eigenvalue mode's
+                        auto-detected fissile source box. Ignored when
+                        `source` is set.
     """
     particles: int = 1000
-    inactive: int = 20
+    inactive: int | None = 20
     batches: int = 100
     seed: int = 1
     run_mode: str = "eigenvalue"
+    source: SourceDef | None = None
     energy_groups: int | None = None
     source_box: tuple[float, ...] | None = None
 
     def __post_init__(self):
-        if self.inactive >= self.batches:
-            raise ValueError(
-                f"inactive batches ({self.inactive}) must be less than "
-                f"total batches ({self.batches})."
-            )
         if self.run_mode not in ("eigenvalue", "fixed source"):
             raise ValueError(
                 f"run_mode must be 'eigenvalue' or 'fixed source', "
-                f"got '{self.run_mode}'."
+                f"got '{self.run_mode}'. (Cascade's `depletion`/`r2s` modes "
+                f"decompose into one or more single-leg calls with this "
+                f"value — see module docstring.)"
             )
+        if self.run_mode == "eigenvalue":
+            if self.inactive is None:
+                raise ValueError("eigenvalue run_mode requires `inactive` to be set.")
+            if self.inactive >= self.batches:
+                raise ValueError(
+                    f"inactive batches ({self.inactive}) must be less than "
+                    f"total batches ({self.batches})."
+                )
+            if self.source is not None:
+                raise ValueError(
+                    "eigenvalue run_mode's source is geometry-driven (auto-"
+                    "detected from fissile cells, or `source_box` override) "
+                    "— do not pass `source`."
+                )
+        else:  # fixed source
+            if self.inactive is not None:
+                raise ValueError(
+                    "fixed source run_mode cannot have `inactive` batches — "
+                    "there is no source convergence to discard warmup "
+                    "batches for (job-settings-model.md §2)."
+                )
+            if self.source is None:
+                raise ValueError(
+                    "fixed source run_mode requires `source` to be set "
+                    "(job-settings-model.md §3.2 — previously this was "
+                    "impossible to submit at all)."
+                )
+
+    @classmethod
+    def for_leg(
+        cls,
+        mc: McSettings,
+        run_mode: str,
+        *,
+        source: SourceDef | None = None,
+        source_box: tuple[float, ...] | None = None,
+    ) -> OpenMCRunSettings:
+        """Build single-leg settings from the higher-level McSettings/SourceDef.
+
+        Bridges domain/run_settings.py (job-level, multi-mode-aware) to this
+        adapter's OpenMCRunSettings (single-leg, OpenMC-XML-shaped).
+        """
+        openmc_run_mode = "eigenvalue" if run_mode == RunMode.EIGENVALUE else "fixed source"
+        return cls(
+            particles=mc.particles,
+            inactive=mc.inactive,
+            batches=mc.batches,
+            seed=mc.seed,
+            run_mode=openmc_run_mode,
+            source=source,
+            source_box=source_box,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +443,48 @@ def _cell_element(cell: Cell, material_id_map: dict[str, int]) -> ET.Element:
     return el
 
 
+def _source_element(source: SourceDef) -> ET.Element:
+    """Build an XML <source> element from a user-specified SourceDef.
+
+    Used for `fixed source` run_mode (job-settings-model.md §3.2) — both
+    Cascade's `fixed_source` mode and r2s's neutron/photon legs route
+    through this once they reach the adapter as a single transport leg.
+
+    Args:
+        source: SourceDef domain object (domain/run_settings.py).
+
+    Returns:
+        ET.Element for insertion as a child of <settings>.
+    """
+    source_el = ET.Element("source")
+    source_el.set("particle", source.particle)
+
+    space_el = ET.SubElement(source_el, "space")
+    if source.space_type == SourceSpaceType.POINT:
+        space_el.set("type", "point")
+        # OpenMC point source: <parameters>x y z</parameters>
+        params_el = ET.SubElement(space_el, "parameters")
+        params_el.text = " ".join(str(v) for v in source.space_params)
+    else:  # box
+        space_el.set("type", "box")
+        params_el = ET.SubElement(space_el, "parameters")
+        params_el.text = " ".join(str(v) for v in source.space_params)
+
+    if source.energy_mev is not None:
+        # Monoenergetic source — OpenMC's <energy type="discrete"> with a
+        # single energy bin (eV) and probability 1.0.
+        energy_el = ET.SubElement(source_el, "energy")
+        energy_el.set("type", "discrete")
+        x_el = ET.SubElement(energy_el, "parameters")
+        x_el.text = f"{source.energy_mev * 1.0e6}"
+        p_el = ET.SubElement(energy_el, "p")
+        p_el.text = "1.0"
+    # else: OpenMC default spectrum (Watt fission spectrum for neutrons).
+    # __post_init__ on SourceDef already forbids this for photon sources.
+
+    return source_el
+
+
 # Nuclides that make a material fissile
 _FISSILE_NUCLIDES = frozenset({
     "U233", "U235", "U238",  # uranium
@@ -374,12 +494,8 @@ _FISSILE_NUCLIDES = frozenset({
 })
 
 
-def _material_is_fissile(mat: Material) -> bool:
-    """Return True if a material contains any fissile or fertile nuclide."""
-    return any(
-        any(nuc.startswith(prefix) for prefix in _FISSILE_NUCLIDES)
-        for nuc in mat.composition
-    )
+def _is_fissile(material: Material) -> bool:
+    return any(nuc in _FISSILE_NUCLIDES for nuc in material.composition)
 
 
 def _compute_fissile_source_box(
@@ -393,7 +509,7 @@ def _compute_fissile_source_box(
     Contracts the box by 1% on each side to ensure particles are
     born strictly inside surfaces, never on them.
     """
-    fissile_ids = {m.id for m in materials if _material_is_fissile(m)}
+    fissile_ids = {m.id for m in materials if _is_fissile(m)}
     fissile_cells = [c for c in geometry.cells if c.material_id in fissile_ids]
 
     if not fissile_cells:
@@ -508,34 +624,57 @@ class OpenMCAdapter:
     # ------------------------------------------------------------------
 
     def export(
-            self,
-            geometry: CascadeGeometry,
-            materials: list[Material],
-            settings: OpenMCRunSettings | None = None,
-            results_config: ResultsConfig | None = None,
+        self,
+        geometry: CascadeGeometry,
+        materials: list[Material],
+        settings: OpenMCRunSettings | None = None,
+        results_config: ResultsConfig | None = None,
     ) -> dict[str, str]:
-        """Return all OpenMC input file contents as a filename → content dict.
-
-        Always produces geometry.xml, materials.xml, settings.xml.
-        Produces tallies.xml when results_config requests any tally group.
+        """Export a complete set of OpenMC input files.
 
         Args:
-            geometry:       Fully expanded CascadeGeometry.
-            materials:      Materials referenced by cells in geometry.
-            settings:       Run parameters. Defaults are used if None.
-            results_config: Results capture config. Tallies.xml is only
-                            generated when this is non-None and
-                            results_config.needs_tallies_xml() is True.
+            geometry: Resolved CascadeGeometry (surfaces + cells).
+            materials: All materials referenced by cells in this geometry.
+                       Any material_id used in a cell must appear here.
+            settings: Run parameters. Uses conservative defaults if None.
+            results_config: What to capture. If None, uses ResultsConfig.default()
+                            (summary + scalar tallies). Produces tallies.xml when
+                            any tally group is enabled.
 
         Returns:
-            dict mapping filename -> XML string content.
+            Dict mapping filename to XML string content:
+                "geometry.xml"  — surface and cell definitions
+                "materials.xml" — material compositions
+                "settings.xml"  — Monte Carlo run parameters
+                "tallies.xml"   — tally definitions (omitted if nothing to tally)
+
+        Raises:
+            ValueError: If a cell references a material not in the materials list.
+            KeyError: If a surface type has no OpenMC mapping.
         """
         if settings is None:
             settings = OpenMCRunSettings()
+        if results_config is None:
+            results_config = ResultsConfig.default()
+
+        if getattr(results_config, "apply_dose_conversion", False):
+            # TODO: implement via an EnergyFunctionFilter wrapping the flux
+            # score with ICRP-116 (or similar) dose conversion factors.
+            # Not yet implemented — fail loudly rather than silently
+            # producing a plain flux tally that LOOKS like a dose result
+            # but isn't weighted. This is exactly the failure mode that
+            # caused the original "settings dropped on the floor" bug;
+            # we don't want to reintroduce it for a new field.
+            raise NotImplementedError(
+                "ResultsConfig.apply_dose_conversion is set but dose-"
+                "conversion XML emission (EnergyFunctionFilter + ICRP dose "
+                "factors) is not implemented yet. Disable it or implement "
+                "_append_dose_conversion_filter() before submitting."
+            )
 
         material_id_map = {mat.id: i + 1 for i, mat in enumerate(materials)}
 
-        files = {
+        files: dict[str, str] = {
             "geometry.xml": self.export_geometry(geometry, material_id_map),
             "materials.xml": self.export_materials(materials, material_id_map),
             "settings.xml": self.export_settings(
@@ -543,7 +682,7 @@ class OpenMCAdapter:
             ),
         }
 
-        if results_config is not None and results_config.needs_tallies_xml():
+        if results_config.needs_tallies_xml():
             files["tallies.xml"] = self.export_tallies(
                 results_config, geometry, materials, material_id_map
             )
@@ -614,7 +753,7 @@ class OpenMCAdapter:
         """Append one tally per cell (or fissile cell) to *root*."""
         fissile_ids: set[str] = set()
         if not cfg.all_cells:
-            fissile_ids = {m.id for m in materials if _material_is_fissile(m)}
+            fissile_ids = {m.id for m in materials if _is_fissile(m)}
 
         tally_id = 101
         for cell in geometry.cells:
@@ -837,17 +976,6 @@ class OpenMCAdapter:
             settings.xml content as a string.
         """
 
-        source_box = settings.source_box
-
-        if source_box is None and geometry is not None and materials is not None:
-            source_box = _compute_fissile_source_box(geometry, materials)
-        if source_box is None:
-            raise ValueError(
-                "Cannot determine source distribution. Either provide "
-                "source_box in OpenMCRunSettings, or pass geometry and "
-                "materials to export_settings() for automatic detection."
-            )
-
         root = ET.Element("settings")
 
         run_mode_el = ET.SubElement(root, "run_mode")
@@ -859,20 +987,39 @@ class OpenMCAdapter:
         batches_el = ET.SubElement(root, "batches")
         batches_el.text = str(settings.batches)
 
-        inactive_el = ET.SubElement(root, "inactive")
-        inactive_el.text = str(settings.inactive)
+        # inactive is None for a fixed-source leg (job-settings-model.md §2)
+        # — OpenMCRunSettings.__post_init__ already guarantees this is
+        # consistent with run_mode, so no extra branching is needed here.
+        if settings.inactive is not None:
+            inactive_el = ET.SubElement(root, "inactive")
+            inactive_el.text = str(settings.inactive)
 
         seed_el = ET.SubElement(root, "seed")
         seed_el.text = str(settings.seed)
 
-        # Source definition — isotropic point source at origin for eigenvalue.
-        # For fixed source mode this needs to be user-configurable (future work).
+        # Source definition.
         if settings.run_mode == "eigenvalue":
+            # Criticality source: auto-detected fissile-cell bounding box
+            # (or an explicit source_box override), never user-entered.
+            source_box = settings.source_box
+            if source_box is None and geometry is not None and materials is not None:
+                source_box = _compute_fissile_source_box(geometry, materials)
+            if source_box is None:
+                raise ValueError(
+                    "Cannot determine source distribution. Either provide "
+                    "source_box in OpenMCRunSettings, or pass geometry and "
+                    "materials to export_settings() for automatic detection."
+                )
             source_el = ET.SubElement(root, "source")
             space_el = ET.SubElement(source_el, "space")
             space_el.set("type", "box")
             params_el = ET.SubElement(space_el, "parameters")
             params_el.text = " ".join(str(v) for v in source_box)
+
+        else:  # fixed source — real, user-specified source
+            # __post_init__ already guarantees settings.source is not None
+            # whenever run_mode == "fixed source".
+            root.append(_source_element(settings.source))
 
         # Diagnostics — particle tracks
         if results_config is not None and results_config.diagnostics.particle_tracks:
@@ -970,174 +1117,3 @@ class OpenMCAdapter:
         #   3. Extract mean + std dev per tally bin
         #   4. Map to TallyResult domain objects
         return []
-
-    # ------------------------------------------------------------------
-    # Export tallies - exports tallies from the OpenMC output
-    # ------------------------------------------------------------------
-
-    def export_tallies(
-            self,
-            results_config: ResultsConfig,
-            geometry: CascadeGeometry,
-            materials: list[Material],
-            material_id_map: dict[str, int] | None = None,
-    ) -> str:
-        """Generate tallies.xml for OpenMC.
-
-        Tally ID ranges (must match results.py parser):
-            101–199  Scalar cell tallies (one tally per cell)
-            200      Mesh tally
-            301+     Energy spectra (one tally per material)
-
-        Args:
-            results_config: Which tally groups to emit.
-            geometry:       Used to enumerate cells for scalar tallies.
-            materials:      Used to enumerate materials for spectra tallies.
-            material_id_map: Maps material.id -> integer id (same map used
-                             for materials.xml). Auto-generated if None.
-
-        Returns:
-            tallies.xml content as a UTF-8 string.
-        """
-        if material_id_map is None:
-            material_id_map = {mat.id: i + 1 for i, mat in enumerate(materials)}
-
-        root = ET.Element("tallies")
-
-        # Filter ID counter — all filters are top-level; tallies reference by ID.
-        # OpenMC schema: <filter id="N" type="..."><bins>...</bins></filter>
-        #                <tally id="M"><filters>N ...</filters><scores>...</scores></tally>
-        next_filter_id = 1
-
-        # ── Group 2: Scalar cell tallies (IDs 101+) ─────────────────────────
-        if results_config.scalars.enabled:
-            fissile_mat_ids: set[str] = set()
-            if not results_config.scalars.all_cells:
-                for mat in materials:
-                    if _material_is_fissile(mat):
-                        fissile_mat_ids.add(mat.id)
-
-            tally_id = 101
-            for cell in geometry.cells:
-                if cell.material_id is None:
-                    continue  # void cells have nothing to tally
-
-                if not results_config.scalars.all_cells:
-                    if cell.material_id not in fissile_mat_ids:
-                        continue
-
-                # Top-level CellFilter
-                cell_filter_id = next_filter_id
-                next_filter_id += 1
-                f_el = ET.SubElement(root, "filter")
-                f_el.set("id", str(cell_filter_id))
-                f_el.set("type", "cell")
-                bins_el = ET.SubElement(f_el, "bins")
-                bins_el.text = _int_id(cell.id)
-
-                tally_el = ET.SubElement(root, "tally")
-                tally_el.set("id", str(tally_id))
-                tally_el.set("name", f"cell_{_int_id(cell.id)}_scalars")
-                filters_el = ET.SubElement(tally_el, "filters")
-                filters_el.text = str(cell_filter_id)
-                scores_el = ET.SubElement(tally_el, "scores")
-                scores_el.text = " ".join(s.value for s in results_config.scalars.scores)
-
-                tally_id += 1
-
-        # ── Group 3: Mesh tally (ID 200) ─────────────────────────────────────
-        if results_config.mesh.enabled:
-            cfg = results_config.mesh
-
-            # Mesh definition — must appear before the filter that references it
-            mesh_el = ET.SubElement(root, "mesh")
-            mesh_el.set("id", "1")
-            if cfg.mesh_type == MeshType.REGULAR:
-                mesh_el.set("type", "regular")
-                bounds = _geometry_bounds(geometry)
-                lower_el = ET.SubElement(mesh_el, "lower_left")
-                lower_el.text = f"{bounds[0]} {bounds[1]} {bounds[2]}"
-                upper_el = ET.SubElement(mesh_el, "upper_right")
-                upper_el.text = f"{bounds[3]} {bounds[4]} {bounds[5]}"
-                dim_el = ET.SubElement(mesh_el, "dimension")
-                dim_el.text = f"{cfg.nx} {cfg.ny} {cfg.nz}"
-            else:
-                mesh_el.set("type", "cylindrical")
-                bounds = _geometry_bounds(geometry)
-                origin_el = ET.SubElement(mesh_el, "origin")
-                origin_el.text = "0.0 0.0 0.0"
-                r_el = ET.SubElement(mesh_el, "r_grid")
-                max_r = max(abs(bounds[0]), abs(bounds[1]),
-                            abs(bounds[2]), abs(bounds[3]))
-                r_step = max_r / cfg.nr
-                r_el.text = " ".join(f"{i * r_step:.6g}" for i in range(cfg.nr + 1))
-                z_el = ET.SubElement(mesh_el, "z_grid")
-                z_step = (bounds[5] - bounds[4]) / cfg.nz_cyl
-                z_el.text = " ".join(
-                    f"{bounds[4] + i * z_step:.6g}" for i in range(cfg.nz_cyl + 1)
-                )
-
-            # Top-level MeshFilter
-            mesh_filter_id = next_filter_id
-            next_filter_id += 1
-            mf_el = ET.SubElement(root, "filter")
-            mf_el.set("id", str(mesh_filter_id))
-            mf_el.set("type", "mesh")
-            mf_bins_el = ET.SubElement(mf_el, "bins")
-            mf_bins_el.text = "1"
-
-            tally_el = ET.SubElement(root, "tally")
-            tally_el.set("id", "200")
-            tally_el.set("name", "power_flux_mesh")
-            filters_el = ET.SubElement(tally_el, "filters")
-            filters_el.text = str(mesh_filter_id)
-            scores_el = ET.SubElement(tally_el, "scores")
-            scores_el.text = " ".join(s.value for s in cfg.scores)
-
-        # ── Group 4: Energy spectra (IDs 301+) ───────────────────────────────
-        if results_config.spectra.enabled:
-            cfg = results_config.spectra
-            boundaries = cfg.boundaries()
-
-            if boundaries:
-                energy_bins_text = " ".join(f"{e:.6g}" for e in boundaries)
-
-                # One shared top-level EnergyFilter for all spectrum tallies
-                energy_filter_id = next_filter_id
-                next_filter_id += 1
-                ef_el = ET.SubElement(root, "filter")
-                ef_el.set("id", str(energy_filter_id))
-                ef_el.set("type", "energy")
-                ef_bins_el = ET.SubElement(ef_el, "bins")
-                ef_bins_el.text = energy_bins_text
-
-                if cfg.per_material:
-                    for tally_id, mat in enumerate(materials, start=301):
-                        mat_int_id = material_id_map.get(mat.id, tally_id - 300)
-
-                        # Top-level MaterialFilter for this material
-                        mat_filter_id = next_filter_id
-                        next_filter_id += 1
-                        mat_f_el = ET.SubElement(root, "filter")
-                        mat_f_el.set("id", str(mat_filter_id))
-                        mat_f_el.set("type", "material")
-                        mat_bins_el = ET.SubElement(mat_f_el, "bins")
-                        mat_bins_el.text = str(mat_int_id)
-
-                        tally_el = ET.SubElement(root, "tally")
-                        tally_el.set("id", str(tally_id))
-                        tally_el.set("name", f"spectrum_{mat.id}")
-                        filters_el = ET.SubElement(tally_el, "filters")
-                        filters_el.text = f"{energy_filter_id} {mat_filter_id}"
-                        scores_el = ET.SubElement(tally_el, "scores")
-                        scores_el.text = "flux"
-                else:
-                    tally_el = ET.SubElement(root, "tally")
-                    tally_el.set("id", "301")
-                    tally_el.set("name", "spectrum_global")
-                    filters_el = ET.SubElement(tally_el, "filters")
-                    filters_el.text = str(energy_filter_id)
-                    scores_el = ET.SubElement(tally_el, "scores")
-                    scores_el.text = "flux"
-
-        return _pretty_xml(root)

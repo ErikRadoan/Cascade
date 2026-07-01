@@ -5,9 +5,10 @@ from __future__ import annotations
 import shutil
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
 from ..repositories.db import SessionLocal, get_db
@@ -21,10 +22,23 @@ from ..domain.results_config import (
     EnergySpectraConfig,
     MeshTallyConfig,
     MeshType,
+    ParticleType,
+    R2SResultsConfig,
     ResultsConfig,
     ScalarTallyConfig,
     SimulationSummaryConfig,
     TallyScore,
+)
+from ..domain.run_settings import (
+    ActivationSettings,
+    DepletionSettings,
+    IrradiationSchedule,
+    McSettings,
+    R2SSettings,
+    RunMode,
+    SourceDef,
+    SourceSpaceType,
+    VrSettings,
 )
 from ..dsl import loader, expander
 from ..dsl.sweep import expand_sweep, parse_sweep, validate_preview
@@ -55,7 +69,112 @@ _DEFAULT_BACKEND_CONFIG = DockerBackendConfig(
 
 
 # ---------------------------------------------------------------------------
-# Request models
+# Request models — Monte Carlo / source / mode-specific settings
+#
+# These mirror domain/run_settings.py at the Pydantic layer (request
+# validation) — see that module's docstring for the reasoning behind the
+# per-leg, per-mode shape. Each *Request model carries a to_domain() that
+# bridges to the matching frozen dataclass.
+# ---------------------------------------------------------------------------
+
+class McSettingsRequest(BaseModel):
+    """Particle/batch/seed settings for ONE transport leg.
+
+    `inactive` is optional and mode-dependent (see RunMode docs on
+    JobSubmitRequest below) — sending it for a fixed-source leg is now a
+    422 validation error instead of a silently-ignored field.
+    """
+    particles: int       = Field(1000, gt=0)
+    batches:   int        = Field(100, gt=0)
+    seed:      int        = 1
+    inactive:  int | None = Field(None, gt=0)
+
+    def to_domain(self) -> McSettings:
+        return McSettings(
+            particles=self.particles, batches=self.batches,
+            seed=self.seed, inactive=self.inactive,
+        )
+
+
+class SourceDefRequest(BaseModel):
+    """Required for fixed_source mode and r2s's neutron leg
+    (job-settings-model.md §3.2 — previously impossible to submit)."""
+    particle:     Literal["neutron", "photon"]
+    space_type:   Literal["point", "box"] = "point"
+    space_params: list[float]             = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    energy_mev:   float | None            = None
+
+    def to_domain(self) -> SourceDef:
+        return SourceDef(
+            particle=self.particle,
+            space_type=self.space_type,
+            space_params=tuple(self.space_params),
+            energy_mev=self.energy_mev,
+        )
+
+
+class DepletionSettingsRequest(BaseModel):
+    power_W:    float        = Field(..., gt=0)
+    timesteps:  list[float]  = Field(..., min_length=1)
+    chain_file: str
+    integrator: str          = "predictor"
+    substeps:   int          = Field(1, gt=0)
+
+    def to_domain(self) -> DepletionSettings:
+        return DepletionSettings(
+            power_W=self.power_W, timesteps=self.timesteps,
+            chain_file=self.chain_file, integrator=self.integrator,
+            substeps=self.substeps,
+        )
+
+
+class IrradiationScheduleRequest(BaseModel):
+    power_W:   float       = Field(..., gt=0)
+    timesteps: list[float] = Field(..., min_length=1)
+
+    def to_domain(self) -> IrradiationSchedule:
+        return IrradiationSchedule(power_W=self.power_W, timesteps=self.timesteps)
+
+
+class ActivationSettingsRequest(BaseModel):
+    irradiation_schedule: IrradiationScheduleRequest
+    cooling_times:        list[float] = Field(..., min_length=1)
+    decay_library:        str
+
+    def to_domain(self) -> ActivationSettings:
+        return ActivationSettings(
+            irradiation_schedule=self.irradiation_schedule.to_domain(),
+            cooling_times=self.cooling_times,
+            decay_library=self.decay_library,
+        )
+
+
+class VrSettingsRequest(BaseModel):
+    weight_windows_enabled: bool = False
+
+    def to_domain(self) -> VrSettings:
+        return VrSettings(weight_windows_enabled=self.weight_windows_enabled)
+
+
+class R2SSettingsRequest(BaseModel):
+    neutron_leg_source: SourceDefRequest
+    neutron_leg_mc:     McSettingsRequest
+    activation:         ActivationSettingsRequest
+    photon_leg_mc:      McSettingsRequest
+    photon_leg_vr:      VrSettingsRequest = Field(default_factory=VrSettingsRequest)
+
+    def to_domain(self) -> R2SSettings:
+        return R2SSettings(
+            neutron_leg_source=self.neutron_leg_source.to_domain(),
+            neutron_leg_mc=self.neutron_leg_mc.to_domain(),
+            activation=self.activation.to_domain(),
+            photon_leg_mc=self.photon_leg_mc.to_domain(),
+            photon_leg_vr=self.photon_leg_vr.to_domain(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Request models — results capture
 # ---------------------------------------------------------------------------
 
 class ScalarTallyRequest(BaseModel):
@@ -63,7 +182,8 @@ class ScalarTallyRequest(BaseModel):
     enabled:   bool            = True
     scores:    list[str]       = Field(
         default=["flux", "fission", "absorption", "heating"],
-        description="TallyScore values to measure per cell.",
+        description="TallyScore values to measure per cell. Valid values "
+                     "depend on the leg's particle_type — see ResultsConfigRequest.",
     )
     all_cells: bool            = False
 
@@ -81,7 +201,8 @@ class MeshTallyRequest(BaseModel):
 
 
 class EnergySpectraRequest(BaseModel):
-    """Controls flux-vs-energy spectra per material region."""
+    """Controls flux-vs-energy spectra per material region. Neutron legs only
+    — see ResultsConfigRequest.to_domain(), which rejects this for a photon leg."""
     enabled:         bool = False
     group_structure: str  = "69"    # "33" | "69" | "252"
     per_material:    bool = True
@@ -94,15 +215,29 @@ class DiagnosticsRequest(BaseModel):
 
 
 class ResultsConfigRequest(BaseModel):
-    """What to ask OpenMC to capture.  All groups default to the cheapest option."""
+    """What to ask OpenMC to capture, for ONE transport leg.
+
+    `particle_type` (new) scopes which scores/group structures are valid —
+    see domain/results_config.py §5's ParticleType restructure. Defaults
+    to "neutron" so existing eigenvalue/fixed_source callers are unaffected.
+    """
+    particle_type: Literal["neutron", "photon"] = "neutron"
     scalars:     ScalarTallyRequest   = Field(default_factory=ScalarTallyRequest)
     mesh:        MeshTallyRequest     = Field(default_factory=MeshTallyRequest)
     spectra:     EnergySpectraRequest = Field(default_factory=EnergySpectraRequest)
     diagnostics: DiagnosticsRequest   = Field(default_factory=DiagnosticsRequest)
+    apply_dose_conversion: bool       = False
 
     def to_domain(self) -> ResultsConfig:
-        """Convert Pydantic request model → domain ResultsConfig."""
+        """Convert Pydantic request model → domain ResultsConfig.
+
+        Raises pydantic.ValidationError-adjacent ValueError (converted to a
+        422 by the route handler) if scores/group-structures are invalid
+        for `particle_type` — this now fails at the API boundary instead of
+        silently generating nonsensical tallies.xml downstream.
+        """
         return ResultsConfig(
+            particle_type=ParticleType(self.particle_type),
             summary=SimulationSummaryConfig(),  # always on
             scalars=ScalarTallyConfig(
                 enabled=self.scalars.enabled,
@@ -129,31 +264,150 @@ class ResultsConfigRequest(BaseModel):
                 particle_tracks=self.diagnostics.particle_tracks,
                 n_tracks=self.diagnostics.n_tracks,
             ),
+            apply_dose_conversion=self.apply_dose_conversion,
         )
 
 
+class R2SResultsConfigRequest(BaseModel):
+    """r2s's per-leg results config — job-settings-model.md §1's core fix.
+
+    Never a single ResultsConfigRequest for r2s. `neutron_leg`/`photon_leg`
+    each carry their own `particle_type`, which is enforced (not just
+    defaulted) in to_domain().
+    """
+    neutron_leg: ResultsConfigRequest
+    photon_leg:  ResultsConfigRequest
+
+    def to_domain(self) -> R2SResultsConfig:
+        neutron_leg = self.neutron_leg.model_copy(update={"particle_type": "neutron"})
+        photon_leg  = self.photon_leg.model_copy(update={"particle_type": "photon"})
+        return R2SResultsConfig(
+            neutron_leg=neutron_leg.to_domain(),
+            photon_leg=photon_leg.to_domain(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Request models — top-level job/sweep submission
+# ---------------------------------------------------------------------------
+
 class JobSubmitRequest(BaseModel):
+    """Submission payload for a single job. Shape depends on `run_mode`
+    (job-settings-model.md §2's field-requirements matrix):
+
+        eigenvalue:   monte_carlo (with inactive) + results_config.
+        fixed_source: monte_carlo (no inactive) + source + results_config.
+        depletion:    monte_carlo (with inactive, applies per timestep)
+                      + depletion + results_config.
+        r2s:          r2s (per-leg settings) + r2s_results_config.
+                      monte_carlo/source/results_config/depletion must be
+                      unset — see validate_shape().
+
+    CHANGE: `run_mode` did not exist on this model before — the frontend
+    sent it, FastAPI/Pydantic silently dropped it as an unknown field, and
+    every job ran as whatever OpenMCRunSettings() defaulted to. It's a
+    required field now.
+    """
     geometry_text:  str
     material_ids:   list[str]
-    backend_config: BackendConfig          = Field(default=_DEFAULT_BACKEND_CONFIG)
-    particles:      int                    = Field(1000, gt=0)
-    inactive:       int                    = Field(20,   gt=0)
-    batches:        int                    = Field(100,  gt=0)
-    seed:           int                    = 1
-    results_config: ResultsConfigRequest   = Field(default_factory=ResultsConfigRequest)
-    notes:          str | None             = None
+    backend_config: BackendConfig = Field(default=_DEFAULT_BACKEND_CONFIG)
+
+    run_mode:       Literal["eigenvalue", "fixed_source", "depletion", "r2s"]
+    monte_carlo:    McSettingsRequest | None       = None
+    source:         SourceDefRequest | None        = None
+    depletion:      DepletionSettingsRequest | None = None
+    r2s:            R2SSettingsRequest | None       = None
+    results_config: ResultsConfigRequest | None     = None
+    r2s_results_config: R2SResultsConfigRequest | None = None
+
+    notes: str | None = None
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "JobSubmitRequest":
+        """job-settings-model.md §2: which fields are required/forbidden
+        per run_mode. This is what makes 'r2s + inactive batches' a 422 at
+        the API boundary instead of a UI affordance that reaches the backend."""
+        mode = self.run_mode
+
+        if mode == "r2s":
+            if self.r2s is None:
+                raise ValueError("run_mode='r2s' requires `r2s` settings.")
+            if self.r2s_results_config is None:
+                raise ValueError("run_mode='r2s' requires `r2s_results_config` (per-leg).")
+            for forbidden, name in (
+                (self.monte_carlo, "monte_carlo"),
+                (self.source, "source"),
+                (self.depletion, "depletion"),
+                (self.results_config, "results_config"),
+            ):
+                if forbidden is not None:
+                    raise ValueError(
+                        f"run_mode='r2s' must not set `{name}` — r2s has two "
+                        f"independent legs, set per-leg fields under `r2s` "
+                        f"and `r2s_results_config` instead."
+                    )
+            return self
+
+        # eigenvalue / fixed_source / depletion all need a single-leg
+        # monte_carlo + results_config, and must not set r2s fields.
+        if self.monte_carlo is None:
+            raise ValueError(f"run_mode='{mode}' requires `monte_carlo`.")
+        if self.results_config is None:
+            raise ValueError(f"run_mode='{mode}' requires `results_config`.")
+        if self.r2s is not None or self.r2s_results_config is not None:
+            raise ValueError(f"run_mode='{mode}' must not set r2s fields.")
+
+        if mode == "eigenvalue":
+            if self.source is not None:
+                raise ValueError(
+                    "run_mode='eigenvalue' source is geometry-driven "
+                    "(auto-detected from fissile cells) — do not set `source`."
+                )
+            if self.depletion is not None:
+                raise ValueError("run_mode='eigenvalue' must not set `depletion`.")
+
+        elif mode == "fixed_source":
+            if self.source is None:
+                raise ValueError(
+                    "run_mode='fixed_source' requires `source` "
+                    "(job-settings-model.md §3.2)."
+                )
+            if self.depletion is not None:
+                raise ValueError("run_mode='fixed_source' must not set `depletion`.")
+
+        elif mode == "depletion":
+            if self.depletion is None:
+                raise ValueError("run_mode='depletion' requires `depletion` settings.")
+            if self.source is not None:
+                raise ValueError("run_mode='depletion' must not set `source`.")
+
+        return self
+
+    def to_domain_kwargs(self) -> dict:
+        """Fields to splat into SimulationJob(...), independent of geometry/
+        materials/backend/job_id which the route handler resolves separately."""
+        mode = self.run_mode  # RunMode's string constants match these literals exactly
+        if self.run_mode == "r2s":
+            return dict(
+                run_mode=RunMode.R2S,
+                mode_specific=self.r2s.to_domain(),
+                results_config=self.r2s_results_config.to_domain(),
+            )
+        mode_specific = self.depletion.to_domain() if self.run_mode == "depletion" else None
+        return dict(
+            run_mode=mode,
+            monte_carlo=self.monte_carlo.to_domain(),
+            source=self.source.to_domain() if self.source else None,
+            mode_specific=mode_specific,
+            results_config=self.results_config.to_domain(),
+        )
 
 
-class SweepSubmitRequest(BaseModel):
-    geometry_text:  str
-    material_ids:   list[str]
-    backend_config: BackendConfig          = Field(default=_DEFAULT_BACKEND_CONFIG)
-    particles:      int                    = Field(1000, gt=0)
-    inactive:       int                    = Field(20,   gt=0)
-    batches:        int                    = Field(100,  gt=0)
-    seed:           int                    = 1
-    results_config: ResultsConfigRequest   = Field(default_factory=ResultsConfigRequest)
-    notes:          str | None             = None
+class SweepSubmitRequest(JobSubmitRequest):
+    """Identical shape to JobSubmitRequest — a sweep is the same per-job
+    settings applied across every point in the parameter sweep. Subclassing
+    means the two can never drift apart the way the old flat field lists did."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -271,18 +525,12 @@ async def submit_job(
     swept_params = _extract_swept_params(body.geometry_text)
 
     if swept_params:
-        sweep_request = SweepSubmitRequest(
-            geometry_text=body.geometry_text,
-            material_ids=body.material_ids,
-            backend_config=body.backend_config,
-            particles=body.particles,
-            inactive=body.inactive,
-            batches=body.batches,
-            seed=body.seed,
-            results_config=body.results_config,
-            notes=body.notes,
-        )
-
+        # SweepSubmitRequest is a subclass of JobSubmitRequest with an
+        # identical shape, so this is a straight passthrough — no more
+        # hand-copying each individual field (and no more risk of the two
+        # request shapes drifting apart, which is how `run_mode` got lost
+        # here in the first place).
+        sweep_request = SweepSubmitRequest(**body.model_dump())
         return await submit_sweep(sweep_request, db)
 
     errors = loader.validate(body.geometry_text)
@@ -299,18 +547,22 @@ async def submit_job(
     backend   = create_backend(body.backend_config)
 
     job_id = str(uuid.uuid4())
-    job = SimulationJob(
-        id=job_id,
-        geometry=geometry,
-        materials=materials,
-        param_values={},
-        backend=body.backend_config.type,
-        results_config=body.results_config.to_domain(),
-        working_dir=Path(body.backend_config.jobs_base_dir) / job_id,
-        notes=body.notes,
-    )
-
-    print(f"Job submited with config {body.results_config.model_dump_json()}")
+    try:
+        job = SimulationJob(
+            id=job_id,
+            geometry=geometry,
+            materials=materials,
+            param_values={},
+            backend=body.backend_config.type,
+            working_dir=Path(body.backend_config.jobs_base_dir) / job_id,
+            notes=body.notes,
+            **body.to_domain_kwargs(),
+        )
+    except ValueError as e:
+        # Domain-level cross-field validation (job-settings-model.md §6) —
+        # e.g. fission scores requested without a fissile material, or
+        # eigenvalue mode on a geometry with no fissile cells at all.
+        raise HTTPException(status_code=422, detail=str(e))
 
     try:
         job = backend.submit(job)
@@ -354,16 +606,28 @@ async def submit_sweep(
 
     for param_values, geometry in sweep_points:
         job_id = str(uuid.uuid4())
-        job = SimulationJob(
-            id=job_id,
-            geometry=geometry,
-            materials=materials,
-            param_values=param_values,
-            backend=body.backend_config.type,
-            results_config=body.results_config.to_domain(),
-            working_dir=Path(body.backend_config.jobs_base_dir) / job_id,
-            notes=body.notes,
-        )
+        try:
+            job = SimulationJob(
+                id=job_id,
+                geometry=geometry,
+                materials=materials,
+                param_values=param_values,
+                backend=body.backend_config.type,
+                working_dir=Path(body.backend_config.jobs_base_dir) / job_id,
+                notes=body.notes,
+                **body.to_domain_kwargs(),
+            )
+        except ValueError as e:
+            # e.g. this sweep point's geometry has no fissile material for
+            # eigenvalue mode — fail just this point, not the whole sweep.
+            import datetime as _dt
+            summaries.append(JobSummary(
+                id=job_id, status=JobStatus.FAILED.value, backend=body.backend_config.type,
+                param_values=param_values, created_at=_dt.datetime.now(_dt.timezone.utc),
+                notes=f"Rejected: {e}",
+            ))
+            job_ids.append(job_id)
+            continue
 
         try:
             job = backend.submit(job)
