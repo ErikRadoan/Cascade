@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from enum import StrEnum
 from pathlib import Path
 
 from .geometry import CascadeGeometry
 from .material import Material
+from .job_status import JobStatus  # re-exported — see job_status.py docstring
+from .job_step import JobStep, derive_job_status
 from .results_config import ResultsConfig, R2SResultsConfig, TallyScore
 from .run_settings import (
     ActivationSettings,
@@ -18,14 +19,6 @@ from .run_settings import (
     SourceDef,
     VrSettings,
 )
-
-
-class JobStatus(StrEnum):
-    QUEUED    = "queued"
-    RUNNING   = "running"
-    COMPLETED = "completed"
-    FAILED    = "failed"
-    CANCELLED = "cancelled"
 
 
 # Nuclides that make a material fissile/fertile for the purposes of job-level
@@ -110,6 +103,17 @@ class SimulationJob:
     backend:        str                              = "docker"
     results_config: ResultsConfig | R2SResultsConfig = field(default_factory=ResultsConfig.default)
     status:         JobStatus                        = JobStatus.QUEUED
+    # Execution steps (PLAN_depletion_r2s_execution.md Task 2). Empty for
+    # eigenvalue/fixed_source jobs run the old way (DockerBackend still
+    # sets `status` directly on those — see effective_status()). Populated
+    # by DockerBackend for r2s's 3-step pipeline (and, in the future,
+    # depletion's single driver-script step, once that's wired up too).
+    steps:          list[JobStep]                    = field(default_factory=list)
+    # Which sweep (if any) produced this job — previously generated in
+    # api/jobs.py's submit_sweep() but never attached to the job itself,
+    # so results views had no way to look it up (see PLAN doc's sweep_id
+    # section). None for a standalone (non-sweep) job.
+    sweep_id:       str | None                       = None
     working_dir:    Path | None                      = None
     created_at:     datetime                         = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at:     datetime | None                  = None
@@ -136,6 +140,16 @@ class SimulationJob:
         elif self.run_mode == RunMode.DEPLETION:
             self._validate_single_leg(needs_source=False, forbid_source=True, mode_specific_type=DepletionSettings)
             self.mode_specific.validate()  # type: ignore[union-attr]
+            if not _has_fissile_material(self.materials):
+                raise ValueError(
+                    "depletion mode requires geometry with a fissile material "
+                    "present — it's both the criticality source for each "
+                    "timestep's transport solve (same as eigenvalue mode) "
+                    "and the material that actually gets marked depletable "
+                    "in materials.xml. Without one, openmc.deplete.CoupledOperator "
+                    "fails with 'No depletable materials were found in the model' "
+                    "regardless of the chain file supplied."
+                )
 
         elif self.run_mode == RunMode.R2S:
             if self.monte_carlo is not None:
@@ -230,6 +244,28 @@ class SimulationJob:
             raise RuntimeError(f"Job '{self.id}' has no working_dir set.")
         return self.working_dir / "output"
 
+    def effective_status(self) -> JobStatus:
+        """The job's real current status.
+
+        Falls back to `self.status` (the plain field, set directly by
+        DockerBackend today) when `steps` is empty — this is what keeps
+        eigenvalue/fixed_source jobs working exactly as before without any
+        changes to how DockerBackend handles them. Once `steps` is
+        populated (r2s's 3-step pipeline; eventually depletion's single
+        driver step too), status is *derived* from step statuses instead —
+        the same pattern SweepRow already uses one level up (sweep status
+        derived from child job statuses, never stored redundantly).
+
+        Callers that read job status for display or polling (API layer,
+        JobRepository) should call this instead of reading `.status`
+        directly, so they get correct behavior for both step-based and
+        legacy single-field jobs without needing to know which kind a
+        given job is.
+        """
+        if self.steps:
+            return derive_job_status(self.steps)
+        return self.status
+
     def to_dict(self) -> dict[str, object]:
         return {
             "id":             self.id,
@@ -242,7 +278,9 @@ class SimulationJob:
             "param_values":   self.param_values,
             "backend":        self.backend,
             "results_config": self.results_config.to_dict(),
-            "status":         self.status.value,
+            "status":         self.effective_status().value,
+            "steps":          [s.to_dict() for s in self.steps],
+            "sweep_id":       self.sweep_id,
             "working_dir":    str(self.working_dir) if self.working_dir else None,
             "created_at":     self.created_at.isoformat(),
             "started_at":     self.started_at.isoformat() if self.started_at else None,

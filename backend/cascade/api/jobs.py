@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import shutil
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
@@ -47,6 +48,7 @@ from ..execution.backend_config import (
     DockerBackendConfig,
     create_backend,
 )
+from ..domain.paths import JOBS_BASE_DIR, UPLOADS_DIR
 from .schemas import (
     DeletedResponse,
     JobDetail,
@@ -55,8 +57,6 @@ from .schemas import (
 )
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
-
-JOBS_BASE_DIR = Path.home() / ".cascade" / "jobs"
 
 _DEFAULT_BACKEND_CONFIG = DockerBackendConfig(
     cli="podman",
@@ -417,18 +417,19 @@ class SweepSubmitRequest(JobSubmitRequest):
 def _to_summary(job: SimulationJob) -> JobSummary:
     return JobSummary(
         id=job.id,
-        status=job.status.value,
+        status=job.effective_status().value,
         backend=job.backend,
         param_values=job.param_values,
         created_at=job.created_at,
         notes=job.notes,
+        sweep_id=job.sweep_id,
     )
 
 
 def _to_detail(job: SimulationJob) -> JobDetail:
     return JobDetail(
         id=job.id,
-        status=job.status.value,
+        status=job.effective_status().value,
         backend=job.backend,
         param_values=job.param_values,
         created_at=job.created_at,
@@ -438,6 +439,8 @@ def _to_detail(job: SimulationJob) -> JobDetail:
         finished_at=job.finished_at,
         error=job.error,
         working_dir=str(job.working_dir) if job.working_dir else None,
+        sweep_id=job.sweep_id,
+        steps=[s.to_dict() for s in job.steps],
     )
 
 
@@ -512,6 +515,46 @@ def _get_job_or_404(job_id: str, db: Session) -> SimulationJob:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@router.post("/files")
+async def upload_job_file(
+    file: UploadFile = File(...),
+    kind: str = Form(...),
+) -> dict:
+    """Accept a file upload from the browser's native file picker.
+
+    Used for depletion chain files and r2s decay/activation libraries
+    (see JobSubmitModal.svelte — the file input's onchange handler calls
+    api.jobs.uploadFile() immediately on selection, before the job is
+    submitted). Returns a `file_id` that the frontend stores as the
+    `chain_file`/`decay_library` string value in the submission payload;
+    DockerBackend resolves that reference back to actual file bytes at
+    staging time via `_stage_uploaded_file()`, copying them directly into
+    the relevant execution step's input_dir (the same directory mounted
+    into the container at /work) — no separate host-path volume mount
+    needed, unlike the provisional approach this replaces.
+
+    `kind` ("chain" | "decay_library") isn't currently used to change
+    storage behavior — both are staged identically — but is accepted and
+    could later gate validation (e.g. requiring a .xml extension for
+    chain files) without a client-side contract change.
+
+    Returns:
+        {"file_id": "<uuid>", "filename": "<original filename>"}
+        Store the two joined as "{file_id}/{filename}" wherever a
+        DepletionSettings.chain_file / ActivationSettings.decay_library
+        string reference is expected.
+    """
+    file_id = str(uuid.uuid4())
+    dest_dir = UPLOADS_DIR / file_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    dest_path = dest_dir / file.filename
+    with dest_path.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    return {"file_id": file_id, "filename": file.filename}
+
 
 @router.post(
     "/submit",
@@ -615,6 +658,7 @@ async def submit_sweep(
                 backend=body.backend_config.type,
                 working_dir=Path(body.backend_config.jobs_base_dir) / job_id,
                 notes=body.notes,
+                sweep_id=sweep_id,
                 **body.to_domain_kwargs(),
             )
         except ValueError as e:
@@ -624,7 +668,7 @@ async def submit_sweep(
             summaries.append(JobSummary(
                 id=job_id, status=JobStatus.FAILED.value, backend=body.backend_config.type,
                 param_values=param_values, created_at=_dt.datetime.now(_dt.timezone.utc),
-                notes=f"Rejected: {e}",
+                notes=f"Rejected: {e}", sweep_id=sweep_id,
             ))
             job_ids.append(job_id)
             continue
@@ -661,11 +705,25 @@ async def get_sweep(
     sweep_id: str,
     db:       Session = Depends(get_db),
 ) -> dict:
-    """Get sweep metadata and derived status."""
+    """Get sweep metadata, derived status, and per-job results summaries.
+
+    CHANGE: previously returned only `record.to_dict()` — sweep metadata
+    plus a bare `job_ids` list, with no way to render per-job results
+    (status, param_values, results_config) without N follow-up requests to
+    GET /jobs/{job_id}. Now attaches full job summaries via
+    JobRepository.list_by_sweep(), which is possible because job.sweep_id
+    is now actually persisted (previously sweep_id was generated at submit
+    time but never attached to the job record at all — see job.py's
+    `sweep_id` field and job_repository.py's `list_by_sweep()`).
+    """
     record = SweepRepository(db).get(sweep_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Sweep '{sweep_id}' not found.")
-    return record.to_dict()
+    jobs = JobRepository(db).list_by_sweep(sweep_id)
+    return {
+        **record.to_dict(),
+        "jobs": [_to_summary(j).model_dump(mode="json") for j in jobs],
+    }
 
 
 @router.delete("/sweeps/{sweep_id}", response_model=DeletedResponse)
@@ -730,33 +788,48 @@ async def get_job(
     """Get current status and detail for a job.
 
     Polls the correct backend if still running, then persists any status change.
+
+    BUG FIX: previously gated on `job.status == JobStatus.RUNNING` — the
+    raw field, which stepped jobs (depletion/r2s) never set at all (only
+    `job.steps` is populated/mutated for those; `job.effective_status()`
+    derives RUNNING from step state instead). That meant `backend.status()`
+    was never called again after the first poll for any depletion/r2s job
+    — its step state, and therefore its displayed status, froze at
+    whatever it was right after submission and never advanced, regardless
+    of what actually happened in the container. Fixed to check
+    `effective_status()`, which is correct for both legacy single-leg jobs
+    (falls back to the raw field) and stepped jobs (derives from steps).
+
+    Also fixed: previously only persisted when the *overall* derived
+    status changed. A stepped job can move from one running step to the
+    next (e.g. r2s's neutron leg finishing and activation starting) while
+    effective_status() stays RUNNING throughout that transition — under
+    the old `if new_status != old_status` gate, that step progress was
+    silently dropped instead of saved. Now always persists (including
+    `job.steps`) after every poll where backend.status() was actually
+    called.
     """
     job = _get_job_or_404(job_id, db)
 
-    if job.status == JobStatus.RUNNING:
+    if job.effective_status() == JobStatus.RUNNING:
         try:
-            backend     = _backend_for_job(job_id, db)
-            # Capture status BEFORE calling backend.status() because the
-            # backend mutates job.status in-place — comparing new_status to
-            # job.status after the call always yields equal, so the update
-            # block was never entered and the DB was never written.
-            old_status  = job.status
-            new_status  = backend.status(job)   # may mutate job in-place
-            if new_status != old_status:
-                # Ensure finished_at is set for terminal transitions
-                if new_status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
-                    if not job.finished_at:
-                        from datetime import datetime, timezone
-                        job.finished_at = datetime.now(timezone.utc)
-                JobRepository(db).update_status(
-                    job_id=      job_id,
-                    status=      new_status,
-                    error=       job.error,
-                    started_at=  job.started_at,
-                    finished_at= job.finished_at,
-                )
-                db.expire_all()
-                db.commit()
+            backend    = _backend_for_job(job_id, db)
+            new_status = backend.status(job)   # mutates job.status and/or job.steps in-place
+
+            if new_status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+                if not job.finished_at:
+                    job.finished_at = datetime.now(timezone.utc)
+
+            JobRepository(db).update_status(
+                job_id=      job_id,
+                status=      new_status,
+                error=       job.error,
+                started_at=  job.started_at,
+                finished_at= job.finished_at,
+                steps=       job.steps,
+            )
+            db.expire_all()
+            db.commit()
         except HTTPException:
             raise
         except Exception as e:
@@ -823,11 +896,23 @@ async def get_job_stdout(
     job_id: str,
     db:     Session = Depends(get_db),
 ) -> dict:
-    """Return the raw stdout from a job's run.log file.
+    """Return the raw stdout from a job's run.log file(s).
 
     This is the actual OpenMC terminal output — particle transport
     progress, k-eff per batch, timing, and errors.
     Polled every 2s by the frontend while a job is running.
+
+    BUG FIX: this previously only ever read `job.working_dir / "run.log"`.
+    That's correct for eigenvalue/fixed_source (job.steps is empty, and
+    DockerBackend writes run.log directly there — see
+    `_submit_single_leg`), but depletion and r2s jobs write run.log
+    per-step, at `step.working_dir / "run.log"` (see `_launch_step()` in
+    docker_backend.py) — `job.working_dir / "run.log"` never exists for
+    them at all. The console silently showed nothing for every depletion/
+    r2s job as a result. Now: for a job with steps, concatenate each
+    step's log (in sequence order, with a header per step) so the console
+    shows the full pipeline's progress, not just whichever step happens to
+    be running right now.
 
     Returns:
         { "lines": str, "available": bool }
@@ -836,6 +921,9 @@ async def get_job_stdout(
 
     if not job.working_dir:
         return {"lines": "", "available": False}
+
+    if job.steps:
+        return _read_stepped_stdout(job)
 
     log_path = job.working_dir / "run.log"
     if not log_path.exists():
@@ -846,3 +934,32 @@ async def get_job_stdout(
         return {"lines": content, "available": True}
     except OSError:
         return {"lines": "", "available": False}
+
+
+def _read_stepped_stdout(job: SimulationJob) -> dict:
+    """Concatenate each step's run.log in sequence order.
+
+    Only includes steps that have actually started (QUEUED steps have no
+    working_dir contents yet — nothing to show). A header line names each
+    step so the pipeline's progress is legible, e.g. for r2s:
+        === neutron leg ===
+        <openmc output>
+        === photon leg ===
+        <openmc output>
+    """
+    chunks: list[str] = []
+    for step in sorted(job.steps, key=lambda s: s.sequence):
+        if step.working_dir is None:
+            continue
+        log_path = step.working_dir / "run.log"
+        if not log_path.exists():
+            continue
+        try:
+            content = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        chunks.append(f"=== {step.label} ===\n{content}")
+
+    if not chunks:
+        return {"lines": "", "available": False}
+    return {"lines": "\n\n".join(chunks), "available": True}

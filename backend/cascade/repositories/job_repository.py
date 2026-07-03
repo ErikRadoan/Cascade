@@ -22,6 +22,7 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from ..domain.job import JobStatus, SimulationJob
+from ..domain.job_step import JobStep
 from ..domain.geometry import CascadeGeometry, Surface, Cell, SurfaceType, BoundaryType
 from ..domain.geometry import Inside, Outside, Intersection, Union, Complement
 from ..domain.material import Material
@@ -72,11 +73,13 @@ class JobRepository:
                 backend_config= backend_config,
                 geometry_json=  job.geometry.to_dict(),
                 materials_json= [m.to_dict() for m in job.materials],
+                sweep_id=                job.sweep_id,
                 run_mode=                job.run_mode,
                 monte_carlo_json=        _opt_asdict(job.monte_carlo),
                 source_json=             _opt_asdict(job.source),
                 mode_specific_json=      _opt_asdict(job.mode_specific),
                 variance_reduction_json= _opt_asdict(job.variance_reduction),
+                steps_json=              [s.to_dict() for s in job.steps] or None,
                 results_config= job.results_config.to_dict(),
                 working_dir=    str(job.working_dir) if job.working_dir else None,
                 notes=          job.notes,
@@ -93,16 +96,32 @@ class JobRepository:
             existing.started_at = job.started_at
             existing.finished_at = job.finished_at
             existing.results_config = job.results_config.to_dict()
+            # Steps mutate as a multi-step pipeline advances (unlike
+            # run_mode/monte_carlo/source, which are fixed at submission
+            # and only ever written in the insert branch above).
+            existing.steps_json = [s.to_dict() for s in job.steps] or None
 
         self._db.commit()
         return job
 
     def update_status(self, job_id: str, status: JobStatus, error: str | None = None,
                       started_at: datetime | None = None,
-                      finished_at: datetime | None = None) -> None:
+                      finished_at: datetime | None = None,
+                      steps: list | None = None) -> None:
         """Efficiently update just the mutable fields of a running job.
 
         Avoids re-serializing geometry/materials on every status poll.
+
+        `steps` (JobStep list) is accepted separately from the rest — for
+        a stepped job (depletion/r2s), step state is what actually
+        advances on each poll (via DockerBackend.status() mutating
+        job.steps in place); the top-level `status` field is largely
+        vestigial for these jobs since effective_status() derives from
+        steps instead. Previously this method had no way to persist step
+        changes at all, so even after get_job() started calling
+        backend.status() correctly, the advanced step state was discarded
+        instead of saved — the job would derive the correct status changed
+        in memory once, then revert to stale step state on next reload.
         """
         row = self._db.get(JobRow, job_id)
         if row is None:
@@ -114,6 +133,8 @@ class JobRepository:
             row.started_at = started_at
         if finished_at is not None:
             row.finished_at = finished_at
+        if steps is not None:
+            row.steps_json = [s.to_dict() for s in steps] or None
         self._db.commit()
 
     # ------------------------------------------------------------------
@@ -149,6 +170,23 @@ class JobRepository:
             self._db.query(JobRow)
             .filter(JobRow.status == status.value)
             .order_by(JobRow.created_at.desc())
+            .all()
+        )
+        return [self._row_to_domain(r) for r in rows]
+
+    def list_by_sweep(self, sweep_id: str) -> list[SimulationJob]:
+        """Return all jobs belonging to a sweep, ordered by creation time.
+
+        This is the query a results view needs to render "sweep results" —
+        previously impossible: sweep_id was only ever stored on
+        SweepRow.job_ids (sweep -> jobs), with no indexed reverse lookup
+        from a job back to its sweep. Now that JobRow.sweep_id exists,
+        this is a direct filter instead of a full-table SweepRow scan.
+        """
+        rows = (
+            self._db.query(JobRow)
+            .filter(JobRow.sweep_id == sweep_id)
+            .order_by(JobRow.created_at.asc())
             .all()
         )
         return [self._row_to_domain(r) for r in rows]
@@ -222,6 +260,8 @@ class JobRepository:
             source=source,
             mode_specific=mode_specific,
             variance_reduction=_vr_settings_from_dict(row.variance_reduction_json),
+            steps=[JobStep.from_dict(s) for s in (row.steps_json or [])],
+            sweep_id=row.sweep_id,
             param_values=row.param_values or {},
             backend=row.backend,
             status=JobStatus(row.status),

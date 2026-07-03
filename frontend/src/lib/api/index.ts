@@ -160,26 +160,32 @@ export const jobs = {
   get: (id: string): Promise<JobDetail> =>
       request(`/api/jobs/${id}`),
 
-  submit: (data: {
-    geometry_text: string;
-    material_ids: string[];
-    run_mode?: string;
-    backend_config?: Record<string, unknown>;
-    particles?: number;
-    inactive?: number;
-    batches?: number;
-    seed?: number;
-    notes?: string;
-    // depletion
-    power_W?: number;
-    timesteps?: number[];
-    // r2s
-    neutron_source_file?: string;
-  }): Promise<JobSummary | SweepResponse> =>
+  // NOTE: this is intentionally loosely typed (Record<string, unknown>)
+  // rather than a precise interface. The real shape is mode-dependent
+  // (JobSubmitRequest in api/jobs.py — eigenvalue/fixed_source/depletion
+  // send `monte_carlo`+`results_config` [+`source`/`depletion`], r2s sends
+  // `r2s`+`r2s_results_config` instead and must NOT set the others) and
+  // validated server-side; a flat TS interface listing every field as
+  // optional would silently allow nonsensical combinations (e.g. r2s +
+  // `monte_carlo` — the exact bug this whole restructure fixed) without
+  // catching them at compile time anyway. See job-settings-model.md.
+  submit: (data: Record<string, unknown>): Promise<JobSummary | SweepResponse> =>
       request('/api/jobs/submit', {
         method: 'POST',
         body: JSON.stringify(data),
       }),
+
+  // Uploads a file selected via a native file picker (depletion chain
+  // files, r2s decay/activation libraries) and returns a reference to
+  // store as the `chain_file`/`decay_library` value in a submit payload.
+  // Follows the same FormData/no-Content-Type-header pattern as
+  // materials.importJson below.
+  uploadFile: (file: File, kind: 'chain' | 'decay_library'): Promise<{ file_id: string; filename: string }> => {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('kind', kind);
+    return request('/api/jobs/files', { method: 'POST', body: form, headers: {} });
+  },
 
   cancel: (id: string): Promise<JobSummary> =>
       request(`/api/jobs/${id}/cancel`, {method: 'POST'}),

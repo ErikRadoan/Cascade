@@ -54,40 +54,67 @@ class RunMode:
 class SourceSpaceType:
     POINT = "point"
     BOX   = "box"
+    FILE  = "file"   # r2s photon leg only — see SourceDef docstring
 
 
 @dataclass(frozen=True)
 class SourceDef:
-    """A user-specified particle source.
+    """A particle source — either analytic (point/box) or file-based.
 
     Required for `fixed_source` mode — job-settings-model.md §3.2 flags this
     as currently missing entirely; a fixed_source run cannot be submitted
     with a real source today. Also required for r2s's neutron leg. Never
     used for `eigenvalue` (source is geometry-driven, auto-detected from
-    fissile cells) and never user-entered for r2s's photon leg (derived
-    from the activation step — see R2SSettings).
+    fissile cells).
+
+    r2s's photon leg is the one case where a SourceDef is constructed by
+    the execution backend rather than the user: the activation step writes
+    a photon source distribution to a file, and that file becomes this
+    leg's source via `space_type=FILE`. It is never user-entered (never
+    appears in a submission request) — see execution/docker_backend.py's
+    r2s step orchestration, which builds this SourceDef after the
+    activation step completes, not at job-submission time.
 
     Fields:
         particle:     Which particle type this source emits.
-        space_type:   Spatial distribution shape.
+        space_type:   Spatial distribution shape — POINT, BOX, or FILE.
         space_params: Parameters for the spatial distribution.
                       `point`: (x, y, z).
                       `box`:   (xmin, ymin, zmin, xmax, ymax, zmax).
+                      `file`:  unused (empty tuple) — see `file_path`.
         energy_mev:   Monoenergetic source energy in MeV. None = OpenMC
                       default (Watt fission spectrum for neutron sources;
-                      must be set explicitly for a photon source since
-                      there is no default photon spectrum).
+                      must be set explicitly for a POINT/BOX photon source
+                      since there is no default photon spectrum). Ignored
+                      for FILE sources, which carry their own energy
+                      distribution in the file.
+        file_path:    Path to an OpenMC source file (e.g. written by
+                      openmc.write_source_file, or an activation solver's
+                      output). Required and only meaningful when
+                      space_type=FILE.
     """
     particle:     str
     space_type:   str = SourceSpaceType.POINT
     space_params: tuple[float, ...] = (0.0, 0.0, 0.0)
     energy_mev:   float | None = None
+    file_path:    str | None = None
 
     def __post_init__(self) -> None:
         if self.particle not in (ParticleType.NEUTRON, ParticleType.PHOTON):
             raise ValueError(f"SourceDef.particle must be 'neutron' or 'photon', got {self.particle!r}.")
-        if self.space_type not in (SourceSpaceType.POINT, SourceSpaceType.BOX):
-            raise ValueError(f"SourceDef.space_type must be 'point' or 'box', got {self.space_type!r}.")
+        if self.space_type not in (SourceSpaceType.POINT, SourceSpaceType.BOX, SourceSpaceType.FILE):
+            raise ValueError(
+                f"SourceDef.space_type must be 'point', 'box', or 'file', got {self.space_type!r}."
+            )
+
+        if self.space_type == SourceSpaceType.FILE:
+            if not self.file_path:
+                raise ValueError("SourceDef.file_path is required when space_type='file'.")
+            return  # space_params/energy_mev are not applicable to a file source
+
+        if self.file_path is not None:
+            raise ValueError("SourceDef.file_path is only meaningful when space_type='file'.")
+
         expected_len = 3 if self.space_type == SourceSpaceType.POINT else 6
         if len(self.space_params) != expected_len:
             raise ValueError(
@@ -97,7 +124,8 @@ class SourceDef:
         if self.particle == ParticleType.PHOTON and self.energy_mev is None:
             raise ValueError(
                 "A photon source has no default energy spectrum — "
-                "energy_mev is required when particle='photon'."
+                "energy_mev is required when particle='photon' (unless "
+                "space_type='file', which carries its own spectrum)."
             )
 
 

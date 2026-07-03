@@ -94,7 +94,15 @@
   // ---------------------------------------------------------------------------
   let depPowerW     = $state(1000.0);
   let depTimesteps  = $state('10, 20, 30');
-  let depChainFile  = $state('');           // NEW — was only a free-text warning before, now a real required field
+  // depChainFile holds the resolved "{file_id}/{filename}" reference
+  // returned by the upload endpoint — NOT a bare filename. The backend
+  // stages the actual uploaded bytes into the job's input_dir at
+  // submission time (see execution/docker_backend.py's
+  // _stage_uploaded_file()); this string is just the lookup key for that.
+  let depChainFile        = $state('');
+  let depChainFileName    = $state('');   // display name shown to the user
+  let depChainFileUploading = $state(false);
+  let depChainFileError     = $state<string | null>(null);
   let depIntegrator = $state('predictor');
   let depSubsteps   = $state(1);
 
@@ -112,7 +120,11 @@
   let r2sPowerW        = $state(1000.0);
   let r2sTimesteps     = $state('30');
   let r2sCoolingTimes  = $state('0, 3600, 86400');
-  let r2sDecayLibrary  = $state('');        // NEW — previously missing entirely
+  // Same "{file_id}/{filename}" upload-reference pattern as depChainFile.
+  let r2sDecayLibrary        = $state('');
+  let r2sDecayLibraryName    = $state('');
+  let r2sDecayLibraryUploading = $state(false);
+  let r2sDecayLibraryError     = $state<string | null>(null);
 
   let r2sPhotonParticles     = $state(500000);
   let r2sPhotonBatches       = $state(50);
@@ -248,6 +260,39 @@
     return text.split(',').map(s => parseFloat(s.trim())).filter(n => !isNaN(n));
   }
 
+  // Shared by the depletion chain-file and r2s decay-library pickers.
+  // Uploads the actual file bytes (not just the filename) via
+  // api.jobs.uploadFile, then stores the returned "{file_id}/{filename}"
+  // reference in the given setter — DockerBackend resolves that back to
+  // real file content and stages it into the job's input_dir at
+  // submission time.
+  async function handleFileUpload(
+    e: Event,
+    kind: 'chain' | 'decay_library',
+    setRef: (ref: string) => void,
+    setName: (name: string) => void,
+    setUploading: (v: boolean) => void,
+    setError: (e: string | null) => void,
+  ) {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+
+    setUploading(true);
+    setError(null);
+    try {
+      const { file_id, filename } = await api.jobs.uploadFile(file, kind);
+      setRef(`${file_id}/${filename}`);
+      setName(filename);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Upload failed.');
+      setRef('');
+      setName('');
+    } finally {
+      setUploading(false);
+    }
+  }
+
   let selectedProjectId = $state(projects.activeId);
 
     const selectedProject = $derived(
@@ -298,8 +343,13 @@
           return;
         }
       }
+      if (runMode === 'depletion' && depChainFileUploading) {
+        submitError = 'Depletion chain file is still uploading — please wait.';
+        submitting = false;
+        return;
+      }
       if (runMode === 'depletion' && !depChainFile.trim()) {
-        submitError = 'Depletion requires a depletion chain file reference.';
+        submitError = 'Depletion requires a depletion chain file to be uploaded.';
         submitting = false;
         return;
       }
@@ -310,8 +360,13 @@
           submitting = false;
           return;
         }
+        if (r2sDecayLibraryUploading) {
+          submitError = 'Decay/activation library is still uploading — please wait.';
+          submitting = false;
+          return;
+        }
         if (!r2sDecayLibrary.trim()) {
-          submitError = 'R2S requires a decay/activation library reference.';
+          submitError = 'R2S requires a decay/activation library to be uploaded.';
           submitting = false;
           return;
         }
@@ -597,7 +652,23 @@
             </label>
             <label class="field wide">
               <span>Depletion chain file</span>
-              <input type="text" placeholder="chain_endfb71_pwr.xml" bind:value={depChainFile} />
+              <input
+                type="file" accept=".xml"
+                disabled={depChainFileUploading}
+                onchange={(e) => handleFileUpload(
+                  e, 'chain',
+                  (v) => depChainFile = v, (v) => depChainFileName = v,
+                  (v) => depChainFileUploading = v, (v) => depChainFileError = v,
+                )}
+              />
+              {#if depChainFileUploading}
+                <span class="note" style="margin-top:4px">Uploading…</span>
+              {:else if depChainFileName}
+                <span class="note" style="margin-top:4px">✓ {depChainFileName}</span>
+              {/if}
+              {#if depChainFileError}
+                <span class="note warning" style="margin-top:4px">⚠ {depChainFileError}</span>
+              {/if}
             </label>
             <label class="field">
               <span>Integrator</span>
@@ -669,7 +740,23 @@
             </label>
             <label class="field wide">
               <span>Decay/activation library</span>
-              <input type="text" placeholder="endf_decay" bind:value={r2sDecayLibrary} />
+              <input
+                type="file" accept=".xml,.h5"
+                disabled={r2sDecayLibraryUploading}
+                onchange={(e) => handleFileUpload(
+                  e, 'decay_library',
+                  (v) => r2sDecayLibrary = v, (v) => r2sDecayLibraryName = v,
+                  (v) => r2sDecayLibraryUploading = v, (v) => r2sDecayLibraryError = v,
+                )}
+              />
+              {#if r2sDecayLibraryUploading}
+                <span class="note" style="margin-top:4px">Uploading…</span>
+              {:else if r2sDecayLibraryName}
+                <span class="note" style="margin-top:4px">✓ {r2sDecayLibraryName}</span>
+              {/if}
+              {#if r2sDecayLibraryError}
+                <span class="note warning" style="margin-top:4px">⚠ {r2sDecayLibraryError}</span>
+              {/if}
             </label>
           </div>
           {#if !r2sDecayLibrary.trim()}

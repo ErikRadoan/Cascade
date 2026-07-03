@@ -47,6 +47,12 @@ class JobRow(Base):
     geometry_json:  Mapped[dict]          = mapped_column(JSON,   nullable=False)
     materials_json: Mapped[list]          = mapped_column(JSON,   nullable=False)
 
+    # Which sweep produced this job, if any. Previously only stored on
+    # SweepRow.job_ids (a one-directional sweep->jobs list) — there was no
+    # way to go from a job (e.g. in a results view) back to its sweep.
+    # Nullable: standalone (non-sweep) jobs never set this.
+    sweep_id:       Mapped[str | None]    = mapped_column(String, nullable=True)
+
     # run_mode/monte_carlo/source/mode_specific/variance_reduction —
     # job-settings-model.md's per-mode settings shape (domain/run_settings.py).
     # Nullable so existing SQLite databases don't need a migration to load
@@ -58,6 +64,11 @@ class JobRow(Base):
     source_json:              Mapped[dict | None] = mapped_column(JSON,   nullable=True)
     mode_specific_json:       Mapped[dict | None] = mapped_column(JSON,   nullable=True)
     variance_reduction_json:  Mapped[dict | None] = mapped_column(JSON,   nullable=True)
+
+    # Execution steps (domain/job_step.py) — populated for multi-step jobs
+    # (r2s's 3-step pipeline). Empty/NULL for single-leg jobs, which still
+    # use the plain `status` column directly (see SimulationJob.effective_status()).
+    steps_json:               Mapped[list | None] = mapped_column(JSON,   nullable=True)
 
     results_config: Mapped[dict]          = mapped_column(JSON,   nullable=False, default=dict)
     working_dir:    Mapped[str | None]    = mapped_column(String, nullable=True)
