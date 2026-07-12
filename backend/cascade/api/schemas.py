@@ -87,6 +87,10 @@ class CylinderLayerOut(BaseModel):
     color:       str
     opacity:     float
     label:       str
+    # Join key for matching a /results/{job_id}/tallies entry's `name` to
+    # this specific layer — see openmc_adapter.py's _append_scalar_tallies
+    # and expander.py's _build_fuel_pin_cells.
+    cell_name:   str = ""
 
 
 class WireframeBoxOut(BaseModel):
@@ -99,6 +103,9 @@ class WireframeBoxOut(BaseModel):
     fill_material_id: str
     fill_color:       str
     fill_opacity:     float
+    # Join key — see CylinderLayerOut.cell_name and expander.py's
+    # _build_fill_cell.
+    cell_name:        str = ""
 
 
 class SceneComponentOut(BaseModel):

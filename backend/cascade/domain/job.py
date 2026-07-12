@@ -63,6 +63,13 @@ class SimulationJob:
         id:             Unique job identifier (UUID string).
         geometry:       Fully resolved CascadeGeometry for this job.
         materials:      All materials referenced by cells in geometry.
+        geometry_text:  Raw YAML geometry text the job was submitted with,
+                        kept alongside the already-expanded `geometry` so
+                        the results view can rebuild a Viewport3D scene
+                        (SceneBuilder works on pre-expansion schemas, not
+                        the low-level CascadeGeometry surfaces/cells —
+                        see api/jobs.py's /scene route). None for jobs
+                        persisted before this field existed.
         run_mode:       One of RunMode.{EIGENVALUE,FIXED_SOURCE,DEPLETION,R2S}.
         monte_carlo:    Particle/batch/seed settings for a single transport
                         leg. Set for eigenvalue/fixed_source/depletion.
@@ -120,6 +127,10 @@ class SimulationJob:
     finished_at:    datetime | None                  = None
     error:          str | None                       = None
     notes:          str | None                       = None
+    # Raw YAML the job was submitted with — see class docstring. Not part
+    # of to_dict()/JobDetail (it can be large and most consumers only need
+    # geometry_id); fetched explicitly via the /scene endpoint instead.
+    geometry_text:  str | None                       = None
 
     def __post_init__(self) -> None:
         if self.run_mode not in RunMode.ALL:

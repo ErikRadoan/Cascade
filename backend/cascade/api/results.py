@@ -126,6 +126,27 @@ async def get_summary(
         sp.close()
 
 
+def _scalars_config(job: SimulationJob):
+    """Find the ScalarTallyConfig that governs this job's cell tallies.
+
+    Single-leg modes (eigenvalue/fixed_source/depletion) carry a flat
+    ResultsConfig — `job.results_config.scalars` directly. r2s carries a
+    per-leg R2SResultsConfig instead (job.py's SimulationJob docstring,
+    job-settings-model.md §1) with no top-level `.scalars` — scalar cell
+    tallies only make sense for the neutron leg here (the photon leg's
+    ResultsConfig can't request fission/nu-fission at all, per
+    SimulationJob.__post_init__), so fall back to that.
+
+    Returns None if neither shape matches, which callers should treat as
+    "can't reconstruct tally names for this job" rather than crashing.
+    """
+    scalars = getattr(job.results_config, "scalars", None)
+    if scalars is not None:
+        return scalars
+    neutron_leg = getattr(job.results_config, "neutron_leg", None)
+    return getattr(neutron_leg, "scalars", None)
+
+
 # ---------------------------------------------------------------------------
 # /tallies
 # ---------------------------------------------------------------------------
@@ -138,9 +159,17 @@ async def get_tallies(
     """Return scalar cell tally results — mean + std dev per cell per score."""
     job = _get_job_or_404(job_id, db)
     _require_completed(job)
+
+    scalars_cfg = _scalars_config(job)
+    if scalars_cfg is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Job '{job_id}' has no scalar tally configuration to reconstruct results against.",
+        )
+
     sp_path, sp = _open_statepoint(job)
     try:
-        return adapter.import_tallies(job_id, sp)
+        return adapter.import_tallies(job_id, sp, job.geometry, job.materials, scalars_cfg)
     finally:
         sp.close()
 

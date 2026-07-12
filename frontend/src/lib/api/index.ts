@@ -19,8 +19,6 @@ const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     const url = `${BASE}${path}`;
 
-    console.log("GET", url);
-
     const res = await fetch(url, {
         headers: {
             "Content-Type": "application/json",
@@ -30,8 +28,6 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     });
 
     const text = await res.text();
-
-    console.log(res.status, text);
 
     if (!res.ok) {
         throw new Error(`API ${res.status}: ${text}`);
@@ -196,6 +192,13 @@ export const jobs = {
   // Raw stdout from run.log — polled while job is running
   stdout: (id: string): Promise<{ lines: string; available: boolean }> =>
       request(`/api/jobs/${id}/stdout`),
+
+  // Renders this job's stored geometry_text into a scene, the same shape
+  // geometry.scene() returns for the live editor. 404s if the job predates
+  // geometry_text being persisted (see repositories/models.py) — callers
+  // should treat that as "no preview available", not an error to surface.
+  scene: (id: string): Promise<SceneResponse> =>
+      request(`/api/jobs/${id}/scene`),
 };
 
 // ---------------------------------------------------------------------------
@@ -232,15 +235,24 @@ export const profiles = {
 // ---------------------------------------------------------------------------
 
 export const results = {
-  summary: (id: string)  =>
+  summary: (id: string) =>
       request(`/api/results/${id}/summary`),
 
-  tallies: (id: string)  =>
-      request(`/api/results/${id}/tallies`),
+  tallies: async (id: string): Promise<TallyResultSet> => {
+      const payload = await request<TallyResultSet>(`/api/results/${id}/tallies`);
 
-  mesh:    (id: string)  =>
+      console.group(`Tallies response (${id})`);
+      console.log("Full payload:", payload);
+      console.log("JSON:", JSON.stringify(payload, null, 2));
+      console.groupEnd();
+
+      return payload;
+  },
+
+  mesh: (id: string) =>
       request(`/api/results/${id}/mesh`),
-  spectra: (id: string)  =>
+
+  spectra: (id: string) =>
       request(`/api/results/${id}/spectra`),
 
   downloadUrl: (id: string) => `${BASE}/api/results/${id}/statepoint/path`,

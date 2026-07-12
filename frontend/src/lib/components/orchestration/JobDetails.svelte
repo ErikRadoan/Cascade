@@ -266,7 +266,12 @@
             </div>
             <div class="win-body results-body">
               {#if detail.status === 'completed'}
-                <button class="icon-text-btn accent" onclick={() => { ui.resultsJobId = detail?.id ?? null; ui.activeTab = 'results'; }}>
+                <button class="icon-text-btn accent" onclick={() => {
+                  const jobId = detail?.id ?? null;
+                  jobsState.selectedResultJobId = jobId;
+                  ui.resultsJobId = jobId;
+                  ui.activeTab = 'results';
+                }}>
                   View results →
                 </button>
               {:else if detail.status === 'failed'}

@@ -366,6 +366,39 @@ def _pretty_xml(element: ET.Element) -> str:
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + "\n".join(lines)
 
 
+class _FilterRegistry:
+    """Collects top-level <filter id="N" type="..."><bins>...</bins></filter>
+    elements for a tallies.xml document and hands back the integer id for
+    each one, so callers can reference it from a <tally>'s <filters> list.
+
+    OpenMC's tallies.xml format requires filters to be declared as their
+    own top-level elements under <tallies>, referenced by id from each
+    <tally>'s <filters> list — NOT nested inline inside the tally with
+    type/bins as attributes on a bare <filter> tag. The inline shape is
+    silently ignored by OpenMC's parser (no error — it just treats the
+    tally as filterless and scores the whole geometry), which is exactly
+    the "n_filters: 0 on every tally" bug this registry fixes.
+    """
+
+    def __init__(self, root: ET.Element):
+        self._root = root
+        self._next_id = 1
+
+    def add(self, filter_type: str, bins: str) -> int:
+        """Append a new top-level <filter> element and return its id."""
+        filter_id = self._next_id
+        self._next_id += 1
+
+        el = ET.Element("filter")
+        el.set("id", str(filter_id))
+        el.set("type", filter_type)
+        bins_el = ET.SubElement(el, "bins")
+        bins_el.text = bins
+        self._root.append(el)
+
+        return filter_id
+
+
 def _surface_element(surface: Surface) -> ET.Element:
     """Build an XML <surface> element from a Surface domain object.
 
@@ -654,7 +687,13 @@ def _compute_fissile_source_box(
     """Compute a source box bounding all fissile cells.
 
     Finds every cell whose material is fissile, then computes the
-    bounding box of those cells from their surface parameters.
+    bounding box of those cells from their surface parameters — including
+    each cylinder's (x0, y0) center, not just its radius. A lattice's
+    fissile cylinders are NOT all centered at the origin (see expander.py's
+    _place_fuel_pin, which offsets each pin's radial surfaces by that
+    pin's placement position) — bounding only by radius silently collapses
+    the box onto whichever pin happens to sit at (0, 0) and starves every
+    other pin of source neutrons in the run's initial fission-source guess.
     Contracts the box by 1% on each side to ensure particles are
     born strictly inside surfaces, never on them.
     """
@@ -670,7 +709,10 @@ def _compute_fissile_source_box(
     # Collect cylinder and plane surfaces that bound fissile cells
     surface_map = {s.id: s for s in geometry.surfaces}
 
-    r_max = 0.0
+    x_min = float('inf')
+    x_max = float('-inf')
+    y_min = float('inf')
+    y_max = float('-inf')
     z_min = float('inf')
     z_max = float('-inf')
 
@@ -680,25 +722,33 @@ def _compute_fissile_source_box(
             if surf is None:
                 continue
             if surf.type_ == SurfaceType.CYLINDER_Z:
-                r = float(surf.params.get("r", 0))
-                r_max = max(r_max, r)
+                x0 = float(surf.params.get("x0", surf.params.get("x", 0.0)))
+                y0 = float(surf.params.get("y0", surf.params.get("y", 0.0)))
+                r  = float(surf.params.get("r", 0.0))
+                x_min = min(x_min, x0 - r)
+                x_max = max(x_max, x0 + r)
+                y_min = min(y_min, y0 - r)
+                y_max = max(y_max, y0 + r)
             elif surf.type_ == SurfaceType.PLANE_Z:
                 z = float(surf.params.get("z", surf.params.get("z0", 0)))
                 z_min = min(z_min, z)
                 z_max = max(z_max, z)
 
-    if r_max == 0 or z_min == float('inf'):
+    if x_min == float('inf') or z_min == float('inf'):
         raise ValueError(
             "Could not determine fissile cell bounds from geometry surfaces. "
             "Specify source_box in OpenMCRunSettings."
         )
 
-    # Contract by 1% to keep particles off surfaces
+    # Contract by 1% to keep particles off surfaces — shrink each axis
+    # toward its OWN bounding box center, not toward the origin, since
+    # the box is generally not centered on (0, 0) for a lattice.
     shrink = 0.99
-    r = r_max * shrink
+    cx, cy = (x_min + x_max) / 2, (y_min + y_max) / 2
+    hx, hy = (x_max - x_min) / 2 * shrink, (y_max - y_min) / 2 * shrink
     dz = (z_max - z_min) * 0.01  # 1% inset from each z face
 
-    return (-r, -r, z_min + dz, r, r, z_max - dz)
+    return (cx - hx, cy - hy, z_min + dz, cx + hx, cy + hy, z_max - dz)
 
 
 def _surface_ids_in_region(region) -> list[str]:
@@ -861,6 +911,11 @@ class OpenMCAdapter:
             200 — mesh tally
             3xx — energy spectra        (301, 302, … one per material)
 
+        Filter IDs are assigned separately (starting at 1) via a shared
+        _FilterRegistry, and each <tally> references its filter(s) by id
+        through its <filters> element — this is the top-level-filter shape
+        OpenMC's parser actually requires (see _FilterRegistry docstring).
+
         Args:
             config:          ResultsConfig carrying user tally choices.
             geometry:        CascadeGeometry — needed for cell IDs and bounds.
@@ -875,21 +930,22 @@ class OpenMCAdapter:
             material_id_map = {mat.id: i + 1 for i, mat in enumerate(materials)}
 
         root = ET.Element("tallies")
+        filters = _FilterRegistry(root)
 
         # --- Group 2: scalar cell tallies -----------------------------------
         if config.scalars.enabled:
             self._append_scalar_tallies(
-                root, config.scalars, geometry, materials, material_id_map
+                root, config.scalars, geometry, materials, material_id_map, filters
             )
 
         # --- Group 3: mesh tally --------------------------------------------
         if config.mesh.enabled:
-            self._append_mesh_tally(root, config.mesh, geometry)
+            self._append_mesh_tally(root, config.mesh, geometry, filters)
 
         # --- Group 4: energy spectra ----------------------------------------
         if config.spectra.enabled:
             self._append_spectra_tallies(
-                root, config.spectra, materials, material_id_map
+                root, config.spectra, materials, material_id_map, filters
             )
 
         return _pretty_xml(root)
@@ -901,6 +957,7 @@ class OpenMCAdapter:
         geometry: CascadeGeometry,
         materials: list[Material],
         material_id_map: dict[str, int],
+        filters: _FilterRegistry,
     ) -> None:
         """Append one tally per cell (or fissile cell) to *root*."""
         fissile_ids: set[str] = set()
@@ -918,13 +975,24 @@ class OpenMCAdapter:
 
             tally_el = ET.SubElement(root, "tally")
             tally_el.set("id", str(tally_id))
-            tally_el.set("name", f"cell_{_int_id(cell.id)}_scalars")
+            # The tally's `name` attribute is free text (unlike `id`, which
+            # OpenMC requires as a bare int) — use cell.name directly rather
+            # than wrapping cell.id, since expander.py now sets cell.name to
+            # exactly the string SceneBuilder uses for this cell's scene
+            # component (e.g. "pin_3_layer0"). That's what lets
+            # import_tallies()'s result be matched back to a specific
+            # component in the 3D viewer. Falls back to the old
+            # id-based label for any cell expander didn't name (shouldn't
+            # happen for fuel pin / box cells, but cheap insurance).
+            tally_el.set("name", cell.name or f"cell_{_int_id(cell.id)}")
 
-            # CellFilter
+            # CellFilter — registered as a top-level <filter> element and
+            # referenced here by id (see _FilterRegistry docstring for why
+            # the old inline <filters><filter type=... bins=.../></filters>
+            # shape was silently ignored by OpenMC's parser).
+            filter_id = filters.add("cell", _int_id(cell.id))
             filters_el = ET.SubElement(tally_el, "filters")
-            cf = ET.SubElement(filters_el, "filter")
-            cf.set("type", "cell")
-            cf.set("bins", _int_id(cell.id))
+            filters_el.text = str(filter_id)
 
             # Scores
             scores_el = ET.SubElement(tally_el, "scores")
@@ -937,6 +1005,7 @@ class OpenMCAdapter:
         root: ET.Element,
         cfg: MeshTallyConfig,
         geometry: CascadeGeometry,
+        filters: _FilterRegistry,
     ) -> None:
         """Append mesh definition + mesh tally (ID 200) to *root*."""
         # --- Mesh definition ------------------------------------------------
@@ -968,10 +1037,13 @@ class OpenMCAdapter:
         tally_el.set("id", "200")
         tally_el.set("name", "mesh_tally")
 
+        # MeshFilter — top-level <filter type="mesh"> referencing mesh id "1",
+        # not the mesh element itself. Registered via the shared registry so
+        # its id doesn't collide with cell/material/energy filter ids from
+        # the other tally groups in this document.
+        filter_id = filters.add("mesh", "1")
         filters_el = ET.SubElement(tally_el, "filters")
-        mf = ET.SubElement(filters_el, "filter")
-        mf.set("type", "mesh")
-        mf.set("bins", "1")
+        filters_el.text = str(filter_id)
 
         scores_el = ET.SubElement(tally_el, "scores")
         scores_el.text = " ".join(s.value for s in cfg.scores)
@@ -982,6 +1054,7 @@ class OpenMCAdapter:
         cfg: EnergySpectraConfig,
         materials: list[Material],
         material_id_map: dict[str, int],
+        filters: _FilterRegistry,
     ) -> None:
         """Append energy spectrum tally/tallies (IDs 301+) to *root*."""
         boundaries = cfg.boundaries()
@@ -1001,17 +1074,12 @@ class OpenMCAdapter:
                 tally_el.set("id", str(tally_id))
                 tally_el.set("name", f"spectrum_{mat.id}")
 
+                # MaterialFilter + EnergyFilter — two top-level filters,
+                # referenced together as a space-separated id list.
+                mat_filter_id = filters.add("material", str(int_id))
+                energy_filter_id = filters.add("energy", bounds_str)
                 filters_el = ET.SubElement(tally_el, "filters")
-
-                # MaterialFilter
-                mf = ET.SubElement(filters_el, "filter")
-                mf.set("type", "material")
-                mf.set("bins", str(int_id))
-
-                # EnergyFilter
-                ef = ET.SubElement(filters_el, "filter")
-                ef.set("type", "energy")
-                ef.set("bins", bounds_str)
+                filters_el.text = f"{mat_filter_id} {energy_filter_id}"
 
                 scores_el = ET.SubElement(tally_el, "scores")
                 scores_el.text = TallyScore.FLUX.value
@@ -1023,10 +1091,9 @@ class OpenMCAdapter:
             tally_el.set("id", "301")
             tally_el.set("name", "spectrum_global")
 
+            energy_filter_id = filters.add("energy", bounds_str)
             filters_el = ET.SubElement(tally_el, "filters")
-            ef = ET.SubElement(filters_el, "filter")
-            ef.set("type", "energy")
-            ef.set("bins", bounds_str)
+            filters_el.text = str(energy_filter_id)
 
             scores_el = ET.SubElement(tally_el, "scores")
             scores_el.text = TallyScore.FLUX.value
@@ -1574,8 +1641,34 @@ class OpenMCAdapter:
             "timing":              timing,
         }
 
-    def import_tallies(self, job_id: str, sp: h5py.File) -> dict[str, Any]:
+    def import_tallies(
+        self,
+        job_id: str,
+        sp: h5py.File,
+        geometry: CascadeGeometry,
+        materials: list[Material],
+        scalars_cfg: ScalarTallyConfig,
+    ) -> dict[str, Any]:
         """Parse scalar cell tallies — mean + std dev per cell per score.
+
+        `name` is NOT read from the statepoint — OpenMC's statepoint.h5
+        does not persist a tally's XML `name=` attribute onto its HDF5
+        group (that metadata lives only in the run's XML/summary, not the
+        statepoint), so `t.attrs.get("name", ...)` silently always fell
+        through to the group key ("tally 101") no matter what
+        _append_scalar_tallies wrote into the XML. export_tallies's own
+        docstring already documents the actual intended mechanism: tally
+        IDs are assigned in a FIXED ORDER over geometry.cells (skip voids,
+        skip non-fissile cells when not all_cells) — so `name` is
+        reconstructed here by replicating that exact same selection loop
+        and zipping it against sorted tally IDs (101 -> 1st selected cell,
+        102 -> 2nd, ...), rather than trusting anything the statepoint may
+        or may not carry.
+
+        `geometry`/`materials`/`scalars_cfg` MUST be the same job's
+        geometry/materials/results_config.scalars that export_tallies was
+        originally called with — this only works because the ordering is
+        deterministic given the same inputs.
 
         Response schema::
 
@@ -1584,7 +1677,7 @@ class OpenMCAdapter:
               "tallies": [
                 {
                   "tally_id": 101,
-                  "name": "cell_1_scalars",
+                  "name": "pin_3_layer0",
                   "scores": {
                     "flux":    {"mean": 3.14e12, "std_dev": 7.2e10, "rel_err": 0.023},
                     "fission": {"mean": 1.02e11, "std_dev": 3.2e9,  "rel_err": 0.031}
@@ -1592,12 +1685,31 @@ class OpenMCAdapter:
                 }
               ]
             }
+
+        `name` matches the corresponding SceneComponentOut's layer/box
+        `cell_name` (see scene_builder_service.py, expander.py's
+        _build_fuel_pin_cells/_build_fill_cell) — that's the join key for
+        mapping a tally result onto a specific object in the 3D viewer.
         """
         tallies_grp = sp.get("tallies")
         if tallies_grp is None:
             return {"job_id": job_id, "tallies": []}
 
         n_realizations = int(sp["n_realizations"][()]) if "n_realizations" in sp else 1
+
+        # Replicate _append_scalar_tallies's exact cell selection/order so
+        # tally_id 101 lines up with ordered_names[0], 102 with [1], etc.
+        fissile_ids: set[str] = set()
+        if not scalars_cfg.all_cells:
+            fissile_ids = {m.id for m in materials if _is_fissile(m)}
+
+        ordered_names: list[str] = []
+        for cell in geometry.cells:
+            if cell.material_id is None:
+                continue
+            if not scalars_cfg.all_cells and cell.material_id not in fissile_ids:
+                continue
+            ordered_names.append(cell.name or f"cell_{_int_id(cell.id)}")
 
         result: list[dict] = []
         for tally_key in tallies_grp.keys():
@@ -1617,9 +1729,8 @@ class OpenMCAdapter:
             if not (100 < tally_id < 200):
                 continue
 
-            name = t.attrs.get("name", tally_key)
-            if isinstance(name, bytes):
-                name = name.decode()
+            idx = tally_id - 101
+            name = ordered_names[idx] if 0 <= idx < len(ordered_names) else tally_key
 
             scores_list: list[str] = []
             if "score_bins" in t:

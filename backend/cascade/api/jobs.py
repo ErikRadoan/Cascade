@@ -53,8 +53,10 @@ from .schemas import (
     DeletedResponse,
     JobDetail,
     JobSummary,
+    SceneResponse,
     SweepResponse,
 )
+from .geometry import build_scene_response
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -594,6 +596,7 @@ async def submit_job(
         job = SimulationJob(
             id=job_id,
             geometry=geometry,
+            geometry_text=body.geometry_text,
             materials=materials,
             param_values={},
             backend=body.backend_config.type,
@@ -653,6 +656,15 @@ async def submit_sweep(
             job = SimulationJob(
                 id=job_id,
                 geometry=geometry,
+                # NOTE: this is the sweep *template* (with sweep(...) exprs),
+                # the same text for every point — there's no per-point
+                # resolved YAML available here, only the resolved
+                # CascadeGeometry (`geometry`, already-expanded surfaces/
+                # cells, not schema form). /jobs/{id}/scene will render the
+                # template's nominal preview for any job in this sweep, not
+                # that job's actual swept dimensions. Good enough for "what
+                # does the geometry look like", not for per-point accuracy.
+                geometry_text=body.geometry_text,
                 materials=materials,
                 param_values=param_values,
                 backend=body.backend_config.type,
@@ -839,6 +851,45 @@ async def get_job(
             )
 
     return _to_detail(job)
+
+
+@router.get("/{job_id}/scene", response_model=SceneResponse)
+async def get_job_scene(
+    job_id: str,
+    db:     Session = Depends(get_db),
+) -> SceneResponse:
+    """Build a Viewport3D-renderable scene for a job's geometry.
+
+    Reuses the exact same YAML-text -> SceneDescription -> SceneResponse
+    pipeline as POST /geometry/scene (see build_scene_response), just
+    sourcing the text from the job record instead of a live editor buffer.
+    This is deliberate: job.geometry (the persisted CascadeGeometry) is
+    already-expanded surfaces/cells, not the mid-level component schemas
+    SceneBuilder needs, so there's no shortcut that skips re-parsing
+    geometry_text.
+
+    404s (not a 200 with `error` set) when the job predates the
+    geometry_text column — that's "no data available", not a YAML
+    validation error, and the two shouldn't be conflated in one field.
+
+    For a sweep job, geometry_text is the sweep *template* (still
+    containing sweep(...) expressions), not that job's per-point resolved
+    dimensions — see the comment in submit_sweep(). The scene shown here
+    is the sweep's nominal preview, same as what the editor shows before
+    submission, not a point-accurate render.
+    """
+    job = _get_job_or_404(job_id, db)
+
+    if not job.geometry_text:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Job '{job_id}' has no stored geometry text — it was "
+                "submitted before scene preview support was added."
+            ),
+        )
+
+    return build_scene_response(job.geometry_text)
 
 
 @router.post("/{job_id}/cancel", response_model=JobSummary)

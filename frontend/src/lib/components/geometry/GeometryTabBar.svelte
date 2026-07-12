@@ -72,6 +72,9 @@
         class:active={projects.activeId === project.id}
         onclick={() => switchProject(project.id)}
         ondblclick={(e) => startRename(project.id, project.name, e)}
+        tabindex="0"
+        role="tab"
+        aria-selected={projects.activeId === project.id}
       >
         {#if renamingId === project.id}
           <input
@@ -87,7 +90,7 @@
         {/if}
 
         {#if project.isDirty}
-          <span class="dirty-dot" title="Unsaved changes"></span>
+          <span class="dirty-mark" title="Unsaved changes"></span>
         {/if}
 
         {#if projects.list.length > 1}
@@ -97,8 +100,8 @@
             aria-label="Close tab"
             onclick={(e) => onCloseTab(project.id, e)}
           >
-            <svg viewBox="0 0 12 12" fill="currentColor">
-              <path d="M2.22 2.22a.75.75 0 011.06 0L6 4.94l2.72-2.72a.75.75 0 111.06 1.06L7.06 6l2.72 2.72a.75.75 0 11-1.06 1.06L6 7.06 3.28 9.78a.75.75 0 01-1.06-1.06L4.94 6 2.22 3.28a.75.75 0 010-1.06z"/>
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="square">
+              <path d="M2.4 2.4l7.2 7.2M9.6 2.4l-7.2 7.2" />
             </svg>
           </button>
         {/if}
@@ -107,14 +110,16 @@
   </div>
 
   <div class="tab-bar-actions">
-    <button class="add-btn" title="New geometry" aria-label="New geometry" onclick={() => newProject()}>
-      <svg viewBox="0 0 16 16" fill="currentColor">
-        <path d="M8 2a.75.75 0 01.75.75v4.5h4.5a.75.75 0 010 1.5h-4.5v4.5a.75.75 0 01-1.5 0v-4.5h-4.5a.75.75 0 010-1.5h4.5v-4.5A.75.75 0 018 2z"/>
+    <button class="action-btn" title="New geometry" aria-label="New geometry" onclick={() => newProject()}>
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square">
+        <path d="M8 3v10M3 8h10" />
       </svg>
     </button>
-    <button class="add-btn" title="Open existing geometry" aria-label="Open existing geometry" onclick={openMenu}>
-      <svg viewBox="0 0 16 16" fill="currentColor">
-        <path d="M1.75 3A1.75 1.75 0 000 4.75v6.5C0 12.216.784 13 1.75 13h12.5A1.75 1.75 0 0016 11.25v-5A1.75 1.75 0 0014.25 4.5H7.5l-1.7-1.7A.75.75 0 005.25 2.5H1.75z"/>
+    <span class="action-divider"></span>
+    <button class="action-btn" title="Open existing geometry" aria-label="Open existing geometry" onclick={openMenu}>
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="square" stroke-linejoin="miter">
+        <path d="M1.5 5.5V2h3.4M14.5 5.5V2h-3.4M1.5 10.5V14h3.4M14.5 10.5V14h-3.4" />
+        <path d="M8 5.8v4.4M5.8 8h4.4" stroke-width="1.1" />
       </svg>
     </button>
   </div>
@@ -132,6 +137,7 @@
       {:else}
         {#each existingGeometries as g}
           <button class="open-menu-item" onclick={() => pickExisting(g.id)}>
+            <span class="open-menu-item-mark"></span>
             {g.name}
           </button>
         {/each}
@@ -147,34 +153,45 @@
     justify-content: space-between;
     background: var(--color-bg-deep);
     border-bottom: 1px solid var(--color-border);
-    height: 32px;
+    height: 36px;
     flex-shrink: 0;
     position: relative;
   }
 
   .tabs {
     display: flex;
+    align-items: flex-end;
     height: 100%;
     overflow-x: auto;
+    overflow-y: hidden;
   }
 
   .tab {
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 0 10px;
-    height: 100%;
+    gap: 7px;
+    padding: 0 11px 0 12px;
+    height: calc(100% - 1px);
     cursor: pointer;
     border-right: 1px solid var(--color-border);
     color: var(--color-subtext);
     font-size: 12px;
     white-space: nowrap;
     position: relative;
+    /* chamfered top-right corner — a small, deliberate geometric cut,
+       echoing the app's own subject matter in the chrome itself. */
+    clip-path: polygon(0 0, calc(100% - 9px) 0, 100% 9px, 100% 100%, 0 100%);
+    transition: background-color 0.1s ease, color 0.1s ease;
   }
 
   .tab:hover {
     background: var(--color-bg-panel);
     color: var(--color-text);
+  }
+
+  .tab:focus-visible {
+    outline: 1px solid var(--color-accent);
+    outline-offset: -1px;
   }
 
   .tab.active {
@@ -193,17 +210,19 @@
     font-size: 12px;
     background: var(--color-bg-raised);
     border: 1px solid var(--color-accent);
-    border-radius: 3px;
+    border-radius: 2px;
     color: var(--color-text);
     padding: 1px 4px;
     width: 100px;
   }
 
-  .dirty-dot {
+  /* Unsaved-changes marker: a small rotated square rather than a dot,
+     matching the tab bar's chamfered / faceted vocabulary. */
+  .dirty-mark {
     width: 6px;
     height: 6px;
-    border-radius: 50%;
     background: var(--color-accent);
+    transform: rotate(45deg);
     flex-shrink: 0;
   }
 
@@ -213,39 +232,49 @@
     border: none;
     background: transparent;
     color: var(--color-subtext);
+    border-radius: 2px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .close-btn svg { width: 9px; height: 9px; }
+  .close-btn:hover { background: var(--color-bg-raised); color: var(--color-text); }
+  .close-btn:focus-visible { outline: 1px solid var(--color-accent); outline-offset: 1px; }
+
+  .tab-bar-actions {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    padding: 0 8px;
+    flex-shrink: 0;
+  }
+
+  .action-btn {
+    width: 26px;
+    height: 26px;
+    border: none;
+    background: transparent;
+    color: var(--color-subtext);
     border-radius: 3px;
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
+  }
+
+  .action-btn svg { width: 15px; height: 15px; }
+  .action-btn:hover { color: var(--color-accent-hi); background: var(--color-bg-raised); }
+  .action-btn:focus-visible { outline: 1px solid var(--color-accent); outline-offset: 1px; }
+
+  .action-divider {
+    width: 1px;
+    height: 14px;
+    background: var(--color-border);
     flex-shrink: 0;
   }
-
-  .close-btn svg { width: 10px; height: 10px; }
-  .close-btn:hover { background: var(--color-bg-raised); color: var(--color-text); }
-
-  .tab-bar-actions {
-    display: flex;
-    gap: 2px;
-    padding: 0 6px;
-    flex-shrink: 0;
-  }
-
-  .add-btn {
-    width: 24px;
-    height: 24px;
-    border: none;
-    background: transparent;
-    color: var(--color-subtext);
-    border-radius: 4px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .add-btn svg { width: 14px; height: 14px; }
-  .add-btn:hover { color: var(--color-accent-hi); background: var(--color-bg-raised); }
 
   .overlay {
     position: fixed;
@@ -262,10 +291,11 @@
     overflow-y: auto;
     background: var(--color-bg-panel);
     border: 1px solid var(--color-border);
-    border-radius: 6px;
     padding: 4px;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
     z-index: 100;
+    /* Same chamfer language as the tabs above it, sized up slightly. */
+    clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
   }
 
   .open-menu-title {
@@ -292,14 +322,36 @@
     color: var(--color-text);
     background: transparent;
     border: none;
-    padding: 6px 8px;
-    border-radius: 4px;
+    border-left: 2px solid transparent;
+    padding: 6px 8px 6px 6px;
     cursor: pointer;
-    display: block;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+
+  .open-menu-item-mark {
+    width: 5px;
+    height: 5px;
+    background: var(--color-subtext);
+    transform: rotate(45deg);
+    flex-shrink: 0;
+    opacity: 0.6;
   }
 
   .open-menu-item:hover {
     background: var(--color-bg-raised);
     color: var(--color-accent-hi);
+    border-left-color: var(--color-accent);
+  }
+
+  .open-menu-item:hover .open-menu-item-mark {
+    background: var(--color-accent);
+    opacity: 1;
+  }
+
+  .open-menu-item:focus-visible {
+    outline: 1px solid var(--color-accent);
+    outline-offset: -1px;
   }
 </style>

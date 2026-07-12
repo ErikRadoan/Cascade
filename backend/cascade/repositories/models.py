@@ -47,6 +47,13 @@ class JobRow(Base):
     geometry_json:  Mapped[dict]          = mapped_column(JSON,   nullable=False)
     materials_json: Mapped[list]          = mapped_column(JSON,   nullable=False)
 
+    # Raw YAML geometry text submitted with the job (domain/job.py's
+    # geometry_text). Nullable for the same reason run_mode etc. are —
+    # existing rows predate this column and shouldn't need a migration
+    # to keep loading; a NULL here just means "submitted before scene
+    # support existed" (see api/jobs.py's /scene route).
+    geometry_text:  Mapped[str | None]    = mapped_column(Text,   nullable=True)
+
     # Which sweep produced this job, if any. Previously only stored on
     # SweepRow.job_ids (a one-directional sweep->jobs list) — there was no
     # way to go from a job (e.g. in a results view) back to its sweep.

@@ -5,6 +5,7 @@
   import { activeProject, ui, setGeometryText } from '$lib/stores/index.svelte';
   import yaml from './yamlParseHelper';
   import {dump} from 'js-yaml';
+  import PanelHeader from './PanelHeader.svelte';
   import TypePickerMenu from './TypePickerMenu.svelte';
   import { TEMPLATE_DEFAULTS, TEMPLATE_TYPES, uniqueName } from './componentDefaults';
 
@@ -68,23 +69,20 @@
 </script>
 
 <div class="panel">
-  <div class="panel-header">
-    <span class="panel-title">Templates</span>
-    <div class="panel-actions">
-      <TypePickerMenu options={TEMPLATE_TYPES} onPick={createTemplate} anchorLabel="New template" />
-      <button
-        class="icon-btn"
-        title="Delete selected template"
-        aria-label="Delete selected template"
-        disabled={ui.selectedItem?.kind !== 'template'}
-        onclick={deleteSelected}
-      >
-        <svg viewBox="0 0 16 16" fill="currentColor">
-          <path d="M3.25 8a.75.75 0 01.75-.75h8a.75.75 0 010 1.5H4A.75.75 0 013.25 8z"/>
-        </svg>
-      </button>
-    </div>
-  </div>
+  <PanelHeader title="Templates">
+    <TypePickerMenu options={TEMPLATE_TYPES} onPick={createTemplate} anchorLabel="New template" />
+    <button
+      class="icon-btn"
+      title="Delete selected template"
+      aria-label="Delete selected template"
+      disabled={ui.selectedItem?.kind !== 'template'}
+      onclick={deleteSelected}
+    >
+      <svg viewBox="0 0 16 16" fill="currentColor">
+        <path d="M3.25 8a.75.75 0 01.75-.75h8a.75.75 0 010 1.5H4A.75.75 0 013.25 8z"/>
+      </svg>
+    </button>
+  </PanelHeader>
 
   <div class="panel-body">
     {#if templates().length === 0}
@@ -132,29 +130,18 @@
     flex: 1;
     overflow: hidden;
     min-height: 0;
+    border: 1px solid var(--color-border);
+    box-shadow: 0 1px 0 rgba(0, 0, 0, 0.15);
+    transition: box-shadow 0.12s, border-color 0.12s;
   }
 
-  .panel-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--color-border);
-    flex-shrink: 0;
+  .panel:hover {
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.28);
   }
 
-  .panel-title {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--color-subtext);
-  }
-
-  .panel-actions {
-    display: flex;
-    gap: 2px;
-    align-items: center;
+  .panel:focus-within {
+    border-color: var(--color-accent);
+    box-shadow: 0 3px 14px rgba(0, 0, 0, 0.32);
   }
 
   .icon-btn {
@@ -163,7 +150,7 @@
     border: none;
     background: transparent;
     color: var(--color-subtext);
-    border-radius: 4px;
+    border-radius: 2px;
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -200,7 +187,7 @@
     align-items: center;
     gap: 4px;
     padding: 10px 6px;
-    border-radius: 8px;
+    border-radius: 2px;
     cursor: pointer;
     background: var(--color-bg-raised);
     border: 1px solid transparent;
@@ -218,7 +205,7 @@
     justify-content: center;
     color: var(--color-accent);
     background: rgba(6, 182, 212, 0.08);
-    border-radius: 6px;
+    border-radius: 2px;
   }
 
   .template-icon svg { width: 22px; height: 22px; }

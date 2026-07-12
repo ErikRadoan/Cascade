@@ -16,17 +16,20 @@ export interface ColorScale {
 
 export const REL_ERR_WARN_THRESHOLD = 0.10;
 
-// 5-stop diverging-ish sequential ramp: deep blue -> cyan -> green -> amber
-// -> red. Kept as the one ramp every panel imports, so nothing invents a
-// second convention. Matches the app's cyan accent at the low end rather
-// than a generic blue, so it doesn't clash with --color-accent elsewhere
-// in the UI.
+// 6-stop "jet"-style rainbow ramp: navy -> blue -> cyan -> yellow -> red ->
+// dark maroon. Matches the colormap convention used by OpenMC's own
+// flux/tally plots (matplotlib's classic 'jet'), which is the look most
+// people expect from a reactor heatmap. Kept as the one ramp every panel
+// imports, so nothing invents a second convention. Six anchor points
+// (rather than the minimum five) so the cyan->yellow transition passes
+// through a real green band under linear RGB interpolation, same as jet.
 const RAMP_STOPS: [number, [number, number, number]][] = [
-  [0.0, [30, 41, 59]],    // slate-800 (near --color-bg base, "cold")
-  [0.25, [6, 182, 212]],  // cyan (--color-accent)
-  [0.5, [34, 197, 94]],   // green
-  [0.75, [234, 179, 8]],  // amber
-  [1.0, [239, 68, 68]],   // red (matches .error-badge red elsewhere)
+  [0.0,   [0, 0, 132]],     // navy, "coldest"
+  [0.125, [0, 4, 255]],     // blue
+  [0.375, [0, 255, 220]],   // cyan
+  [0.625, [255, 255, 0]],   // yellow
+  [0.875, [255, 0, 0]],     // red (matches .error-badge red elsewhere)
+  [1.0,   [128, 0, 0]],     // dark maroon, "hottest"
 ];
 
 function lerp(a: number, b: number, t: number): number {
@@ -64,6 +67,19 @@ export function buildScale(values: number[], type: ScaleType = 'log'): ColorScal
   const domain = type === 'log' ? finite.filter((v) => v > 0) : finite;
   if (domain.length === 0) return { type, min: 0, max: 1 };
   return { type, min: Math.min(...domain), max: Math.max(...domain) };
+}
+
+export type ScaleMode = 'dynamic' | 'static';
+
+/** Build a fixed-domain scale that does NOT depend on the current result's
+ *  data — e.g. always "0 to 1000", so the same raw value maps to the same
+ *  color regardless of which job/result is on screen. Complement to
+ *  buildScale, which derives min/max from whatever data is currently
+ *  loaded (the "dynamic" mode). Callers own the min/max (e.g. user-entered
+ *  bounds, or a domain default like 0°C); this just wraps them into a
+ *  ColorScale so valueToColor/valueToT/isFlagged all work unchanged. */
+export function staticScale(min: number, max: number, type: ScaleType = 'linear'): ColorScale {
+  return { type, min, max };
 }
 
 /** Map a raw value onto [0,1] given a scale. Values <= 0 on a log scale

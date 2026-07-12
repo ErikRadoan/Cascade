@@ -72,6 +72,7 @@ class JobRepository:
                 param_values=   job.param_values,
                 backend_config= backend_config,
                 geometry_json=  job.geometry.to_dict(),
+                geometry_text=  job.geometry_text,
                 materials_json= [m.to_dict() for m in job.materials],
                 sweep_id=                job.sweep_id,
                 run_mode=                job.run_mode,
@@ -254,6 +255,7 @@ class JobRepository:
         return SimulationJob(
             id=row.id,
             geometry=_geometry_from_dict(row.geometry_json),
+            geometry_text=row.geometry_text,
             materials=[_material_from_dict(m) for m in row.materials_json],
             run_mode=run_mode,
             monte_carlo=monte_carlo,
