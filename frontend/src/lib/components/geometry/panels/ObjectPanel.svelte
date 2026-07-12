@@ -5,12 +5,14 @@
   // viewport — Boxes default to visible but are the most common thing
   // a user will want to hide since they can occlude inner geometry.
 
-  import { activeProject, ui, setGeometryText, isVisible, toggleVisibility } from '$lib/stores/index.svelte';
-  import yaml from './yamlParseHelper';
+  import { activeProject, setGeometryText } from '../stores/projects.svelte.js';
+  import { geometrySelection } from '../stores/selection.svelte.js';
+  import { isVisible, toggleVisibility } from '../stores/visibility.svelte.js';
+  import yaml from '../yamlParseHelper';
   import {dump} from 'js-yaml';
-  import PanelHeader from './PanelHeader.svelte';
-  import TypePickerMenu from './TypePickerMenu.svelte';
-  import { PLACEMENT_DEFAULTS, PLACEMENT_TYPES, uniqueName } from './componentDefaults';
+  import PanelHeader from '../dock/PanelHeader.svelte';
+  import TypePickerMenu from '../TypePickerMenu.svelte';
+  import { PLACEMENT_DEFAULTS, PLACEMENT_TYPES, uniqueName } from '../componentDefaults';
   import type { SceneComponent } from '$lib/types';
 
   let placements = $derived(activeProject().scene?.components ?? []);
@@ -54,7 +56,7 @@
   let pendingTemplate = $state<string | null>(null);
 
   function select(name: string) {
-    ui.selectedItem = { kind: 'placement', name };
+    geometrySelection.selectedItem = { kind: 'placement', name };
   }
 
   function startCreate(templateName: string) {
@@ -71,7 +73,7 @@
     const newText = dump(updated, { indent: 2, lineWidth: -1 });
 
     setGeometryText(newText, { immediate: true });
-    ui.selectedItem = { kind: 'placement', name };
+    geometrySelection.selectedItem = { kind: 'placement', name };
     pendingTemplate = null;
   }
 
@@ -80,7 +82,7 @@
   }
 
   function deleteSelected() {
-    const sel = ui.selectedItem;
+    const sel = geometrySelection.selectedItem;
     const doc = parsedDoc();
     if (!sel || sel.kind !== 'placement' || !doc || !(sel.name in doc)) return;
 
@@ -89,7 +91,7 @@
     const newText = dump(updated, { indent: 2, lineWidth: -1 });
 
     setGeometryText(newText, { immediate: true });
-    ui.selectedItem = null;
+    geometrySelection.selectedItem = null;
   }
 
   function onToggleVisibility(e: MouseEvent, name: string) {
@@ -109,7 +111,7 @@
       class="icon-btn"
       title="Delete selected object"
       aria-label="Delete selected object"
-      disabled={ui.selectedItem?.kind !== 'placement'}
+      disabled={geometrySelection.selectedItem?.kind !== 'placement'}
       onclick={deleteSelected}
     >
       <svg viewBox="0 0 16 16" fill="currentColor">
@@ -139,7 +141,7 @@
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           class="object-row"
-          class:selected={ui.selectedItem?.name === group.name && ui.selectedItem?.kind === 'placement'}
+          class:selected={geometrySelection.selectedItem?.name === group.name && geometrySelection.selectedItem?.kind === 'placement'}
           class:hidden-row={!isVisible(group.name)}
           onclick={() => select(group.name)}
         >

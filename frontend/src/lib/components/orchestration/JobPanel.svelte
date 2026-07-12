@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { jobsState, startJobsPolling, stopJobsPolling } from '$lib/stores/index.svelte';
+  import { jobsState, startJobsPolling, stopJobsPolling } from './stores/jobs.svelte.ts';
   import { onMount } from 'svelte';
   import type { JobSummary } from '$lib/types';
 

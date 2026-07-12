@@ -1,5 +1,6 @@
 <script lang="ts">
-    import { projects, jobsState } from '$lib/stores/index.svelte';
+    import { jobsState } from './stores/jobs.svelte.ts';
+    import { projects } from '../geometry/stores/projects.svelte.ts'
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
   import type { BackendProfile } from '$lib/types';
@@ -293,7 +294,18 @@
     }
   }
 
-  let selectedProjectId = $state(projects.activeId);
+  let selectedProjectId = $state(projects.activeId ?? projects.list[0]?.id ?? null);
+
+  // Self-heal: if selectedProjectId is unset or no longer refers to a real
+  // project (e.g. this modal mounted before `projects.activeId` was ready),
+  // fall back to the active project, or the first one in the list. This only
+  // fires when the current value is actually invalid, so it never overrides
+  // a project the user deliberately picked from the dropdown.
+  $effect(() => {
+    if (!projects.list.some(p => p.id === selectedProjectId)) {
+      selectedProjectId = projects.activeId ?? projects.list[0]?.id ?? null;
+    }
+  });
 
     const selectedProject = $derived(
         projects.list.find(p => p.id === selectedProjectId) ?? projects.list[0]

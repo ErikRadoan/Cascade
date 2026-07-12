@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { ui } from '$lib/stores/index.svelte';
   import Sidebar from '$lib/components/shared/Sidebar.svelte';
   import MenuBar from '$lib/components/shared/MenuBar.svelte';
 

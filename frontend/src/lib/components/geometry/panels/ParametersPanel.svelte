@@ -10,13 +10,14 @@
   // that keeps it correct as new schema types are added on the backend
   // without needing frontend changes.
 
-  import { activeProject, ui, setGeometryText } from '$lib/stores/index.svelte';
-  import yaml from './yamlParseHelper';
+  import { activeProject, setGeometryText } from '../stores/projects.svelte.js';
+  import { geometrySelection } from '../stores/selection.svelte.js';
+  import yaml from '../yamlParseHelper';
   import {dump} from 'js-yaml';
-  import PanelHeader from './PanelHeader.svelte';
-  import { resolveFieldOptions } from './fieldOptions';
-  import SweepToggle from './SweepToggle.svelte';
-  import MaterialSearchSelect from './MaterialSearchSelect.svelte';
+  import PanelHeader from '../dock/PanelHeader.svelte';
+  import { resolveFieldOptions } from '../fieldOptions';
+  import SweepToggle from '../SweepToggle.svelte';
+  import MaterialSearchSelect from '../MaterialSearchSelect.svelte';
 
   interface FieldEntry {
     key: string;
@@ -34,7 +35,7 @@
 
   let selectedBlock = $derived((): Record<string, unknown> | null => {
     const doc = parsedDoc();
-    const sel = ui.selectedItem;
+    const sel = geometrySelection.selectedItem;
     if (!doc || !sel) return null;
     return doc[sel.name] ?? null;
   });
@@ -88,7 +89,7 @@
   let customFields = $state<Set<string>>(new Set());
 
   $effect(() => {
-    ui.selectedItem; // dependency — clear custom-entry state on reselect
+    geometrySelection.selectedItem; // dependency — clear custom-entry state on reselect
     customFields = new Set();
   });
 
@@ -98,7 +99,7 @@
 
   function updateField(key: string, newValue: string | number | boolean) {
     const doc = parsedDoc();
-    const sel = ui.selectedItem;
+    const sel = geometrySelection.selectedItem;
     if (!doc || !sel || !doc[sel.name]) return;
 
     doc[sel.name][key] = newValue;
@@ -165,13 +166,13 @@
   <PanelHeader title="Parameters" />
 
   <div class="panel-body">
-    {#if !ui.selectedItem}
+    {#if !geometrySelection.selectedItem}
       <p class="empty-hint">Select a template or object to edit its parameters.</p>
     {:else if !selectedBlock()}
-      <p class="empty-hint">"{ui.selectedItem.name}" not found in the current YAML.</p>
+      <p class="empty-hint">"{geometrySelection.selectedItem.name}" not found in the current YAML.</p>
     {:else}
       <div class="selected-header">
-        <span class="selected-name">{ui.selectedItem.name}</span>
+        <span class="selected-name">{geometrySelection.selectedItem.name}</span>
         {#if componentType()}
           <span class="selected-type">{componentType()}</span>
         {/if}

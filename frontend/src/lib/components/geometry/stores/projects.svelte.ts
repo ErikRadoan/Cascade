@@ -1,23 +1,11 @@
-// Global application state using Svelte 5 runes.
+// projects.svelte.ts — geometry projects ("open files in an IDE"): the
+// list of open geometry tabs, which one is active, validation/scene
+// refresh, and autosave. Moved out of the old lib/stores/index.svelte.ts
+// as-is — behavior is unchanged, only the location and (necessarily) its
+// imports of sibling geometry stores.
 
-import type {ActiveTab, JobSummary, SceneResponse, SelectedItem, ValidationError} from '$lib/types';
+import type { SceneResponse, ValidationError } from '$lib/types';
 import * as api from '$lib/api';
-
-// ---------------------------------------------------------------------------
-// UI state
-// ---------------------------------------------------------------------------
-
-export const ui = $state({
-  activeTab:    'geometry' as ActiveTab,
-  selectedItem: null as SelectedItem | null,
-  resultsJobId: null as string | null,
-});
-
-// ---------------------------------------------------------------------------
-// Geometry projects — like open files in an IDE.
-// Each project is independently editable; exactly one is "active" at a
-// time (the open tab). Job submission always targets the active project.
-// ---------------------------------------------------------------------------
 
 const DEFAULT_TEXT = `# Cascade geometry definition
 # Define templates first, then place them
@@ -184,12 +172,30 @@ export async function saveProject(projectId: string): Promise<void> {
       await api.geometry.update(project.id, project.text, project.name);
     } else {
       const result = await api.geometry.save(project.text, project.name);
+      const oldId = project.id;
       // Adopt the real backend id — the tab's identity now matches the
       // persisted record. Existing references to the old tmp- id (e.g.
       // ui.selectedItem doesn't hold project ids, so nothing else needs
       // updating) are unaffected.
       project.id = result.id;
       project.isSaved = true;
+
+      // The id just changed out from under this project. If it was the
+      // active tab, `activeId` is still pointing at the now-dead tmp- id,
+      // so every `activeId === project.id` check in the UI (e.g. the tab
+      // bar's highlight) would go false the instant this resolves. Keep
+      // it in sync. Also re-key any pending debounce timers so a later
+      // lookup by the new id doesn't miss an in-flight one.
+      if (projects.activeId === oldId) {
+        projects.activeId = project.id;
+      }
+      for (const timers of [validateTimers, saveTimers]) {
+        const pending = timers.get(oldId);
+        if (pending) {
+          timers.delete(oldId);
+          timers.set(project.id, pending);
+        }
+      }
     }
     project.isDirty = false;
   } catch {
@@ -289,100 +295,4 @@ export async function deleteProjectPermanently(projectId: string): Promise<void>
     }
   }
   closeProject(projectId);
-}
-
-// ---------------------------------------------------------------------------
-// Object visibility — now keyed by `${projectId}:${placementName}` so
-// visibility state doesn't leak between different geometry projects.
-// ---------------------------------------------------------------------------
-
-export const visibility = $state<Record<string, boolean>>({});
-
-function visKey(name: string): string {
-  return `${projects.activeId}:${name}`;
-}
-
-export function isVisible(name: string): boolean {
-  return visibility[visKey(name)] !== false;
-}
-
-export function toggleVisibility(name: string) {
-  const key = visKey(name);
-  visibility[key] = !(visibility[key] !== false);
-}
-
-// ---------------------------------------------------------------------------
-// Jobs state
-// ---------------------------------------------------------------------------
-
-export const jobsState = $state({
-  list:                [] as JobSummary[],
-  isLoading:           false,
-  error:               null as string | null,
-  selectedJobId:       null as string | null,
-  // Set by JobDetails "View Results →" button, read by ResultsViewer
-  selectedResultJobId: null as string | null,
-});
-
-
-let jobsPoller: ReturnType<typeof setInterval> | null = null;
-
-export async function refreshJobs() {
-  jobsState.isLoading = true;
-  jobsState.error = null;
-
-  try {
-    const fresh = await api.jobs.list();
-
-    // Build a map of the incoming data
-    const freshMap = new Map(fresh.map(j => [j.id, j]));
-
-    // Update existing entries in-place (preserves object identity for $derived)
-    for (const existing of jobsState.list) {
-      const updated = freshMap.get(existing.id);
-      if (updated) {
-        existing.status      = updated.status;
-        existing.notes       = updated.notes;
-        existing.backend     = updated.backend;
-        existing.param_values = updated.param_values;
-      }
-    }
-
-    // Add any jobs that aren't in the list yet (prepend, newest first)
-    const existingIds = new Set(jobsState.list.map(j => j.id));
-    const newJobs = fresh.filter(j => !existingIds.has(j.id));
-    if (newJobs.length > 0) {
-      jobsState.list.unshift(...newJobs);
-    }
-
-    // Remove jobs that no longer exist on the backend
-    const toRemove = jobsState.list.filter(j => !freshMap.has(j.id));
-    for (const gone of toRemove) {
-      const idx = jobsState.list.indexOf(gone);
-      if (idx !== -1) jobsState.list.splice(idx, 1);
-    }
-
-  } catch (e) {
-    jobsState.error = e instanceof Error ? e.message : 'Failed to load jobs';
-  } finally {
-    jobsState.isLoading = false;
-  }
-}
-
-
-export function startJobsPolling(interval = 5000) {
-  if (jobsPoller) return;
-
-  refreshJobs();
-
-  jobsPoller = setInterval(() => {
-    refreshJobs();
-  }, interval);
-}
-
-export function stopJobsPolling() {
-  if (!jobsPoller) return;
-
-  clearInterval(jobsPoller);
-  jobsPoller = null;
 }

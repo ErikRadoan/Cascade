@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ui } from '$lib/stores/index.svelte';
+  import { ui } from '$lib/stores/ui.svelte';
   import type { ActiveTab } from '$lib/types';
 
   const tabs: { id: ActiveTab; label: string; shortLabel: string; icon: string }[] = [

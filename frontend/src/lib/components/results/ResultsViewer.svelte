@@ -2,17 +2,17 @@
   // ResultsViewer — thin wrapper around JobResultsPage.
   //
   // jobsState.selectedResultJobId is canonical: JobDetails sets it when the
-  // user clicks "View results →" on a completed job (see that store's own
-  // comment). This component's only job is to watch that field and mount
-  // JobResultsPage with it — all the actual results UI (summary strip,
-  // tabs, panels) lives there now. The old raw JSON-dump blocks and the
-  // fission-overlay wiring are gone; JobResultsPage's panels supersede them.
+  // user clicks "View results →" on a completed job. This component's only
+  // job is to watch that field and mount JobResultsPage with it — all the
+  // actual results UI (summary strip, tabs, panels) lives there now.
   //
-  // NOTE: `jobsState` didn't appear in either file reviewed for this change
-  // (only `ui.resultsJobId` did, in the old version of this file), so the
-  // import path below is inferred from the sibling `ui` store's location.
-  // Fix the path/name if jobsState actually lives elsewhere.
-  import { jobsState } from '$lib/stores/index.svelte';
+  // Confirmed: this file never reads `resultsUi.resultsJobId` (the other
+  // field JobDetails sets on that same click). That field has no reader
+  // anywhere in the results domain — it's dead. Worth deleting the
+  // `resultsUi.resultsJobId = jobId;` line in JobDetails and the
+  // resultsUi.svelte.ts store entirely, unless something outside these
+  // two components turns up reading it.
+  import { jobsState } from '../orchestration/stores/jobs.svelte';
   import JobResultsPage from './JobResultsPage.svelte';
 
   const jobId = $derived(jobsState.selectedResultJobId);

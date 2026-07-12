@@ -9,7 +9,7 @@
     closeProject,
     renameProject,
     openExistingProject,
-  } from '$lib/stores/index.svelte';
+  } from './stores/projects.svelte';
   import * as api from '$lib/api';
 
   let renamingId = $state<string | null>(null);

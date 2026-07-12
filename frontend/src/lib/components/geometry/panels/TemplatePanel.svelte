@@ -2,12 +2,13 @@
   // TemplatePanel — shows template definitions as thumbnail cards.
   // The "+" button now actually creates a new template block in the YAML.
 
-  import { activeProject, ui, setGeometryText } from '$lib/stores/index.svelte';
-  import yaml from './yamlParseHelper';
+  import { activeProject, setGeometryText } from '../stores/projects.svelte.js';
+  import { geometrySelection } from '../stores/selection.svelte.js';
+  import yaml from '../yamlParseHelper';
   import {dump} from 'js-yaml';
-  import PanelHeader from './PanelHeader.svelte';
-  import TypePickerMenu from './TypePickerMenu.svelte';
-  import { TEMPLATE_DEFAULTS, TEMPLATE_TYPES, uniqueName } from './componentDefaults';
+  import PanelHeader from '../dock/PanelHeader.svelte';
+  import TypePickerMenu from '../TypePickerMenu.svelte';
+  import { TEMPLATE_DEFAULTS, TEMPLATE_TYPES, uniqueName } from '../componentDefaults';
 
   interface TemplateEntry {
     name: string;
@@ -31,7 +32,7 @@
   });
 
   function select(name: string) {
-    ui.selectedItem = { kind: 'template', name };
+    geometrySelection.selectedItem = { kind: 'template', name };
   }
 
   function iconFor(type: string): string {
@@ -51,11 +52,11 @@
     const newText = dump(updated, { indent: 2, lineWidth: -1 });
 
     setGeometryText(newText, { immediate: true });
-    ui.selectedItem = { kind: 'template', name };
+    geometrySelection.selectedItem = { kind: 'template', name };
   }
 
   function deleteSelected() {
-    const sel = ui.selectedItem;
+    const sel = geometrySelection.selectedItem;
     const doc = parsedDoc();
     if (!sel || sel.kind !== 'template' || !doc || !(sel.name in doc)) return;
 
@@ -64,7 +65,7 @@
     const newText = dump(updated, { indent: 2, lineWidth: -1 });
 
     setGeometryText(newText, { immediate: true });
-    ui.selectedItem = null;
+    geometrySelection.selectedItem = null;
   }
 </script>
 
@@ -75,7 +76,7 @@
       class="icon-btn"
       title="Delete selected template"
       aria-label="Delete selected template"
-      disabled={ui.selectedItem?.kind !== 'template'}
+      disabled={geometrySelection.selectedItem?.kind !== 'template'}
       onclick={deleteSelected}
     >
       <svg viewBox="0 0 16 16" fill="currentColor">
@@ -94,7 +95,7 @@
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             class="template-card"
-            class:selected={ui.selectedItem?.name === tpl.name && ui.selectedItem?.kind === 'template'}
+            class:selected={geometrySelection.selectedItem?.name === tpl.name && geometrySelection.selectedItem?.kind === 'template'}
             onclick={() => select(tpl.name)}
           >
             <div class="template-icon">

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ui } from '$lib/stores/index.svelte';
+  import { ui } from '$lib/stores/ui.svelte';
   import GeometryEditor from '$lib/components/geometry/GeometryEditor.svelte';
   import JobScheduler from '$lib/components/orchestration/JobScheduler.svelte';
   import ResultsViewer from '$lib/components/results/ResultsViewer.svelte';
