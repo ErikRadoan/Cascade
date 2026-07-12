@@ -22,11 +22,22 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from ..domain.job import JobStatus, SimulationJob
+from ..domain.job_step import JobStep
 from ..domain.geometry import CascadeGeometry, Surface, Cell, SurfaceType, BoundaryType
 from ..domain.geometry import Inside, Outside, Intersection, Union, Complement
 from ..domain.material import Material
 from .models import JobRow
-from ..domain.results_config import ResultsConfig
+from ..domain.results_config import ResultsConfig, R2SResultsConfig
+from ..domain.run_settings import (
+    ActivationSettings,
+    DepletionSettings,
+    IrradiationSchedule,
+    McSettings,
+    R2SSettings,
+    RunMode,
+    SourceDef,
+    VrSettings,
+)
 
 
 class JobRepository:
@@ -61,7 +72,15 @@ class JobRepository:
                 param_values=   job.param_values,
                 backend_config= backend_config,
                 geometry_json=  job.geometry.to_dict(),
+                geometry_text=  job.geometry_text,
                 materials_json= [m.to_dict() for m in job.materials],
+                sweep_id=                job.sweep_id,
+                run_mode=                job.run_mode,
+                monte_carlo_json=        _opt_asdict(job.monte_carlo),
+                source_json=             _opt_asdict(job.source),
+                mode_specific_json=      _opt_asdict(job.mode_specific),
+                variance_reduction_json= _opt_asdict(job.variance_reduction),
+                steps_json=              [s.to_dict() for s in job.steps] or None,
                 results_config= job.results_config.to_dict(),
                 working_dir=    str(job.working_dir) if job.working_dir else None,
                 notes=          job.notes,
@@ -78,16 +97,32 @@ class JobRepository:
             existing.started_at = job.started_at
             existing.finished_at = job.finished_at
             existing.results_config = job.results_config.to_dict()
+            # Steps mutate as a multi-step pipeline advances (unlike
+            # run_mode/monte_carlo/source, which are fixed at submission
+            # and only ever written in the insert branch above).
+            existing.steps_json = [s.to_dict() for s in job.steps] or None
 
         self._db.commit()
         return job
 
     def update_status(self, job_id: str, status: JobStatus, error: str | None = None,
                       started_at: datetime | None = None,
-                      finished_at: datetime | None = None) -> None:
+                      finished_at: datetime | None = None,
+                      steps: list | None = None) -> None:
         """Efficiently update just the mutable fields of a running job.
 
         Avoids re-serializing geometry/materials on every status poll.
+
+        `steps` (JobStep list) is accepted separately from the rest — for
+        a stepped job (depletion/r2s), step state is what actually
+        advances on each poll (via DockerBackend.status() mutating
+        job.steps in place); the top-level `status` field is largely
+        vestigial for these jobs since effective_status() derives from
+        steps instead. Previously this method had no way to persist step
+        changes at all, so even after get_job() started calling
+        backend.status() correctly, the advanced step state was discarded
+        instead of saved — the job would derive the correct status changed
+        in memory once, then revert to stale step state on next reload.
         """
         row = self._db.get(JobRow, job_id)
         if row is None:
@@ -99,6 +134,8 @@ class JobRepository:
             row.started_at = started_at
         if finished_at is not None:
             row.finished_at = finished_at
+        if steps is not None:
+            row.steps_json = [s.to_dict() for s in steps] or None
         self._db.commit()
 
     # ------------------------------------------------------------------
@@ -138,6 +175,23 @@ class JobRepository:
         )
         return [self._row_to_domain(r) for r in rows]
 
+    def list_by_sweep(self, sweep_id: str) -> list[SimulationJob]:
+        """Return all jobs belonging to a sweep, ordered by creation time.
+
+        This is the query a results view needs to render "sweep results" —
+        previously impossible: sweep_id was only ever stored on
+        SweepRow.job_ids (sweep -> jobs), with no indexed reverse lookup
+        from a job back to its sweep. Now that JobRow.sweep_id exists,
+        this is a direct filter instead of a full-table SweepRow scan.
+        """
+        rows = (
+            self._db.query(JobRow)
+            .filter(JobRow.sweep_id == sweep_id)
+            .order_by(JobRow.created_at.asc())
+            .all()
+        )
+        return [self._row_to_domain(r) for r in rows]
+
     def delete(self, job_id: str) -> bool:
         """Delete a job record. Returns True if deleted, False if not found."""
         row = self._db.get(JobRow, job_id)
@@ -152,19 +206,68 @@ class JobRepository:
     # ------------------------------------------------------------------
 
     def _row_to_domain(self, row: JobRow) -> SimulationJob:
-        """Convert a JobRow back to a SimulationJob domain object."""
-        return SimulationJob(
-            id=row.id,
-            geometry=_geometry_from_dict(row.geometry_json),
-            materials=[_material_from_dict(m) for m in row.materials_json],
-            param_values=row.param_values or {},
-            backend=row.backend,
-            status=JobStatus(row.status),
-            results_config=(
+        """Convert a JobRow back to a SimulationJob domain object.
+
+        Dispatches by row.run_mode to know which shape to reconstruct:
+        results_config is a ResultsConfig for every mode except r2s, where
+        it's a R2SResultsConfig (job-settings-model.md §1) — same for
+        mode_specific, which is DepletionSettings for depletion, R2SSettings
+        for r2s, and None otherwise.
+        """
+        if row.run_mode is None:
+            # A row saved before the r2s restructure — there's no reliable
+            # way to guess what settings it used to run with (the old
+            # schema never stored them either — see the docker_backend.py
+            # bug this whole restructure started from). Fail loudly rather
+            # than fabricate an eigenvalue default that looks legitimate.
+            raise ValueError(
+                f"Job '{row.id}' has no run_mode stored (pre-dates the r2s "
+                f"restructure). It cannot be reconstructed — this job's "
+                f"record predates settings being persisted at all. Consider "
+                f"marking it FAILED/archived rather than serving it."
+            )
+
+        run_mode = row.run_mode
+
+        if run_mode == RunMode.R2S:
+            results_config = (
+                R2SResultsConfig.from_dict(row.results_config)
+                if row.results_config
+                else R2SResultsConfig.default()
+            )
+            mode_specific = _r2s_settings_from_dict(row.mode_specific_json)
+            monte_carlo = None
+            source = None
+        else:
+            results_config = (
                 ResultsConfig.from_dict(row.results_config)
                 if row.results_config
                 else ResultsConfig.default()
-            ),
+            )
+            mode_specific = (
+                _depletion_settings_from_dict(row.mode_specific_json)
+                if run_mode == RunMode.DEPLETION
+                else None
+            )
+            monte_carlo = _mc_settings_from_dict(row.monte_carlo_json)
+            source = _source_from_dict(row.source_json)
+
+        return SimulationJob(
+            id=row.id,
+            geometry=_geometry_from_dict(row.geometry_json),
+            geometry_text=row.geometry_text,
+            materials=[_material_from_dict(m) for m in row.materials_json],
+            run_mode=run_mode,
+            monte_carlo=monte_carlo,
+            source=source,
+            mode_specific=mode_specific,
+            variance_reduction=_vr_settings_from_dict(row.variance_reduction_json),
+            steps=[JobStep.from_dict(s) for s in (row.steps_json or [])],
+            sweep_id=row.sweep_id,
+            param_values=row.param_values or {},
+            backend=row.backend,
+            status=JobStatus(row.status),
+            results_config=results_config,
             working_dir=Path(row.working_dir) if row.working_dir else None,
             notes=row.notes,
             error=row.error,
@@ -254,4 +357,87 @@ def _material_from_dict(d: dict) -> Material:
         name=        d["name"],
         density=     d.get("density"),
         composition= d.get("composition", {}),
+    )
+
+
+# ---------------------------------------------------------------------------
+# run_settings.py (de)serialization helpers
+#
+# These are dataclasses.asdict()/reconstruct pairs, not to_dict()/from_dict()
+# methods on the dataclasses themselves — domain/run_settings.py deliberately
+# has no serialization code (see its docstring: "nothing in this module
+# knows how to talk to OpenMC" — the same principle extends to not knowing
+# about persistence). That's kept here instead, alongside the geometry/
+# material helpers this file already owns.
+# ---------------------------------------------------------------------------
+
+def _opt_asdict(obj) -> dict | None:
+    """dataclasses.asdict for an optional frozen dataclass, None-safe."""
+    if obj is None:
+        return None
+    import dataclasses
+    return dataclasses.asdict(obj)
+
+
+def _mc_settings_from_dict(d: dict | None) -> McSettings | None:
+    if d is None:
+        return None
+    return McSettings(
+        particles=d.get("particles", 1000),
+        batches=d.get("batches", 100),
+        seed=d.get("seed", 1),
+        inactive=d.get("inactive"),
+    )
+
+
+def _source_from_dict(d: dict | None) -> SourceDef | None:
+    if d is None:
+        return None
+    return SourceDef(
+        particle=d["particle"],
+        space_type=d.get("space_type", "point"),
+        space_params=tuple(d.get("space_params", (0.0, 0.0, 0.0))),
+        energy_mev=d.get("energy_mev"),
+    )
+
+
+def _depletion_settings_from_dict(d: dict | None) -> DepletionSettings | None:
+    if d is None:
+        return None
+    return DepletionSettings(
+        power_W=d["power_W"],
+        timesteps=d["timesteps"],
+        chain_file=d["chain_file"],
+        integrator=d.get("integrator", "predictor"),
+        substeps=d.get("substeps", 1),
+    )
+
+
+def _irradiation_schedule_from_dict(d: dict) -> IrradiationSchedule:
+    return IrradiationSchedule(power_W=d["power_W"], timesteps=d["timesteps"])
+
+
+def _activation_settings_from_dict(d: dict) -> ActivationSettings:
+    return ActivationSettings(
+        irradiation_schedule=_irradiation_schedule_from_dict(d["irradiation_schedule"]),
+        cooling_times=d["cooling_times"],
+        decay_library=d["decay_library"],
+    )
+
+
+def _vr_settings_from_dict(d: dict | None) -> VrSettings | None:
+    if d is None:
+        return None
+    return VrSettings(weight_windows_enabled=d.get("weight_windows_enabled", False))
+
+
+def _r2s_settings_from_dict(d: dict | None) -> R2SSettings | None:
+    if d is None:
+        return None
+    return R2SSettings(
+        neutron_leg_source=_source_from_dict(d["neutron_leg_source"]),
+        neutron_leg_mc=_mc_settings_from_dict(d["neutron_leg_mc"]),
+        activation=_activation_settings_from_dict(d["activation"]),
+        photon_leg_mc=_mc_settings_from_dict(d["photon_leg_mc"]),
+        photon_leg_vr=_vr_settings_from_dict(d.get("photon_leg_vr")) or VrSettings(),
     )

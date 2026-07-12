@@ -1,16 +1,17 @@
 <script lang="ts">
   // GeometryEditor — top-level layout for the geometry tab.
-  // Tab bar on top, then three-column layout below:
-  // Object/Template panels | Viewport | Parameters panel.
+  // Tab bar on top, then a JetBrains-style dock layout below it: panes can
+  // be dragged by their tab into other panes (as a tab) or onto a pane's
+  // edge (to split it), and resized via the splitters between them.
+  // See dockStore.svelte.ts for the layout tree and its mutations.
+  //
   // Everything below the tab bar operates on the ACTIVE project.
 
   import { onMount } from 'svelte';
-  import { projects, activeProject, setGeometryText } from '$lib/stores/index.svelte';
+  import { projects, activeProject, setGeometryText } from './stores/projects.svelte';
   import GeometryTabBar from './GeometryTabBar.svelte';
-  import Viewport3D from './Viewport3D.svelte';
-  import ObjectPanel from './ObjectPanel.svelte';
-  import TemplatePanel from './TemplatePanel.svelte';
-  import ParametersPanel from './ParametersPanel.svelte';
+  import DockLayout from './dock/DockLayout.svelte';
+  import { dock } from './dock/dockStore.svelte.js';
 
   // Re-run scene load whenever the active tab changes AND that project
   // has never had its scene loaded yet (switching back to an
@@ -27,18 +28,7 @@
   <GeometryTabBar />
 
   <div class="geometry-editor">
-    <aside class="left-panels">
-      <ObjectPanel />
-      <TemplatePanel />
-    </aside>
-
-    <section class="viewport-area">
-      <Viewport3D scene={activeProject().scene} isStale={activeProject().isSceneStale} />
-    </section>
-
-    <aside class="right-panel">
-      <ParametersPanel />
-    </aside>
+    <DockLayout node={dock.layout} />
   </div>
 </div>
 
@@ -51,28 +41,9 @@
   }
 
   .geometry-editor {
-    display: grid;
-    grid-template-columns: var(--panel-left-w) 1fr var(--panel-right-w);
-    flex: 1;
-    overflow: hidden;
-  }
-
-  .left-panels {
     display: flex;
-    flex-direction: column;
-    border-right: 1px solid var(--color-border);
+    flex: 1;
+    min-height: 0;
     overflow: hidden;
-  }
-
-  .viewport-area {
-    overflow: hidden;
-    position: relative;
-    background: var(--color-bg-deep);
-  }
-
-  .right-panel {
-    border-left: 1px solid var(--color-border);
-    overflow-y: auto;
-    background: var(--color-bg-panel);
   }
 </style>

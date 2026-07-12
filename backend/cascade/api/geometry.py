@@ -31,6 +31,84 @@ _geometry_store: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
+# Scene building — shared by /geometry/scene and /jobs/{job_id}/scene
+# ---------------------------------------------------------------------------
+
+_EMPTY_BOUNDS = BoundsOut(x_min=0, x_max=1, y_min=0, y_max=1, z_min=0, z_max=1)
+
+
+def build_scene_response(text: str) -> SceneResponse:
+    """Validate + expand YAML geometry text into a SceneResponse.
+
+    Shared by geometry.py's own /scene route and jobs.py's
+    /jobs/{job_id}/scene route, so there is exactly one implementation of
+    "YAML text -> renderable scene" instead of two copies drifting apart.
+    Never raises — validation/expansion/build failures all come back as
+    a SceneResponse with `error` set and empty components, matching the
+    contract Viewport3D already expects (it just renders the error badge).
+    """
+    errors = sweep.validate_preview(text)
+    if errors:
+        return SceneResponse(
+            components=[],
+            material_colors={},
+            bounds=_EMPTY_BOUNDS,
+            error=errors[0]["message"],
+        )
+
+    try:
+        schemas = sweep.preview_load(text)
+        scene = _scene_builder.build(schemas)
+    except Exception as e:
+        return SceneResponse(
+            components=[],
+            material_colors={},
+            bounds=_EMPTY_BOUNDS,
+            error=str(e),
+        )
+
+    components_out = []
+    for comp in scene.components:
+        layers_out = [
+            CylinderLayerOut(
+                r_inner=l.r_inner, r_outer=l.r_outer,
+                height=l.height,   z_base=l.z_base,
+                material_id=l.material_id, color=l.color,
+                opacity=l.opacity, label=l.label,
+                cell_name=l.cell_name,
+            )
+            for l in comp.layers
+        ]
+        box_out = None
+        if comp.box:
+            b = comp.box
+            box_out = WireframeBoxOut(
+                x_size=b.x_size, y_size=b.y_size, z_size=b.z_size,
+                z_base=b.z_base, color=b.color,
+                boundary_type=b.boundary_type,
+                fill_material_id=b.fill_material_id,
+                fill_color=b.fill_color, fill_opacity=b.fill_opacity,
+                cell_name=b.cell_name,
+            )
+        components_out.append(SceneComponentOut(
+            type=comp.type, name=comp.name,
+            position=list(comp.position),
+            layers=layers_out, box=box_out,
+        ))
+
+    b = scene.bounds
+    return SceneResponse(
+        components=components_out,
+        material_colors=scene.material_colors,
+        bounds=BoundsOut(
+            x_min=b[0], x_max=b[1],
+            y_min=b[2], y_max=b[3],
+            z_min=b[4], z_max=b[5],
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Validation and scene
 # ---------------------------------------------------------------------------
 
@@ -59,63 +137,7 @@ async def build_scene(body: SceneRequest) -> SceneResponse:
 
     Called when validation passes and the preview needs to update.
     """
-    errors = sweep.validate_preview(body.text)
-    if errors:
-        return SceneResponse(
-            components=[],
-            material_colors={},
-            bounds=BoundsOut(x_min=0,x_max=1,y_min=0,y_max=1,z_min=0,z_max=1),
-            error=errors[0]["message"],
-        )
-
-    try:
-        schemas = sweep.preview_load(body.text)
-        scene = _scene_builder.build(schemas)
-    except Exception as e:
-        return SceneResponse(
-            components=[],
-            material_colors={},
-            bounds=BoundsOut(x_min=0,x_max=1,y_min=0,y_max=1,z_min=0,z_max=1),
-            error=str(e),
-        )
-
-    components_out = []
-    for comp in scene.components:
-        layers_out = [
-            CylinderLayerOut(
-                r_inner=l.r_inner, r_outer=l.r_outer,
-                height=l.height,   z_base=l.z_base,
-                material_id=l.material_id, color=l.color,
-                opacity=l.opacity, label=l.label,
-            )
-            for l in comp.layers
-        ]
-        box_out = None
-        if comp.box:
-            b = comp.box
-            box_out = WireframeBoxOut(
-                x_size=b.x_size, y_size=b.y_size, z_size=b.z_size,
-                z_base=b.z_base, color=b.color,
-                boundary_type=b.boundary_type,
-                fill_material_id=b.fill_material_id,
-                fill_color=b.fill_color, fill_opacity=b.fill_opacity,
-            )
-        components_out.append(SceneComponentOut(
-            type=comp.type, name=comp.name,
-            position=list(comp.position),
-            layers=layers_out, box=box_out,
-        ))
-
-    b = scene.bounds
-    return SceneResponse(
-        components=components_out,
-        material_colors=scene.material_colors,
-        bounds=BoundsOut(
-            x_min=b[0], x_max=b[1],
-            y_min=b[2], y_max=b[3],
-            z_min=b[4], z_max=b[5],
-        ),
-    )
+    return build_scene_response(body.text)
 
 
 # ---------------------------------------------------------------------------

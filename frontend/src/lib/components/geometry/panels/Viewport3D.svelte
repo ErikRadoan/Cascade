@@ -9,7 +9,7 @@
   import { onMount, onDestroy } from 'svelte';
   import * as THREE from 'three';
   import type { SceneResponse } from '$lib/types';
-  import { isVisible, visibility } from '$lib/stores/index.svelte';
+  import { isVisible, visibility } from '../stores/visibility.svelte.js';
 
   let { scene: sceneData, isStale = false }: { scene: SceneResponse | null; isStale?: boolean } = $props();
 

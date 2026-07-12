@@ -10,12 +10,14 @@
   // that keeps it correct as new schema types are added on the backend
   // without needing frontend changes.
 
-  import { activeProject, ui, setGeometryText } from '$lib/stores/index.svelte';
-  import yaml from './yamlParseHelper';
+  import { activeProject, setGeometryText } from '../stores/projects.svelte.js';
+  import { geometrySelection } from '../stores/selection.svelte.js';
+  import yaml from '../yamlParseHelper';
   import {dump} from 'js-yaml';
-  import { resolveFieldOptions } from './fieldOptions';
-  import SweepToggle from './SweepToggle.svelte';
-  import MaterialSearchSelect from './MaterialSearchSelect.svelte';
+  import PanelHeader from '../dock/PanelHeader.svelte';
+  import { resolveFieldOptions } from '../fieldOptions';
+  import SweepToggle from '../SweepToggle.svelte';
+  import MaterialSearchSelect from '../MaterialSearchSelect.svelte';
 
   interface FieldEntry {
     key: string;
@@ -33,7 +35,7 @@
 
   let selectedBlock = $derived((): Record<string, unknown> | null => {
     const doc = parsedDoc();
-    const sel = ui.selectedItem;
+    const sel = geometrySelection.selectedItem;
     if (!doc || !sel) return null;
     return doc[sel.name] ?? null;
   });
@@ -75,13 +77,19 @@
     return typeof value === 'string' && value.trim().startsWith('sweep(');
   }
 
+  // Display-only: "material_id" -> "material id". The raw key is still
+  // used for the input's id/name and for writing back to the YAML.
+  function formatLabel(key: string): string {
+    return key.replace(/_/g, ' ');
+  }
+
   // Fields where the user picked "Custom..." in a dropdown — render as
   // free text instead, so a material/template not in the static option
   // list is never unreachable. Keyed by field key, reset on selection change.
   let customFields = $state<Set<string>>(new Set());
 
   $effect(() => {
-    ui.selectedItem; // dependency — clear custom-entry state on reselect
+    geometrySelection.selectedItem; // dependency — clear custom-entry state on reselect
     customFields = new Set();
   });
 
@@ -91,7 +99,7 @@
 
   function updateField(key: string, newValue: string | number | boolean) {
     const doc = parsedDoc();
-    const sel = ui.selectedItem;
+    const sel = geometrySelection.selectedItem;
     if (!doc || !sel || !doc[sel.name]) return;
 
     doc[sel.name][key] = newValue;
@@ -155,18 +163,16 @@
 </script>
 
 <div class="panel">
-  <div class="panel-header">
-    <span class="panel-title">Parameters</span>
-  </div>
+  <PanelHeader title="Parameters" />
 
   <div class="panel-body">
-    {#if !ui.selectedItem}
+    {#if !geometrySelection.selectedItem}
       <p class="empty-hint">Select a template or object to edit its parameters.</p>
     {:else if !selectedBlock()}
-      <p class="empty-hint">"{ui.selectedItem.name}" not found in the current YAML.</p>
+      <p class="empty-hint">"{geometrySelection.selectedItem.name}" not found in the current YAML.</p>
     {:else}
       <div class="selected-header">
-        <span class="selected-name">{ui.selectedItem.name}</span>
+        <span class="selected-name">{geometrySelection.selectedItem.name}</span>
         {#if componentType()}
           <span class="selected-type">{componentType()}</span>
         {/if}
@@ -176,7 +182,7 @@
         {#each fields() as field (field.key)}
           <div class="field-row">
             <label class="field-label" for="field-{field.key}">
-              {field.key}
+              {formatLabel(field.key)}
               {#if isSweepExpression(field.value)}
                 <span class="sweep-badge">sweep</span>
               {/if}
@@ -216,17 +222,22 @@
                   onchange={(e) => onInputChange(field, e)}
                 />
               {:else if field.options && !customFields.has(field.key)}
-                <select
-                  id="field-{field.key}"
-                  class="field-input field-select"
-                  value={field.options.includes(String(field.value)) ? field.value : '__custom__'}
-                  onchange={(e) => onSelectChange(field, e)}
-                >
-                  {#each field.options as opt}
-                    <option value={opt}>{opt}</option>
-                  {/each}
-                  <option value="__custom__">Custom…</option>
-                </select>
+                <div class="select-wrap">
+                  <select
+                    id="field-{field.key}"
+                    class="field-input field-select"
+                    value={field.options.includes(String(field.value)) ? field.value : '__custom__'}
+                    onchange={(e) => onSelectChange(field, e)}
+                  >
+                    {#each field.options as opt}
+                      <option value={opt}>{opt}</option>
+                    {/each}
+                    <option value="__custom__">Custom…</option>
+                  </select>
+                  <svg class="select-chevron" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                    <path d="M4.22 6.22a.75.75 0 011.06 0L8 8.94l2.72-2.72a.75.75 0 111.06 1.06l-3.25 3.25a.75.75 0 01-1.06 0L4.22 7.28a.75.75 0 010-1.06z"/>
+                  </svg>
+                </div>
               {:else if field.kind === 'number'}
                 <input
                   id="field-{field.key}"
@@ -259,26 +270,25 @@
     display: flex;
     flex-direction: column;
     height: 100%;
+    border: 1px solid var(--color-border);
+    box-shadow: 0 1px 0 rgba(0, 0, 0, 0.15);
+    transition: box-shadow 0.12s, border-color 0.12s;
   }
 
-  .panel-header {
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--color-border);
-    flex-shrink: 0;
+  .panel:hover {
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.28);
   }
 
-  .panel-title {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--color-accent-hi);
+  .panel:focus-within {
+    border-color: var(--color-accent);
+    box-shadow: 0 3px 14px rgba(0, 0, 0, 0.32);
   }
 
   .panel-body {
     flex: 1;
     overflow-y: auto;
     padding: 12px;
+    background: var(--color-bg-panel);
   }
 
   .empty-hint {
@@ -292,9 +302,9 @@
 
   .selected-header {
     display: flex;
-    flex-direction: column;
-    gap: 2px;
-    margin-bottom: 14px;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 12px;
     padding-bottom: 10px;
     border-bottom: 1px solid var(--color-border);
   }
@@ -309,31 +319,21 @@
   .selected-type {
     font-size: 10px;
     color: var(--color-accent);
+    background: rgba(6, 182, 212, 0.12);
+    padding: 1px 6px;
+    border-radius: 2px;
     text-transform: uppercase;
     letter-spacing: 0.06em;
   }
 
   .field-list {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
+    display: grid;
+    grid-template-columns: minmax(70px, 30%) 1fr;
+    column-gap: 12px;
   }
 
   .field-row {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-  }
-
-  .field-input-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .field-input-row .field-input {
-    flex: 1;
-    min-width: 0;
+    display: contents;
   }
 
   .field-label {
@@ -343,6 +343,27 @@
     display: flex;
     align-items: center;
     gap: 6px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--color-border);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    box-sizing: border-box;
+  }
+
+  .field-input-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--color-border);
+    min-width: 0;
+    box-sizing: border-box;
+  }
+
+  .field-input-row .field-input {
+    flex: 1;
+    min-width: 0;
   }
 
   .sweep-badge {
@@ -350,7 +371,7 @@
     color: var(--color-accent);
     background: rgba(6, 182, 212, 0.12);
     padding: 1px 5px;
-    border-radius: 3px;
+    border-radius: 2px;
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
@@ -358,7 +379,7 @@
   .field-input {
     background: var(--color-bg-raised);
     border: 1px solid var(--color-border);
-    border-radius: 5px;
+    border-radius: 2px;
     color: var(--color-text);
     font-family: var(--font-mono);
     font-size: 12px;
@@ -375,14 +396,28 @@
     color: var(--color-accent-hi);
   }
 
+  .select-wrap {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    display: flex;
+  }
+
   .field-select {
     appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%23CBD5E1'%3E%3Cpath d='M4.22 6.22a.75.75 0 011.06 0L8 8.94l2.72-2.72a.75.75 0 111.06 1.06l-3.25 3.25a.75.75 0 01-1.06 0L4.22 7.28a.75.75 0 010-1.06z'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 8px center;
-    background-size: 14px;
-    padding-right: 26px;
+    padding-right: 24px;
     cursor: pointer;
+  }
+
+  .select-chevron {
+    position: absolute;
+    top: 50%;
+    right: 8px;
+    width: 12px;
+    height: 12px;
+    transform: translateY(-50%);
+    color: var(--color-subtext);
+    pointer-events: none;
   }
 
   input[type='checkbox'] {

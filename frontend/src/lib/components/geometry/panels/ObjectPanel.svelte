@@ -5,11 +5,14 @@
   // viewport — Boxes default to visible but are the most common thing
   // a user will want to hide since they can occlude inner geometry.
 
-  import { activeProject, ui, setGeometryText, isVisible, toggleVisibility } from '$lib/stores/index.svelte';
-  import yaml from './yamlParseHelper';
+  import { activeProject, setGeometryText } from '../stores/projects.svelte.js';
+  import { geometrySelection } from '../stores/selection.svelte.js';
+  import { isVisible, toggleVisibility } from '../stores/visibility.svelte.js';
+  import yaml from '../yamlParseHelper';
   import {dump} from 'js-yaml';
-  import TypePickerMenu from './TypePickerMenu.svelte';
-  import { PLACEMENT_DEFAULTS, PLACEMENT_TYPES, uniqueName } from './componentDefaults';
+  import PanelHeader from '../dock/PanelHeader.svelte';
+  import TypePickerMenu from '../TypePickerMenu.svelte';
+  import { PLACEMENT_DEFAULTS, PLACEMENT_TYPES, uniqueName } from '../componentDefaults';
   import type { SceneComponent } from '$lib/types';
 
   let placements = $derived(activeProject().scene?.components ?? []);
@@ -53,7 +56,7 @@
   let pendingTemplate = $state<string | null>(null);
 
   function select(name: string) {
-    ui.selectedItem = { kind: 'placement', name };
+    geometrySelection.selectedItem = { kind: 'placement', name };
   }
 
   function startCreate(templateName: string) {
@@ -70,7 +73,7 @@
     const newText = dump(updated, { indent: 2, lineWidth: -1 });
 
     setGeometryText(newText, { immediate: true });
-    ui.selectedItem = { kind: 'placement', name };
+    geometrySelection.selectedItem = { kind: 'placement', name };
     pendingTemplate = null;
   }
 
@@ -79,7 +82,7 @@
   }
 
   function deleteSelected() {
-    const sel = ui.selectedItem;
+    const sel = geometrySelection.selectedItem;
     const doc = parsedDoc();
     if (!sel || sel.kind !== 'placement' || !doc || !(sel.name in doc)) return;
 
@@ -88,7 +91,7 @@
     const newText = dump(updated, { indent: 2, lineWidth: -1 });
 
     setGeometryText(newText, { immediate: true });
-    ui.selectedItem = null;
+    geometrySelection.selectedItem = null;
   }
 
   function onToggleVisibility(e: MouseEvent, name: string) {
@@ -98,27 +101,24 @@
 </script>
 
 <div class="panel">
-  <div class="panel-header">
-    <span class="panel-title">Objects</span>
-    <div class="panel-actions">
-      {#if availableTemplates().length === 0}
-        <span class="hint-text">create a template first</span>
-      {:else}
-        <TypePickerMenu options={availableTemplates()} onPick={startCreate} anchorLabel="Place template" />
-      {/if}
-      <button
-        class="icon-btn"
-        title="Delete selected object"
-        aria-label="Delete selected object"
-        disabled={ui.selectedItem?.kind !== 'placement'}
-        onclick={deleteSelected}
-      >
-        <svg viewBox="0 0 16 16" fill="currentColor">
-          <path d="M3.25 8a.75.75 0 01.75-.75h8a.75.75 0 010 1.5H4A.75.75 0 013.25 8z"/>
-        </svg>
-      </button>
-    </div>
-  </div>
+  <PanelHeader title="Objects">
+    {#if availableTemplates().length === 0}
+      <span class="hint-text">create a template first</span>
+    {:else}
+      <TypePickerMenu options={availableTemplates()} onPick={startCreate} anchorLabel="Place template" />
+    {/if}
+    <button
+      class="icon-btn"
+      title="Delete selected object"
+      aria-label="Delete selected object"
+      disabled={geometrySelection.selectedItem?.kind !== 'placement'}
+      onclick={deleteSelected}
+    >
+      <svg viewBox="0 0 16 16" fill="currentColor">
+        <path d="M3.25 8a.75.75 0 01.75-.75h8a.75.75 0 010 1.5H4A.75.75 0 013.25 8z"/>
+      </svg>
+    </button>
+  </PanelHeader>
 
   {#if pendingTemplate}
     <div class="create-step">
@@ -141,7 +141,7 @@
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           class="object-row"
-          class:selected={ui.selectedItem?.name === group.name && ui.selectedItem?.kind === 'placement'}
+          class:selected={geometrySelection.selectedItem?.name === group.name && geometrySelection.selectedItem?.kind === 'placement'}
           class:hidden-row={!isVisible(group.name)}
           onclick={() => select(group.name)}
         >
@@ -184,32 +184,19 @@
     flex-direction: column;
     flex: 1;
     overflow: hidden;
-    border-bottom: 1px solid var(--color-border);
     min-height: 0;
+    border: 1px solid var(--color-border);
+    box-shadow: 0 1px 0 rgba(0, 0, 0, 0.15);
+    transition: box-shadow 0.12s, border-color 0.12s;
   }
 
-  .panel-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--color-border);
-    flex-shrink: 0;
-    gap: 6px;
+  .panel:hover {
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.28);
   }
 
-  .panel-title {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--color-subtext);
-  }
-
-  .panel-actions {
-    display: flex;
-    gap: 4px;
-    align-items: center;
+  .panel:focus-within {
+    border-color: var(--color-accent);
+    box-shadow: 0 3px 14px rgba(0, 0, 0, 0.32);
   }
 
   .hint-text {
@@ -225,7 +212,7 @@
     border: none;
     background: transparent;
     color: var(--color-subtext);
-    border-radius: 4px;
+    border-radius: 2px;
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -263,7 +250,7 @@
     border: 1px solid var(--color-border);
     color: var(--color-text);
     padding: 4px 8px;
-    border-radius: 4px;
+    border-radius: 2px;
     cursor: pointer;
   }
 
@@ -275,7 +262,7 @@
     border: 1px solid transparent;
     color: var(--color-subtext);
     padding: 4px 8px;
-    border-radius: 4px;
+    border-radius: 2px;
     cursor: pointer;
   }
 
@@ -321,7 +308,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    border-radius: 3px;
+    border-radius: 2px;
   }
 
   .eye-btn svg { width: 13px; height: 13px; }

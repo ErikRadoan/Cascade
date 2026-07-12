@@ -46,6 +46,37 @@ class JobRow(Base):
     backend_config: Mapped[dict]          = mapped_column(JSON,   nullable=False, default=dict)
     geometry_json:  Mapped[dict]          = mapped_column(JSON,   nullable=False)
     materials_json: Mapped[list]          = mapped_column(JSON,   nullable=False)
+
+    # Raw YAML geometry text submitted with the job (domain/job.py's
+    # geometry_text). Nullable for the same reason run_mode etc. are —
+    # existing rows predate this column and shouldn't need a migration
+    # to keep loading; a NULL here just means "submitted before scene
+    # support existed" (see api/jobs.py's /scene route).
+    geometry_text:  Mapped[str | None]    = mapped_column(Text,   nullable=True)
+
+    # Which sweep produced this job, if any. Previously only stored on
+    # SweepRow.job_ids (a one-directional sweep->jobs list) — there was no
+    # way to go from a job (e.g. in a results view) back to its sweep.
+    # Nullable: standalone (non-sweep) jobs never set this.
+    sweep_id:       Mapped[str | None]    = mapped_column(String, nullable=True)
+
+    # run_mode/monte_carlo/source/mode_specific/variance_reduction —
+    # job-settings-model.md's per-mode settings shape (domain/run_settings.py).
+    # Nullable so existing SQLite databases don't need a migration to load
+    # this schema change; every job created going forward always sets
+    # run_mode, so a NULL here after this change means a pre-existing row
+    # from before the r2s restructure, not a bug in a new save().
+    run_mode:                Mapped[str | None]  = mapped_column(String, nullable=True)
+    monte_carlo_json:        Mapped[dict | None] = mapped_column(JSON,   nullable=True)
+    source_json:              Mapped[dict | None] = mapped_column(JSON,   nullable=True)
+    mode_specific_json:       Mapped[dict | None] = mapped_column(JSON,   nullable=True)
+    variance_reduction_json:  Mapped[dict | None] = mapped_column(JSON,   nullable=True)
+
+    # Execution steps (domain/job_step.py) — populated for multi-step jobs
+    # (r2s's 3-step pipeline). Empty/NULL for single-leg jobs, which still
+    # use the plain `status` column directly (see SimulationJob.effective_status()).
+    steps_json:               Mapped[list | None] = mapped_column(JSON,   nullable=True)
+
     results_config: Mapped[dict]          = mapped_column(JSON,   nullable=False, default=dict)
     working_dir:    Mapped[str | None]    = mapped_column(String, nullable=True)
     notes:          Mapped[str | None]    = mapped_column(Text,   nullable=True)

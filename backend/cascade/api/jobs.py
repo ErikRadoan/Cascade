@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import shutil
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
 from ..repositories.db import SessionLocal, get_db
@@ -21,10 +23,23 @@ from ..domain.results_config import (
     EnergySpectraConfig,
     MeshTallyConfig,
     MeshType,
+    ParticleType,
+    R2SResultsConfig,
     ResultsConfig,
     ScalarTallyConfig,
     SimulationSummaryConfig,
     TallyScore,
+)
+from ..domain.run_settings import (
+    ActivationSettings,
+    DepletionSettings,
+    IrradiationSchedule,
+    McSettings,
+    R2SSettings,
+    RunMode,
+    SourceDef,
+    SourceSpaceType,
+    VrSettings,
 )
 from ..dsl import loader, expander
 from ..dsl.sweep import expand_sweep, parse_sweep, validate_preview
@@ -33,16 +48,17 @@ from ..execution.backend_config import (
     DockerBackendConfig,
     create_backend,
 )
+from ..domain.paths import JOBS_BASE_DIR, UPLOADS_DIR
 from .schemas import (
     DeletedResponse,
     JobDetail,
     JobSummary,
+    SceneResponse,
     SweepResponse,
 )
+from .geometry import build_scene_response
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
-
-JOBS_BASE_DIR = Path.home() / ".cascade" / "jobs"
 
 _DEFAULT_BACKEND_CONFIG = DockerBackendConfig(
     cli="podman",
@@ -55,7 +71,112 @@ _DEFAULT_BACKEND_CONFIG = DockerBackendConfig(
 
 
 # ---------------------------------------------------------------------------
-# Request models
+# Request models — Monte Carlo / source / mode-specific settings
+#
+# These mirror domain/run_settings.py at the Pydantic layer (request
+# validation) — see that module's docstring for the reasoning behind the
+# per-leg, per-mode shape. Each *Request model carries a to_domain() that
+# bridges to the matching frozen dataclass.
+# ---------------------------------------------------------------------------
+
+class McSettingsRequest(BaseModel):
+    """Particle/batch/seed settings for ONE transport leg.
+
+    `inactive` is optional and mode-dependent (see RunMode docs on
+    JobSubmitRequest below) — sending it for a fixed-source leg is now a
+    422 validation error instead of a silently-ignored field.
+    """
+    particles: int       = Field(1000, gt=0)
+    batches:   int        = Field(100, gt=0)
+    seed:      int        = 1
+    inactive:  int | None = Field(None, gt=0)
+
+    def to_domain(self) -> McSettings:
+        return McSettings(
+            particles=self.particles, batches=self.batches,
+            seed=self.seed, inactive=self.inactive,
+        )
+
+
+class SourceDefRequest(BaseModel):
+    """Required for fixed_source mode and r2s's neutron leg
+    (job-settings-model.md §3.2 — previously impossible to submit)."""
+    particle:     Literal["neutron", "photon"]
+    space_type:   Literal["point", "box"] = "point"
+    space_params: list[float]             = Field(default_factory=lambda: [0.0, 0.0, 0.0])
+    energy_mev:   float | None            = None
+
+    def to_domain(self) -> SourceDef:
+        return SourceDef(
+            particle=self.particle,
+            space_type=self.space_type,
+            space_params=tuple(self.space_params),
+            energy_mev=self.energy_mev,
+        )
+
+
+class DepletionSettingsRequest(BaseModel):
+    power_W:    float        = Field(..., gt=0)
+    timesteps:  list[float]  = Field(..., min_length=1)
+    chain_file: str
+    integrator: str          = "predictor"
+    substeps:   int          = Field(1, gt=0)
+
+    def to_domain(self) -> DepletionSettings:
+        return DepletionSettings(
+            power_W=self.power_W, timesteps=self.timesteps,
+            chain_file=self.chain_file, integrator=self.integrator,
+            substeps=self.substeps,
+        )
+
+
+class IrradiationScheduleRequest(BaseModel):
+    power_W:   float       = Field(..., gt=0)
+    timesteps: list[float] = Field(..., min_length=1)
+
+    def to_domain(self) -> IrradiationSchedule:
+        return IrradiationSchedule(power_W=self.power_W, timesteps=self.timesteps)
+
+
+class ActivationSettingsRequest(BaseModel):
+    irradiation_schedule: IrradiationScheduleRequest
+    cooling_times:        list[float] = Field(..., min_length=1)
+    decay_library:        str
+
+    def to_domain(self) -> ActivationSettings:
+        return ActivationSettings(
+            irradiation_schedule=self.irradiation_schedule.to_domain(),
+            cooling_times=self.cooling_times,
+            decay_library=self.decay_library,
+        )
+
+
+class VrSettingsRequest(BaseModel):
+    weight_windows_enabled: bool = False
+
+    def to_domain(self) -> VrSettings:
+        return VrSettings(weight_windows_enabled=self.weight_windows_enabled)
+
+
+class R2SSettingsRequest(BaseModel):
+    neutron_leg_source: SourceDefRequest
+    neutron_leg_mc:     McSettingsRequest
+    activation:         ActivationSettingsRequest
+    photon_leg_mc:      McSettingsRequest
+    photon_leg_vr:      VrSettingsRequest = Field(default_factory=VrSettingsRequest)
+
+    def to_domain(self) -> R2SSettings:
+        return R2SSettings(
+            neutron_leg_source=self.neutron_leg_source.to_domain(),
+            neutron_leg_mc=self.neutron_leg_mc.to_domain(),
+            activation=self.activation.to_domain(),
+            photon_leg_mc=self.photon_leg_mc.to_domain(),
+            photon_leg_vr=self.photon_leg_vr.to_domain(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Request models — results capture
 # ---------------------------------------------------------------------------
 
 class ScalarTallyRequest(BaseModel):
@@ -63,7 +184,8 @@ class ScalarTallyRequest(BaseModel):
     enabled:   bool            = True
     scores:    list[str]       = Field(
         default=["flux", "fission", "absorption", "heating"],
-        description="TallyScore values to measure per cell.",
+        description="TallyScore values to measure per cell. Valid values "
+                     "depend on the leg's particle_type — see ResultsConfigRequest.",
     )
     all_cells: bool            = False
 
@@ -81,7 +203,8 @@ class MeshTallyRequest(BaseModel):
 
 
 class EnergySpectraRequest(BaseModel):
-    """Controls flux-vs-energy spectra per material region."""
+    """Controls flux-vs-energy spectra per material region. Neutron legs only
+    — see ResultsConfigRequest.to_domain(), which rejects this for a photon leg."""
     enabled:         bool = False
     group_structure: str  = "69"    # "33" | "69" | "252"
     per_material:    bool = True
@@ -94,15 +217,29 @@ class DiagnosticsRequest(BaseModel):
 
 
 class ResultsConfigRequest(BaseModel):
-    """What to ask OpenMC to capture.  All groups default to the cheapest option."""
+    """What to ask OpenMC to capture, for ONE transport leg.
+
+    `particle_type` (new) scopes which scores/group structures are valid —
+    see domain/results_config.py §5's ParticleType restructure. Defaults
+    to "neutron" so existing eigenvalue/fixed_source callers are unaffected.
+    """
+    particle_type: Literal["neutron", "photon"] = "neutron"
     scalars:     ScalarTallyRequest   = Field(default_factory=ScalarTallyRequest)
     mesh:        MeshTallyRequest     = Field(default_factory=MeshTallyRequest)
     spectra:     EnergySpectraRequest = Field(default_factory=EnergySpectraRequest)
     diagnostics: DiagnosticsRequest   = Field(default_factory=DiagnosticsRequest)
+    apply_dose_conversion: bool       = False
 
     def to_domain(self) -> ResultsConfig:
-        """Convert Pydantic request model → domain ResultsConfig."""
+        """Convert Pydantic request model → domain ResultsConfig.
+
+        Raises pydantic.ValidationError-adjacent ValueError (converted to a
+        422 by the route handler) if scores/group-structures are invalid
+        for `particle_type` — this now fails at the API boundary instead of
+        silently generating nonsensical tallies.xml downstream.
+        """
         return ResultsConfig(
+            particle_type=ParticleType(self.particle_type),
             summary=SimulationSummaryConfig(),  # always on
             scalars=ScalarTallyConfig(
                 enabled=self.scalars.enabled,
@@ -129,31 +266,150 @@ class ResultsConfigRequest(BaseModel):
                 particle_tracks=self.diagnostics.particle_tracks,
                 n_tracks=self.diagnostics.n_tracks,
             ),
+            apply_dose_conversion=self.apply_dose_conversion,
         )
 
 
+class R2SResultsConfigRequest(BaseModel):
+    """r2s's per-leg results config — job-settings-model.md §1's core fix.
+
+    Never a single ResultsConfigRequest for r2s. `neutron_leg`/`photon_leg`
+    each carry their own `particle_type`, which is enforced (not just
+    defaulted) in to_domain().
+    """
+    neutron_leg: ResultsConfigRequest
+    photon_leg:  ResultsConfigRequest
+
+    def to_domain(self) -> R2SResultsConfig:
+        neutron_leg = self.neutron_leg.model_copy(update={"particle_type": "neutron"})
+        photon_leg  = self.photon_leg.model_copy(update={"particle_type": "photon"})
+        return R2SResultsConfig(
+            neutron_leg=neutron_leg.to_domain(),
+            photon_leg=photon_leg.to_domain(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Request models — top-level job/sweep submission
+# ---------------------------------------------------------------------------
+
 class JobSubmitRequest(BaseModel):
+    """Submission payload for a single job. Shape depends on `run_mode`
+    (job-settings-model.md §2's field-requirements matrix):
+
+        eigenvalue:   monte_carlo (with inactive) + results_config.
+        fixed_source: monte_carlo (no inactive) + source + results_config.
+        depletion:    monte_carlo (with inactive, applies per timestep)
+                      + depletion + results_config.
+        r2s:          r2s (per-leg settings) + r2s_results_config.
+                      monte_carlo/source/results_config/depletion must be
+                      unset — see validate_shape().
+
+    CHANGE: `run_mode` did not exist on this model before — the frontend
+    sent it, FastAPI/Pydantic silently dropped it as an unknown field, and
+    every job ran as whatever OpenMCRunSettings() defaulted to. It's a
+    required field now.
+    """
     geometry_text:  str
     material_ids:   list[str]
-    backend_config: BackendConfig          = Field(default=_DEFAULT_BACKEND_CONFIG)
-    particles:      int                    = Field(1000, gt=0)
-    inactive:       int                    = Field(20,   gt=0)
-    batches:        int                    = Field(100,  gt=0)
-    seed:           int                    = 1
-    results_config: ResultsConfigRequest   = Field(default_factory=ResultsConfigRequest)
-    notes:          str | None             = None
+    backend_config: BackendConfig = Field(default=_DEFAULT_BACKEND_CONFIG)
+
+    run_mode:       Literal["eigenvalue", "fixed_source", "depletion", "r2s"]
+    monte_carlo:    McSettingsRequest | None       = None
+    source:         SourceDefRequest | None        = None
+    depletion:      DepletionSettingsRequest | None = None
+    r2s:            R2SSettingsRequest | None       = None
+    results_config: ResultsConfigRequest | None     = None
+    r2s_results_config: R2SResultsConfigRequest | None = None
+
+    notes: str | None = None
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "JobSubmitRequest":
+        """job-settings-model.md §2: which fields are required/forbidden
+        per run_mode. This is what makes 'r2s + inactive batches' a 422 at
+        the API boundary instead of a UI affordance that reaches the backend."""
+        mode = self.run_mode
+
+        if mode == "r2s":
+            if self.r2s is None:
+                raise ValueError("run_mode='r2s' requires `r2s` settings.")
+            if self.r2s_results_config is None:
+                raise ValueError("run_mode='r2s' requires `r2s_results_config` (per-leg).")
+            for forbidden, name in (
+                (self.monte_carlo, "monte_carlo"),
+                (self.source, "source"),
+                (self.depletion, "depletion"),
+                (self.results_config, "results_config"),
+            ):
+                if forbidden is not None:
+                    raise ValueError(
+                        f"run_mode='r2s' must not set `{name}` — r2s has two "
+                        f"independent legs, set per-leg fields under `r2s` "
+                        f"and `r2s_results_config` instead."
+                    )
+            return self
+
+        # eigenvalue / fixed_source / depletion all need a single-leg
+        # monte_carlo + results_config, and must not set r2s fields.
+        if self.monte_carlo is None:
+            raise ValueError(f"run_mode='{mode}' requires `monte_carlo`.")
+        if self.results_config is None:
+            raise ValueError(f"run_mode='{mode}' requires `results_config`.")
+        if self.r2s is not None or self.r2s_results_config is not None:
+            raise ValueError(f"run_mode='{mode}' must not set r2s fields.")
+
+        if mode == "eigenvalue":
+            if self.source is not None:
+                raise ValueError(
+                    "run_mode='eigenvalue' source is geometry-driven "
+                    "(auto-detected from fissile cells) — do not set `source`."
+                )
+            if self.depletion is not None:
+                raise ValueError("run_mode='eigenvalue' must not set `depletion`.")
+
+        elif mode == "fixed_source":
+            if self.source is None:
+                raise ValueError(
+                    "run_mode='fixed_source' requires `source` "
+                    "(job-settings-model.md §3.2)."
+                )
+            if self.depletion is not None:
+                raise ValueError("run_mode='fixed_source' must not set `depletion`.")
+
+        elif mode == "depletion":
+            if self.depletion is None:
+                raise ValueError("run_mode='depletion' requires `depletion` settings.")
+            if self.source is not None:
+                raise ValueError("run_mode='depletion' must not set `source`.")
+
+        return self
+
+    def to_domain_kwargs(self) -> dict:
+        """Fields to splat into SimulationJob(...), independent of geometry/
+        materials/backend/job_id which the route handler resolves separately."""
+        mode = self.run_mode  # RunMode's string constants match these literals exactly
+        if self.run_mode == "r2s":
+            return dict(
+                run_mode=RunMode.R2S,
+                mode_specific=self.r2s.to_domain(),
+                results_config=self.r2s_results_config.to_domain(),
+            )
+        mode_specific = self.depletion.to_domain() if self.run_mode == "depletion" else None
+        return dict(
+            run_mode=mode,
+            monte_carlo=self.monte_carlo.to_domain(),
+            source=self.source.to_domain() if self.source else None,
+            mode_specific=mode_specific,
+            results_config=self.results_config.to_domain(),
+        )
 
 
-class SweepSubmitRequest(BaseModel):
-    geometry_text:  str
-    material_ids:   list[str]
-    backend_config: BackendConfig          = Field(default=_DEFAULT_BACKEND_CONFIG)
-    particles:      int                    = Field(1000, gt=0)
-    inactive:       int                    = Field(20,   gt=0)
-    batches:        int                    = Field(100,  gt=0)
-    seed:           int                    = 1
-    results_config: ResultsConfigRequest   = Field(default_factory=ResultsConfigRequest)
-    notes:          str | None             = None
+class SweepSubmitRequest(JobSubmitRequest):
+    """Identical shape to JobSubmitRequest — a sweep is the same per-job
+    settings applied across every point in the parameter sweep. Subclassing
+    means the two can never drift apart the way the old flat field lists did."""
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -163,18 +419,19 @@ class SweepSubmitRequest(BaseModel):
 def _to_summary(job: SimulationJob) -> JobSummary:
     return JobSummary(
         id=job.id,
-        status=job.status.value,
+        status=job.effective_status().value,
         backend=job.backend,
         param_values=job.param_values,
         created_at=job.created_at,
         notes=job.notes,
+        sweep_id=job.sweep_id,
     )
 
 
 def _to_detail(job: SimulationJob) -> JobDetail:
     return JobDetail(
         id=job.id,
-        status=job.status.value,
+        status=job.effective_status().value,
         backend=job.backend,
         param_values=job.param_values,
         created_at=job.created_at,
@@ -184,6 +441,8 @@ def _to_detail(job: SimulationJob) -> JobDetail:
         finished_at=job.finished_at,
         error=job.error,
         working_dir=str(job.working_dir) if job.working_dir else None,
+        sweep_id=job.sweep_id,
+        steps=[s.to_dict() for s in job.steps],
     )
 
 
@@ -259,6 +518,46 @@ def _get_job_or_404(job_id: str, db: Session) -> SimulationJob:
 # Routes
 # ---------------------------------------------------------------------------
 
+@router.post("/files")
+async def upload_job_file(
+    file: UploadFile = File(...),
+    kind: str = Form(...),
+) -> dict:
+    """Accept a file upload from the browser's native file picker.
+
+    Used for depletion chain files and r2s decay/activation libraries
+    (see JobSubmitModal.svelte — the file input's onchange handler calls
+    api.jobs.uploadFile() immediately on selection, before the job is
+    submitted). Returns a `file_id` that the frontend stores as the
+    `chain_file`/`decay_library` string value in the submission payload;
+    DockerBackend resolves that reference back to actual file bytes at
+    staging time via `_stage_uploaded_file()`, copying them directly into
+    the relevant execution step's input_dir (the same directory mounted
+    into the container at /work) — no separate host-path volume mount
+    needed, unlike the provisional approach this replaces.
+
+    `kind` ("chain" | "decay_library") isn't currently used to change
+    storage behavior — both are staged identically — but is accepted and
+    could later gate validation (e.g. requiring a .xml extension for
+    chain files) without a client-side contract change.
+
+    Returns:
+        {"file_id": "<uuid>", "filename": "<original filename>"}
+        Store the two joined as "{file_id}/{filename}" wherever a
+        DepletionSettings.chain_file / ActivationSettings.decay_library
+        string reference is expected.
+    """
+    file_id = str(uuid.uuid4())
+    dest_dir = UPLOADS_DIR / file_id
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    dest_path = dest_dir / file.filename
+    with dest_path.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    return {"file_id": file_id, "filename": file.filename}
+
+
 @router.post(
     "/submit",
     response_model=JobSummary | SweepResponse,
@@ -271,18 +570,12 @@ async def submit_job(
     swept_params = _extract_swept_params(body.geometry_text)
 
     if swept_params:
-        sweep_request = SweepSubmitRequest(
-            geometry_text=body.geometry_text,
-            material_ids=body.material_ids,
-            backend_config=body.backend_config,
-            particles=body.particles,
-            inactive=body.inactive,
-            batches=body.batches,
-            seed=body.seed,
-            results_config=body.results_config,
-            notes=body.notes,
-        )
-
+        # SweepSubmitRequest is a subclass of JobSubmitRequest with an
+        # identical shape, so this is a straight passthrough — no more
+        # hand-copying each individual field (and no more risk of the two
+        # request shapes drifting apart, which is how `run_mode` got lost
+        # here in the first place).
+        sweep_request = SweepSubmitRequest(**body.model_dump())
         return await submit_sweep(sweep_request, db)
 
     errors = loader.validate(body.geometry_text)
@@ -299,18 +592,23 @@ async def submit_job(
     backend   = create_backend(body.backend_config)
 
     job_id = str(uuid.uuid4())
-    job = SimulationJob(
-        id=job_id,
-        geometry=geometry,
-        materials=materials,
-        param_values={},
-        backend=body.backend_config.type,
-        results_config=body.results_config.to_domain(),
-        working_dir=Path(body.backend_config.jobs_base_dir) / job_id,
-        notes=body.notes,
-    )
-
-    print(f"Job submited with config {body.results_config.model_dump_json()}")
+    try:
+        job = SimulationJob(
+            id=job_id,
+            geometry=geometry,
+            geometry_text=body.geometry_text,
+            materials=materials,
+            param_values={},
+            backend=body.backend_config.type,
+            working_dir=Path(body.backend_config.jobs_base_dir) / job_id,
+            notes=body.notes,
+            **body.to_domain_kwargs(),
+        )
+    except ValueError as e:
+        # Domain-level cross-field validation (job-settings-model.md §6) —
+        # e.g. fission scores requested without a fissile material, or
+        # eigenvalue mode on a geometry with no fissile cells at all.
+        raise HTTPException(status_code=422, detail=str(e))
 
     try:
         job = backend.submit(job)
@@ -354,16 +652,38 @@ async def submit_sweep(
 
     for param_values, geometry in sweep_points:
         job_id = str(uuid.uuid4())
-        job = SimulationJob(
-            id=job_id,
-            geometry=geometry,
-            materials=materials,
-            param_values=param_values,
-            backend=body.backend_config.type,
-            results_config=body.results_config.to_domain(),
-            working_dir=Path(body.backend_config.jobs_base_dir) / job_id,
-            notes=body.notes,
-        )
+        try:
+            job = SimulationJob(
+                id=job_id,
+                geometry=geometry,
+                # NOTE: this is the sweep *template* (with sweep(...) exprs),
+                # the same text for every point — there's no per-point
+                # resolved YAML available here, only the resolved
+                # CascadeGeometry (`geometry`, already-expanded surfaces/
+                # cells, not schema form). /jobs/{id}/scene will render the
+                # template's nominal preview for any job in this sweep, not
+                # that job's actual swept dimensions. Good enough for "what
+                # does the geometry look like", not for per-point accuracy.
+                geometry_text=body.geometry_text,
+                materials=materials,
+                param_values=param_values,
+                backend=body.backend_config.type,
+                working_dir=Path(body.backend_config.jobs_base_dir) / job_id,
+                notes=body.notes,
+                sweep_id=sweep_id,
+                **body.to_domain_kwargs(),
+            )
+        except ValueError as e:
+            # e.g. this sweep point's geometry has no fissile material for
+            # eigenvalue mode — fail just this point, not the whole sweep.
+            import datetime as _dt
+            summaries.append(JobSummary(
+                id=job_id, status=JobStatus.FAILED.value, backend=body.backend_config.type,
+                param_values=param_values, created_at=_dt.datetime.now(_dt.timezone.utc),
+                notes=f"Rejected: {e}", sweep_id=sweep_id,
+            ))
+            job_ids.append(job_id)
+            continue
 
         try:
             job = backend.submit(job)
@@ -397,11 +717,25 @@ async def get_sweep(
     sweep_id: str,
     db:       Session = Depends(get_db),
 ) -> dict:
-    """Get sweep metadata and derived status."""
+    """Get sweep metadata, derived status, and per-job results summaries.
+
+    CHANGE: previously returned only `record.to_dict()` — sweep metadata
+    plus a bare `job_ids` list, with no way to render per-job results
+    (status, param_values, results_config) without N follow-up requests to
+    GET /jobs/{job_id}. Now attaches full job summaries via
+    JobRepository.list_by_sweep(), which is possible because job.sweep_id
+    is now actually persisted (previously sweep_id was generated at submit
+    time but never attached to the job record at all — see job.py's
+    `sweep_id` field and job_repository.py's `list_by_sweep()`).
+    """
     record = SweepRepository(db).get(sweep_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Sweep '{sweep_id}' not found.")
-    return record.to_dict()
+    jobs = JobRepository(db).list_by_sweep(sweep_id)
+    return {
+        **record.to_dict(),
+        "jobs": [_to_summary(j).model_dump(mode="json") for j in jobs],
+    }
 
 
 @router.delete("/sweeps/{sweep_id}", response_model=DeletedResponse)
@@ -466,33 +800,48 @@ async def get_job(
     """Get current status and detail for a job.
 
     Polls the correct backend if still running, then persists any status change.
+
+    BUG FIX: previously gated on `job.status == JobStatus.RUNNING` — the
+    raw field, which stepped jobs (depletion/r2s) never set at all (only
+    `job.steps` is populated/mutated for those; `job.effective_status()`
+    derives RUNNING from step state instead). That meant `backend.status()`
+    was never called again after the first poll for any depletion/r2s job
+    — its step state, and therefore its displayed status, froze at
+    whatever it was right after submission and never advanced, regardless
+    of what actually happened in the container. Fixed to check
+    `effective_status()`, which is correct for both legacy single-leg jobs
+    (falls back to the raw field) and stepped jobs (derives from steps).
+
+    Also fixed: previously only persisted when the *overall* derived
+    status changed. A stepped job can move from one running step to the
+    next (e.g. r2s's neutron leg finishing and activation starting) while
+    effective_status() stays RUNNING throughout that transition — under
+    the old `if new_status != old_status` gate, that step progress was
+    silently dropped instead of saved. Now always persists (including
+    `job.steps`) after every poll where backend.status() was actually
+    called.
     """
     job = _get_job_or_404(job_id, db)
 
-    if job.status == JobStatus.RUNNING:
+    if job.effective_status() == JobStatus.RUNNING:
         try:
-            backend     = _backend_for_job(job_id, db)
-            # Capture status BEFORE calling backend.status() because the
-            # backend mutates job.status in-place — comparing new_status to
-            # job.status after the call always yields equal, so the update
-            # block was never entered and the DB was never written.
-            old_status  = job.status
-            new_status  = backend.status(job)   # may mutate job in-place
-            if new_status != old_status:
-                # Ensure finished_at is set for terminal transitions
-                if new_status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
-                    if not job.finished_at:
-                        from datetime import datetime, timezone
-                        job.finished_at = datetime.now(timezone.utc)
-                JobRepository(db).update_status(
-                    job_id=      job_id,
-                    status=      new_status,
-                    error=       job.error,
-                    started_at=  job.started_at,
-                    finished_at= job.finished_at,
-                )
-                db.expire_all()
-                db.commit()
+            backend    = _backend_for_job(job_id, db)
+            new_status = backend.status(job)   # mutates job.status and/or job.steps in-place
+
+            if new_status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
+                if not job.finished_at:
+                    job.finished_at = datetime.now(timezone.utc)
+
+            JobRepository(db).update_status(
+                job_id=      job_id,
+                status=      new_status,
+                error=       job.error,
+                started_at=  job.started_at,
+                finished_at= job.finished_at,
+                steps=       job.steps,
+            )
+            db.expire_all()
+            db.commit()
         except HTTPException:
             raise
         except Exception as e:
@@ -502,6 +851,45 @@ async def get_job(
             )
 
     return _to_detail(job)
+
+
+@router.get("/{job_id}/scene", response_model=SceneResponse)
+async def get_job_scene(
+    job_id: str,
+    db:     Session = Depends(get_db),
+) -> SceneResponse:
+    """Build a Viewport3D-renderable scene for a job's geometry.
+
+    Reuses the exact same YAML-text -> SceneDescription -> SceneResponse
+    pipeline as POST /geometry/scene (see build_scene_response), just
+    sourcing the text from the job record instead of a live editor buffer.
+    This is deliberate: job.geometry (the persisted CascadeGeometry) is
+    already-expanded surfaces/cells, not the mid-level component schemas
+    SceneBuilder needs, so there's no shortcut that skips re-parsing
+    geometry_text.
+
+    404s (not a 200 with `error` set) when the job predates the
+    geometry_text column — that's "no data available", not a YAML
+    validation error, and the two shouldn't be conflated in one field.
+
+    For a sweep job, geometry_text is the sweep *template* (still
+    containing sweep(...) expressions), not that job's per-point resolved
+    dimensions — see the comment in submit_sweep(). The scene shown here
+    is the sweep's nominal preview, same as what the editor shows before
+    submission, not a point-accurate render.
+    """
+    job = _get_job_or_404(job_id, db)
+
+    if not job.geometry_text:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Job '{job_id}' has no stored geometry text — it was "
+                "submitted before scene preview support was added."
+            ),
+        )
+
+    return build_scene_response(job.geometry_text)
 
 
 @router.post("/{job_id}/cancel", response_model=JobSummary)
@@ -559,11 +947,23 @@ async def get_job_stdout(
     job_id: str,
     db:     Session = Depends(get_db),
 ) -> dict:
-    """Return the raw stdout from a job's run.log file.
+    """Return the raw stdout from a job's run.log file(s).
 
     This is the actual OpenMC terminal output — particle transport
     progress, k-eff per batch, timing, and errors.
     Polled every 2s by the frontend while a job is running.
+
+    BUG FIX: this previously only ever read `job.working_dir / "run.log"`.
+    That's correct for eigenvalue/fixed_source (job.steps is empty, and
+    DockerBackend writes run.log directly there — see
+    `_submit_single_leg`), but depletion and r2s jobs write run.log
+    per-step, at `step.working_dir / "run.log"` (see `_launch_step()` in
+    docker_backend.py) — `job.working_dir / "run.log"` never exists for
+    them at all. The console silently showed nothing for every depletion/
+    r2s job as a result. Now: for a job with steps, concatenate each
+    step's log (in sequence order, with a header per step) so the console
+    shows the full pipeline's progress, not just whichever step happens to
+    be running right now.
 
     Returns:
         { "lines": str, "available": bool }
@@ -572,6 +972,9 @@ async def get_job_stdout(
 
     if not job.working_dir:
         return {"lines": "", "available": False}
+
+    if job.steps:
+        return _read_stepped_stdout(job)
 
     log_path = job.working_dir / "run.log"
     if not log_path.exists():
@@ -582,3 +985,32 @@ async def get_job_stdout(
         return {"lines": content, "available": True}
     except OSError:
         return {"lines": "", "available": False}
+
+
+def _read_stepped_stdout(job: SimulationJob) -> dict:
+    """Concatenate each step's run.log in sequence order.
+
+    Only includes steps that have actually started (QUEUED steps have no
+    working_dir contents yet — nothing to show). A header line names each
+    step so the pipeline's progress is legible, e.g. for r2s:
+        === neutron leg ===
+        <openmc output>
+        === photon leg ===
+        <openmc output>
+    """
+    chunks: list[str] = []
+    for step in sorted(job.steps, key=lambda s: s.sequence):
+        if step.working_dir is None:
+            continue
+        log_path = step.working_dir / "run.log"
+        if not log_path.exists():
+            continue
+        try:
+            content = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        chunks.append(f"=== {step.label} ===\n{content}")
+
+    if not chunks:
+        return {"lines": "", "available": False}
+    return {"lines": "\n\n".join(chunks), "available": True}

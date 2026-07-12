@@ -66,6 +66,11 @@ def material_opacity(mid: str) -> float:
 class CylinderLayer:
     r_inner: float; r_outer: float; height: float; z_base: float
     material_id: str; color: str; opacity: float; label: str
+    # Matches the Cell.name expander.py assigns this layer's actual OpenMC
+    # cell (f"{placement_name}_layer{i}") — the join key for mapping a
+    # tally result back onto this specific layer in the 3D viewer. See
+    # _build_fuel_pin below and expander.py's _build_fuel_pin_cells.
+    cell_name: str = ""
 
 
 @dataclass
@@ -73,6 +78,9 @@ class WireframeBox:
     x_size: float; y_size: float; z_size: float; z_base: float
     color: str; boundary_type: str
     fill_material_id: str; fill_color: str; fill_opacity: float
+    # Matches the fill Cell.name expander.py assigns (the box placement's
+    # name) — see _build_box below and expander.py's _build_fill_cell.
+    cell_name: str = ""
 
 
 @dataclass
@@ -90,7 +98,8 @@ class SceneComponent:
                 {"r_inner": l.r_inner, "r_outer": l.r_outer,
                  "height": l.height, "z_base": l.z_base,
                  "material_id": l.material_id, "color": l.color,
-                 "opacity": l.opacity, "label": l.label}
+                 "opacity": l.opacity, "label": l.label,
+                 "cell_name": l.cell_name}
                 for l in self.layers
             ]
         if self.box:
@@ -101,6 +110,7 @@ class SceneComponent:
                 "boundary_type": b.boundary_type,
                 "fill_material_id": b.fill_material_id,
                 "fill_color": b.fill_color, "fill_opacity": b.fill_opacity,
+                "cell_name": b.cell_name,
             }
         return d
 
@@ -221,13 +231,18 @@ class SceneBuilder:
             schema.gap_material:    "Helium gap",
             schema.clad_material:   "Cladding",
         }
-        for r_outer, mat_id in schema.radial_layers():
+        for i, (r_outer, mat_id) in enumerate(schema.radial_layers()):
             layers.append(CylinderLayer(
                 r_inner=prev_r, r_outer=r_outer,
                 height=schema.pellet_height, z_base=position[2],
                 material_id=mat_id, color=material_color(mat_id),
                 opacity=material_opacity(mat_id),
                 label=labels.get(mat_id, mat_id),
+                # `name` here is exactly the cell_name_prefix expand.py's
+                # _place_fuel_pin passes down to _build_fuel_pin_cells for
+                # this same instance (placement name, or f"{name}_{i}" for
+                # a lattice pin) — must stay in lockstep with that naming.
+                cell_name=f"{name}_layer{i}",
             ))
             prev_r = r_outer
         return SceneComponent(type="FuelPin", name=name, position=position, layers=layers)
@@ -247,6 +262,10 @@ class SceneBuilder:
             boundary_type=bt_str, fill_material_id=schema.material,
             fill_color=material_color(schema.material),
             fill_opacity=material_opacity(schema.material),
+            # Matches expander.py's _build_fill_cell, which now names the
+            # fill Cell after the box's placement name (the same `name`
+            # this SceneComponent gets) instead of f"fill_{material}".
+            cell_name=name,
         )
         return SceneComponent(type="Box", name=name, position=position, box=box)
 

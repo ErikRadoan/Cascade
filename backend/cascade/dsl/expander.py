@@ -150,8 +150,17 @@ def _expand_fuel_pin_radial(
     layer_surfaces: list[Surface] = []
 
     for outer_r, _ in schema.radial_layers():
+        # x0/y0 must be present (even at the origin-default 0.0) so that
+        # _translate_params has keys to shift below — it only translates
+        # params that already exist on the dict (`if param_key in result`).
+        # Without them, every pin placement silently no-ops the x/y shift
+        # and every instance in a lattice ends up centered on the origin,
+        # fully overlapping in the actual OpenMC model even though each
+        # gets a distinct cell id/name and a correct `position` in the
+        # scene (which is why this bug is invisible in the 3D editor and
+        # only shows up as identical tally results per lattice instance).
         s = Surface(id=ctx.fresh_id("s"), type_=SurfaceType.CYLINDER_Z,
-                    params={"r": outer_r})
+                    params={"r": outer_r, "x0": 0.0, "y0": 0.0})
         surfaces.append(s)
         layer_surfaces.append(s)
 
@@ -165,10 +174,22 @@ def _build_fuel_pin_cells(
     bot_id: str,
     top_id: str,
     ctx: Context,
+    cell_name_prefix: str,
 ) -> list[Cell]:
     """Build fuel pin cells using provided surface IDs.
 
     Uses the axial bound IDs from context (shared with the box).
+
+    `cell_name_prefix` is the SAME string SceneBuilder uses to name this
+    pin's SceneComponent (the placement name, or f"{name}_{i}" for a
+    lattice instance — see scene_builder_service.py's build()/_build_placed).
+    Cell.name is set to f"{cell_name_prefix}_layer{i}" for the i-th radial
+    layer, which is exactly how scene_builder_service.py's _build_fuel_pin
+    labels each CylinderLayer's cell_name. This is what lets a tally result
+    (openmc_adapter.py embeds cell.name in the tally's `name` attribute) be
+    matched back to a specific pin+layer in the 3D viewer — previously
+    Cell.name was f"{mat_id}_layer_{i}", which collided across every pin
+    of the same fuel type and carried no placement information at all.
     """
     cells: list[Cell] = []
     axial = [Outside(bot_id), Inside(top_id)]
@@ -184,7 +205,7 @@ def _build_fuel_pin_cells(
             id=          ctx.fresh_id("c"),
             region=      Intersection(radial + axial),
             material_id= mat_id,
-            name=        f"{mat_id}_layer_{i}",
+            name=        f"{cell_name_prefix}_layer{i}",
         ))
     return cells
 
@@ -267,6 +288,7 @@ def _place_fuel_pin(
     schema: FuelPinSchema,
     position: tuple[float, float, float],
     ctx: Context,
+    cell_name_prefix: str,
 ) -> list[Surface | Cell]:
     """Place one fuel pin instance.
 
@@ -314,6 +336,7 @@ def _place_fuel_pin(
         bot_id=            ctx.axial_bot_id,
         top_id=            ctx.axial_top_id,
         ctx=               ctx,
+        cell_name_prefix=  cell_name_prefix,
     )
 
     return translated_surfaces + cells
@@ -323,8 +346,19 @@ def _build_fill_cell(
     schema: BoxSchema,
     translated_labels: dict[str, str],
     ctx: Context,
+    cell_name: str,
 ) -> Cell:
-    """Build the water fill cell once all pins are placed."""
+    """Build the water fill cell once all pins are placed.
+
+    `cell_name` is the box placement's name — the same string SceneBuilder
+    uses for this Box's SceneComponent (see scene_builder_service.py's
+    _build_box), so a tally on this cell can be matched back to the box
+    in the 3D viewer the same way fuel pin layers are (see
+    _build_fuel_pin_cells). Previously this was f"fill_{schema.material}",
+    which carried no placement identity — fine when there's only one Box
+    per geometry (the only case supported today), but worth naming
+    consistently now rather than adding another special case later.
+    """
     box_interior = [
         Outside(translated_labels["xlo"]),
         Inside(translated_labels["xhi"]),
@@ -339,7 +373,7 @@ def _build_fill_cell(
         id=          ctx.fresh_id("c"),
         region=      Intersection(box_interior + outer_exclusions),
         material_id= schema.material,
-        name=        f"fill_{schema.material}",
+        name=        cell_name,
     )
 
 
@@ -377,6 +411,7 @@ def expand(
     all_objects:           list[Surface | Cell]   = []
     box_schema:            BoxSchema | None        = None
     box_translated_labels: dict[str, str] | None  = None
+    box_placement_name:    str | None              = None
 
     # ------------------------------------------------------------------
     # Step 1 — Box placements first
@@ -398,6 +433,7 @@ def expand(
         all_objects.extend(placed_surfaces)
         box_schema            = tpl
         box_translated_labels = translated_labels
+        box_placement_name    = name
 
     # ------------------------------------------------------------------
     # Step 2 — Fuel pin placements (SinglePlacement + lattices)
@@ -416,7 +452,7 @@ def expand(
                 continue  # already handled in Step 1
 
             if isinstance(tpl, FuelPinSchema):
-                placed = _place_fuel_pin(tpl, schema.position(), ctx)
+                placed = _place_fuel_pin(tpl, schema.position(), ctx, cell_name_prefix=name)
                 all_objects.extend(placed)
             else:
                 raise TypeError(
@@ -433,8 +469,8 @@ def expand(
                     f"'{schema.template}'."
                 )
             if isinstance(tpl, FuelPinSchema):
-                for pos in schema.pin_positions():
-                    placed = _place_fuel_pin(tpl, pos, ctx)
+                for i, pos in enumerate(schema.pin_positions()):
+                    placed = _place_fuel_pin(tpl, pos, ctx, cell_name_prefix=f"{name}_{i}")
                     all_objects.extend(placed)
             else:
                 raise TypeError(
@@ -450,8 +486,8 @@ def expand(
                     f"'{schema.template}'."
                 )
             if isinstance(tpl, FuelPinSchema):
-                for pos in schema.pin_positions():
-                    placed = _place_fuel_pin(tpl, pos, ctx)
+                for i, pos in enumerate(schema.pin_positions()):
+                    placed = _place_fuel_pin(tpl, pos, ctx, cell_name_prefix=f"{name}_{i}")
                     all_objects.extend(placed)
             else:
                 raise TypeError(
@@ -463,7 +499,10 @@ def expand(
     # Step 3 — Fill cell
     # ------------------------------------------------------------------
     if box_schema is not None and box_translated_labels is not None:
-        fill_cell = _build_fill_cell(box_schema, box_translated_labels, ctx)
+        fill_cell = _build_fill_cell(
+            box_schema, box_translated_labels, ctx,
+            cell_name=box_placement_name or f"fill_{box_schema.material}",
+        )
         all_objects.append(fill_cell)
 
     surfaces = [obj for obj in all_objects if isinstance(obj, Surface)]

@@ -1,11 +1,11 @@
 <script lang="ts">
-  import { ui } from '$lib/stores/index.svelte';
+  import { ui } from '$lib/stores/ui.svelte';
   import type { ActiveTab } from '$lib/types';
 
-  const tabs: { id: ActiveTab; label: string; icon: string }[] = [
-    { id: 'geometry',      label: 'Geometry Editor',  icon: 'cube'      },
-    { id: 'jobs',          label: 'Job Scheduler',    icon: 'cpu'       },
-    { id: 'results',       label: 'Results Viewer',   icon: 'chart-bar' },
+  const tabs: { id: ActiveTab; label: string; shortLabel: string; icon: string }[] = [
+    { id: 'geometry',      label: 'Geometry Editor',  shortLabel: 'Geometry', icon: 'cube'      },
+    { id: 'jobs',          label: 'Job Scheduler',    shortLabel: 'Jobs',     icon: 'cpu'       },
+    { id: 'results',       label: 'Results Viewer',   shortLabel: 'Results',  icon: 'chart-bar' },
   ];
 
   function setTab(id: ActiveTab) {
@@ -40,6 +40,7 @@
             d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75zM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V8.625zM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V4.125z"/>
         </svg>
       {/if}
+      <span class="tab-label">{tab.shortLabel}</span>
     </button>
   {/each}
 </nav>
@@ -51,29 +52,45 @@
     border-right: 1px solid var(--color-border);
     display: flex;
     flex-direction: column;
-    align-items: center;
+    align-items: stretch;
     padding: 8px 0;
-    gap: 4px;
+    gap: 6px;
     flex-shrink: 0;
   }
 
   .tab-btn {
-    width: 36px;
-    height: 36px;
-    border-radius: 8px;
+    position: relative;
+    width: 100%;
+    min-height: 84px;
+    border-radius: 2px;
     border: none;
     background: transparent;
     color: var(--color-subtext);
     cursor: pointer;
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
+    gap: 8px;
+    padding: 12px 4px;
     transition: color 0.15s, background 0.15s;
   }
 
   .tab-btn svg {
     width: 20px;
     height: 20px;
+    flex-shrink: 0;
+  }
+
+  .tab-label {
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    font-size: 10px;
+    font-family: var(--font-mono);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    white-space: nowrap;
   }
 
   .tab-btn:hover {
@@ -84,5 +101,15 @@
   .tab-btn.active {
     color: var(--color-accent);
     background: rgba(6, 182, 212, 0.12);
+  }
+
+  .tab-btn.active::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 8px;
+    bottom: 8px;
+    width: 2px;
+    background: var(--color-accent);
   }
 </style>

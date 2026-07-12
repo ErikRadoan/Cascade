@@ -29,6 +29,11 @@ export interface CylinderLayer {
   color: string;
   opacity: number;
   label: string;
+  // Join key for matching a /results/{job_id}/tallies entry's `name` to
+  // this specific layer — see openmc_adapter.py's _append_scalar_tallies
+  // and expander.py's _build_fuel_pin_cells. Empty string for scenes built
+  // before this field existed (backend defaults it to "").
+  cell_name: string;
 }
 
 export interface WireframeBox {
@@ -41,6 +46,8 @@ export interface WireframeBox {
   fill_material_id: string;
   fill_color: string;
   fill_opacity: number;
+  // See CylinderLayer.cell_name — same join key, for the box's fill cell.
+  cell_name: string;
 }
 
 export interface SceneComponent {

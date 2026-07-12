@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { jobsState, refreshJobs, ui } from '$lib/stores/index.svelte';
+  import { jobsState, refreshJobs } from './stores/jobs.svelte';
+  import { ui } from '$lib/stores/ui.svelte';
   import { onMount, onDestroy } from 'svelte';
   import * as api from '$lib/api';
   import type { JobDetail } from '$lib/types';
@@ -266,7 +267,11 @@
             </div>
             <div class="win-body results-body">
               {#if detail.status === 'completed'}
-                <button class="icon-text-btn accent" onclick={() => { ui.resultsJobId = detail?.id ?? null; ui.activeTab = 'results'; }}>
+                <button class="icon-text-btn accent" onclick={() => {
+                  const jobId = detail?.id ?? null;
+                  jobsState.selectedResultJobId = jobId;
+                  ui.activeTab = 'results';
+                }}>
                   View results →
                 </button>
               {:else if detail.status === 'failed'}
