@@ -498,7 +498,14 @@
 
       const result = await api.jobs.submit(body as Parameters<typeof api.jobs.submit>[0]);
 
-      if ('sweep_id' in result) {
+      // CHANGE: was `'sweep_id' in result`. JobSummary now carries an
+      // (often-null) sweep_id field too (backend schemas.py fix, so
+      // sweep_id survives serialization for non-sweep jobs the same way
+      // it always did in the domain layer) — so that check no longer
+      // discriminates the two response shapes and took the sweep branch
+      // unconditionally, spreading `result.jobs` when it was undefined on
+      // a plain JobSummary. `jobs` (the array) is unique to SweepResponse.
+      if ('jobs' in result) {
         jobsState.list.unshift(...result.jobs);
         jobsState.selectedJobId = result.jobs[0]?.id ?? null;
       } else {

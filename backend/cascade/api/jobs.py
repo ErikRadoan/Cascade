@@ -50,11 +50,23 @@ from ..execution.backend_config import (
 )
 from ..domain.paths import JOBS_BASE_DIR, UPLOADS_DIR
 from .schemas import (
+    ActivationSettingsOut,
     DeletedResponse,
+    DiagnosticsOut,
+    EnergySpectraOut,
+    IrradiationScheduleOut,
     JobDetail,
     JobSummary,
+    McSettingsOut,
+    MeshTallyOut,
+    R2SResultsConfigOut,
+    R2SSettingsOut,
+    ResultsConfigOut,
+    ScalarTallyOut,
     SceneResponse,
+    SourceDefOut,
     SweepResponse,
+    VrSettingsOut, DepletionSettingsOut,
 )
 from .geometry import build_scene_response
 
@@ -428,7 +440,118 @@ def _to_summary(job: SimulationJob) -> JobSummary:
     )
 
 
+# ---------------------------------------------------------------------------
+# Domain -> response conversion for submission config (job-settings-model.md
+# §2). These mirror the *Request.to_domain() methods above, just inverted —
+# each one is None-safe on its input since every sub-config here is
+# optional/mode-dependent on SimulationJob.
+#
+# `.value if hasattr(..., "value") else ...` on enum-shaped fields (e.g.
+# particle_type, mesh_type, scores) is deliberately defensive rather than
+# assuming a specific enum type: ResultsConfig.from_dict() (domain-internal,
+# not this module's concern) is what actually reconstructs those on load,
+# and whether it hands back enum members or plain strings isn't a contract
+# this response layer should have to track.
+# ---------------------------------------------------------------------------
+
+def _enum_value(v):
+    return v.value if hasattr(v, "value") else v
+
+
+def _mc_out(mc) -> McSettingsOut | None:
+    if mc is None:
+        return None
+    return McSettingsOut(
+        particles=mc.particles, batches=mc.batches,
+        seed=mc.seed, inactive=mc.inactive,
+    )
+
+
+def _source_out(source) -> SourceDefOut | None:
+    if source is None:
+        return None
+    return SourceDefOut(
+        particle=_enum_value(source.particle),
+        space_type=_enum_value(source.space_type),
+        space_params=list(source.space_params),
+        energy_mev=source.energy_mev,
+    )
+
+
+def _depletion_out(depletion) -> DepletionSettingsOut | None:
+    if depletion is None:
+        return None
+    return DepletionSettingsOut(
+        power_W=depletion.power_W, timesteps=list(depletion.timesteps),
+        chain_file=depletion.chain_file, integrator=depletion.integrator,
+        substeps=depletion.substeps,
+    )
+
+
+def _results_config_out(rc) -> ResultsConfigOut | None:
+    if rc is None:
+        return None
+    return ResultsConfigOut(
+        particle_type=_enum_value(rc.particle_type),
+        scalars=ScalarTallyOut(
+            enabled=rc.scalars.enabled,
+            scores=[_enum_value(s) for s in rc.scalars.scores],
+            all_cells=rc.scalars.all_cells,
+        ),
+        mesh=MeshTallyOut(
+            enabled=rc.mesh.enabled,
+            mesh_type=_enum_value(rc.mesh.mesh_type),
+            nx=rc.mesh.nx, ny=rc.mesh.ny, nz=rc.mesh.nz,
+            nr=rc.mesh.nr, nz_cyl=rc.mesh.nz_cyl,
+            scores=[_enum_value(s) for s in rc.mesh.scores],
+        ),
+        spectra=EnergySpectraOut(
+            enabled=rc.spectra.enabled,
+            group_structure=_enum_value(rc.spectra.group_structure),
+            per_material=rc.spectra.per_material,
+        ) if rc.spectra is not None else None,
+        diagnostics=DiagnosticsOut(
+            stochastic_volumes=rc.diagnostics.stochastic_volumes,
+            particle_tracks=rc.diagnostics.particle_tracks,
+            n_tracks=rc.diagnostics.n_tracks,
+        ) if rc.diagnostics is not None else None,
+        apply_dose_conversion=rc.apply_dose_conversion,
+    )
+
+
+def _r2s_settings_out(r2s) -> R2SSettingsOut | None:
+    if r2s is None:
+        return None
+    return R2SSettingsOut(
+        neutron_leg_source=_source_out(r2s.neutron_leg_source),
+        neutron_leg_mc=_mc_out(r2s.neutron_leg_mc),
+        activation=ActivationSettingsOut(
+            irradiation_schedule=IrradiationScheduleOut(
+                power_W=r2s.activation.irradiation_schedule.power_W,
+                timesteps=list(r2s.activation.irradiation_schedule.timesteps),
+            ),
+            cooling_times=list(r2s.activation.cooling_times),
+            decay_library=r2s.activation.decay_library,
+        ),
+        photon_leg_mc=_mc_out(r2s.photon_leg_mc),
+        photon_leg_vr=VrSettingsOut(
+            weight_windows_enabled=r2s.photon_leg_vr.weight_windows_enabled,
+        ),
+    )
+
+
+def _r2s_results_config_out(rc) -> R2SResultsConfigOut | None:
+    if rc is None:
+        return None
+    return R2SResultsConfigOut(
+        neutron_leg=_results_config_out(rc.neutron_leg),
+        photon_leg=_results_config_out(rc.photon_leg),
+    )
+
+
 def _to_detail(job: SimulationJob) -> JobDetail:
+    is_r2s = job.run_mode == RunMode.R2S
+
     return JobDetail(
         id=job.id,
         status=job.effective_status().value,
@@ -443,6 +566,15 @@ def _to_detail(job: SimulationJob) -> JobDetail:
         working_dir=str(job.working_dir) if job.working_dir else None,
         sweep_id=job.sweep_id,
         steps=[s.to_dict() for s in job.steps],
+        # --- submission config — see block comment above _mc_out() ---
+        run_mode=_enum_value(job.run_mode),
+        material_ids=[m.id for m in job.materials],
+        monte_carlo=_mc_out(job.monte_carlo),
+        source=_source_out(job.source),
+        depletion=_depletion_out(job.mode_specific) if job.run_mode == RunMode.DEPLETION else None,
+        results_config=None if is_r2s else _results_config_out(job.results_config),
+        r2s=_r2s_settings_out(job.mode_specific) if is_r2s else None,
+        r2s_results_config=_r2s_results_config_out(job.results_config) if is_r2s else None,
     )
 
 

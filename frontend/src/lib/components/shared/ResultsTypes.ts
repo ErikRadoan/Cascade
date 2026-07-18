@@ -22,12 +22,6 @@ export interface ImportSummaryResponse {
   } | Record<string, never>;
   entropy_history: number[];
   keff_history: number[];
-  neutron_balance: {
-    leakage: number;
-    absorption: number;
-    fission: number;
-    nu_fission: number;
-  };
   timing: Record<string, number>;
 }
 

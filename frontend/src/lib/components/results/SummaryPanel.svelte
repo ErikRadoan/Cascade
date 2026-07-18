@@ -81,12 +81,6 @@
     return Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(3);
   }
 
-  // ---- Neutron balance bar -------------------------------------------------
-  const balanceEntries = $derived(
-    Object.entries(summary.neutron_balance).filter(([, v]) => Number.isFinite(v)),
-  );
-  const balanceMax = $derived(Math.max(1e-12, ...balanceEntries.map(([, v]) => v)));
-
   const timingEntries = $derived(Object.entries(summary.timing ?? {}));
 </script>
 
@@ -147,21 +141,6 @@
   {:else}
     <div class="card note">Fixed-source run — no k-effective / convergence data.</div>
   {/if}
-
-  <div class="card">
-    <div class="card-title">Neutron balance</div>
-    <div class="balance-bars">
-      {#each balanceEntries as [label, value]}
-        <div class="balance-row">
-          <span class="balance-label">{label}</span>
-          <div class="balance-track">
-            <div class="balance-fill" style="width: {(value / balanceMax) * 100}%"></div>
-          </div>
-          <span class="balance-value">{value.toPrecision(4)}</span>
-        </div>
-      {/each}
-    </div>
-  </div>
 
   <div class="card">
     <div class="card-title">Timing</div>
@@ -361,48 +340,6 @@
 
   .swatch.keff { background: var(--color-accent-hi); }
   .swatch.entropy { background: #eab308; }
-
-  .balance-bars {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-
-  .balance-row {
-    display: grid;
-    grid-template-columns: 72px 1fr 72px;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .balance-label {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    color: var(--color-subtext);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .balance-track {
-    height: 8px;
-    background: var(--color-bg-panel);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-
-  .balance-fill {
-    height: 100%;
-    background: var(--color-accent);
-    border-radius: 2px;
-  }
-
-  .balance-value {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    text-align: right;
-    color: var(--color-text);
-  }
 
   .timing-table {
     width: 100%;
