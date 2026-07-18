@@ -1958,3 +1958,75 @@ class OpenMCAdapter:
             "group_structure": group_structure,
             "spectra":         spectra_out,
         }
+
+    # ------------------------------------------------------------------
+    # AdapterProtocol conformance
+    # ------------------------------------------------------------------
+
+    def import_results(
+        self,
+        job_id: str,
+        output_dir: Path,
+        geometry: CascadeGeometry,
+        materials: list[Material],
+        results_config: ResultsConfig | None = None,
+    ) -> dict[str, Any]:
+        """AdapterProtocol entry point — locate, open, and parse a
+        completed run's statepoint into every result section
+        `results_config` asks for.
+
+        This is a convenience aggregator over import_summary/import_tallies/
+        import_mesh/import_spectra for callers that only have a job_id and
+        an output directory (e.g. a generic ExecutionBackend.fetch_results()
+        path) and don't want to know OpenMC's statepoint/tally-id layout.
+        results.py's panel-by-panel endpoints can keep calling the
+        individual import_* methods directly against an already-open
+        statepoint when they only need one section — this method composes
+        those, it doesn't replace them.
+
+        Args:
+            job_id: Job identifier, threaded through into every section.
+            output_dir: Directory to search for the run's statepoint file
+                        (job.output_dir() for single-leg runs).
+            geometry: The job's resolved geometry — import_tallies needs
+                      this to reconstruct tally names (see its docstring).
+            materials: The job's materials — same reason.
+            results_config: What was captured. Defaults to
+                            ResultsConfig.default() (summary + scalars).
+
+        Returns:
+            {
+              "job_id": "...",
+              "summary": {...},             # always present
+              "tallies": {...},             # if results_config.scalars.enabled
+              "mesh": {...},                # if results_config.mesh.enabled
+              "spectra": {...},             # if results_config.spectra.enabled
+            }
+
+        Raises:
+            FileNotFoundError: If no statepoint file exists in output_dir.
+            OSError: If the statepoint file exists but can't be opened.
+        """
+        if results_config is None:
+            results_config = ResultsConfig.default()
+
+        statepoint_path = self.find_statepoint([output_dir])
+        sp = self.open_statepoint(statepoint_path)
+        try:
+            out: dict[str, Any] = {
+                "job_id": job_id,
+                "summary": self.import_summary(job_id, sp),
+            }
+            if results_config.scalars.enabled:
+                out["tallies"] = self.import_tallies(
+                    job_id, sp, geometry, materials, results_config.scalars
+                )
+            if results_config.mesh.enabled:
+                out["mesh"] = self.import_mesh(
+                    job_id, sp, results_config.mesh.mesh_type
+                )
+            if results_config.spectra.enabled:
+                out["spectra"] = self.import_spectra(job_id, sp, results_config)
+            return out
+        finally:
+            sp.close()
