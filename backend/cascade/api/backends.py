@@ -11,15 +11,11 @@ Mount this router on the jobs router or the main app:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 
-from ..repositories.db import get_db
-from ..repositories.profile_repository import ProfileRepository
 from ..domain.backend_profile import BackendProfile
-from ..execution.profile_registry import (
-    ProfileRegistry,
+from ..services.profile_registry_service import (
     ProfileNotFoundError,
     ProfileAlreadyExistsError,
     registry,

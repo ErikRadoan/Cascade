@@ -551,5 +551,5 @@ export const results = {
   spectra: (id: string): Promise<SpectraResultResponse> =>
       request(`/api/results/${encodeURIComponent(id)}/spectra`),
 
-  downloadUrl: (id: string): string => `${BASE}/api/results/${encodeURIComponent(id)}/statepoint/path`,
+  downloadUrl: (id: string): string => `${BASE}/api/results/${encodeURIComponent(id)}/download`,
 };

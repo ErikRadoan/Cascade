@@ -11,6 +11,7 @@ from .api.materials import router as materials_router
 from .api.results import router as results_router
 from .api.backends import router as backends_router
 from .repositories.db import create_tables
+from .api.projects import router as projects_router
 
 app = FastAPI(
     title="Cascade",
@@ -55,6 +56,7 @@ app.include_router(materials_router, prefix="/api")
 app.include_router(jobs_router,      prefix="/api")
 app.include_router(results_router,   prefix="/api")
 app.include_router(backends_router,  prefix="/api")
+app.include_router(projects_router, prefix="/api")
 
 
 # ---------------------------------------------------------------------------

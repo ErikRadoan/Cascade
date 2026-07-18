@@ -8,10 +8,15 @@
   // Everything below the tab bar operates on the ACTIVE project.
 
   import { onMount } from 'svelte';
-  import { projects, activeProject, setGeometryText } from './stores/projects.svelte';
+  import {activeProject, setGeometryText, restoreProjects} from './stores/projects.svelte';
   import GeometryTabBar from './GeometryTabBar.svelte';
   import DockLayout from './dock/DockLayout.svelte';
   import { dock } from './dock/dockStore.svelte.js';
+
+  onMount(() => {
+    restoreProjects();
+  });
+
 
   // Re-run scene load whenever the active tab changes AND that project
   // has never had its scene loaded yet (switching back to an

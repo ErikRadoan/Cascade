@@ -1,11 +1,12 @@
-"""Geometry routes — YAML validation, scene building, geometry CRUD."""
-
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 
 from ..dsl import loader
 from ..dsl import sweep
+from ..repositories.db import get_db
+from ..repositories.geometry_repositroy import GeometryRepository
 from ..services.scene_builder_service import SceneBuilder
 from .schemas import (
     BoundsOut,
@@ -25,57 +26,39 @@ from .schemas import (
 router = APIRouter(prefix="/geometry", tags=["geometry"])
 _scene_builder = SceneBuilder()
 
-# In-memory geometry store — replace with repository when DB is wired up.
-# Maps geometry_id -> {"name": str, "text": str, "geometry": CascadeGeometry}
-_geometry_store: dict[str, dict] = {}
-
+# _geometry_store is GONE — replaced by GeometryRepository (DB-backed).
 
 # ---------------------------------------------------------------------------
-# Scene building — shared by /geometry/scene and /jobs/{job_id}/scene
+# Scene building — UNCHANGED, still shared by /geometry/scene and
+# /jobs/{job_id}/scene. Not shown again here.
 # ---------------------------------------------------------------------------
 
 _EMPTY_BOUNDS = BoundsOut(x_min=0, x_max=1, y_min=0, y_max=1, z_min=0, z_max=1)
 
 
 def build_scene_response(text: str) -> SceneResponse:
-    """Validate + expand YAML geometry text into a SceneResponse.
-
-    Shared by geometry.py's own /scene route and jobs.py's
-    /jobs/{job_id}/scene route, so there is exactly one implementation of
-    "YAML text -> renderable scene" instead of two copies drifting apart.
-    Never raises — validation/expansion/build failures all come back as
-    a SceneResponse with `error` set and empty components, matching the
-    contract Viewport3D already expects (it just renders the error badge).
-    """
+    # ... unchanged, keep exactly as-is ...
     errors = sweep.validate_preview(text)
     if errors:
         return SceneResponse(
-            components=[],
-            material_colors={},
-            bounds=_EMPTY_BOUNDS,
+            components=[], material_colors={}, bounds=_EMPTY_BOUNDS,
             error=errors[0]["message"],
         )
-
     try:
         schemas = sweep.preview_load(text)
         scene = _scene_builder.build(schemas)
     except Exception as e:
         return SceneResponse(
-            components=[],
-            material_colors={},
-            bounds=_EMPTY_BOUNDS,
+            components=[], material_colors={}, bounds=_EMPTY_BOUNDS,
             error=str(e),
         )
-
     components_out = []
     for comp in scene.components:
         layers_out = [
             CylinderLayerOut(
-                r_inner=l.r_inner, r_outer=l.r_outer,
-                height=l.height,   z_base=l.z_base,
-                material_id=l.material_id, color=l.color,
-                opacity=l.opacity, label=l.label,
-                cell_name=l.cell_name,
+                r_inner=l.r_inner, r_outer=l.r_outer, height=l.height, z_base=l.z_base,
+                material_id=l.material_id, color=l.color, opacity=l.opacity,
+                label=l.label, cell_name=l.cell_name,
             )
             for l in comp.layers
         ]
@@ -83,45 +66,29 @@ def build_scene_response(text: str) -> SceneResponse:
         if comp.box:
             b = comp.box
             box_out = WireframeBoxOut(
-                x_size=b.x_size, y_size=b.y_size, z_size=b.z_size,
-                z_base=b.z_base, color=b.color,
-                boundary_type=b.boundary_type,
-                fill_material_id=b.fill_material_id,
-                fill_color=b.fill_color, fill_opacity=b.fill_opacity,
-                cell_name=b.cell_name,
+                x_size=b.x_size, y_size=b.y_size, z_size=b.z_size, z_base=b.z_base,
+                color=b.color, boundary_type=b.boundary_type,
+                fill_material_id=b.fill_material_id, fill_color=b.fill_color,
+                fill_opacity=b.fill_opacity, cell_name=b.cell_name,
             )
         components_out.append(SceneComponentOut(
-            type=comp.type, name=comp.name,
-            position=list(comp.position),
+            type=comp.type, name=comp.name, position=list(comp.position),
             layers=layers_out, box=box_out,
         ))
-
     b = scene.bounds
     return SceneResponse(
         components=components_out,
         material_colors=scene.material_colors,
-        bounds=BoundsOut(
-            x_min=b[0], x_max=b[1],
-            y_min=b[2], y_max=b[3],
-            z_min=b[4], z_max=b[5],
-        ),
+        bounds=BoundsOut(x_min=b[0], x_max=b[1], y_min=b[2], y_max=b[3], z_min=b[4], z_max=b[5]),
     )
 
 
 # ---------------------------------------------------------------------------
-# Validation and scene
+# Validation and scene — UNCHANGED
 # ---------------------------------------------------------------------------
 
 @router.post("/validate", response_model=ValidationResponse)
 async def validate_geometry(body: GeometryTextRequest) -> ValidationResponse:
-    """Validate YAML geometry text without expanding or storing it.
-
-    Returns immediately — no containers, no files. Suitable for calling
-    on every editor keystroke (with debounce on the frontend).
-
-    Returns a list of structured errors with component and field names
-    so the editor can underline the offending lines.
-    """
     raw_errors = sweep.validate_preview(body.text)
     errors = [ValidationError(**e) for e in raw_errors]
     return ValidationResponse(valid=len(errors) == 0, errors=errors)
@@ -129,162 +96,117 @@ async def validate_geometry(body: GeometryTextRequest) -> ValidationResponse:
 
 @router.post("/scene", response_model=SceneResponse)
 async def build_scene(body: SceneRequest) -> SceneResponse:
-    """Build a 3D scene description from YAML geometry text.
-
-    Parses and expands the YAML, then maps each component to
-    Three.js-renderable objects (cylinder layers, wireframe boxes).
-    Returns colors, opacity, and bounds — the frontend renders directly.
-
-    Called when validation passes and the preview needs to update.
-    """
     return build_scene_response(body.text)
 
 
 # ---------------------------------------------------------------------------
-# CRUD — saved geometries
+# CRUD — now DB-backed via GeometryRepository
 # ---------------------------------------------------------------------------
 
+def _compute_counts(text: str) -> tuple[int, int]:
+    """Best-effort surface/cell counts — 0 if the geometry doesn't expand
+    yet (drafts are allowed to be invalid, per this module's original
+    docstring on save_geometry/update_geometry)."""
+    from ..dsl import expander
+    try:
+        schemas = sweep.preview_load(text)
+        geom = expander.expand(schemas)
+        return len(geom.surfaces), len(geom.cells)
+    except Exception:
+        return 0, 0
+
+
 @router.get("/", response_model=list[GeometrySummary])
-async def list_geometries() -> list[GeometrySummary]:
+async def list_geometries(db: Session = Depends(get_db)) -> list[GeometrySummary]:
     """List all saved geometry definitions, most recently created first."""
-    result = [
+    records = GeometryRepository(db).list()
+    return [
         GeometrySummary(
-            id=gid,
-            name=entry["name"],
-            created_at=entry["created_at"],
-            n_surfaces=entry["n_surfaces"],
-            n_cells=entry["n_cells"],
+            id=r.id, name=r.name, created_at=r.created_at,
+            n_surfaces=r.n_surfaces, n_cells=r.n_cells,
         )
-        for gid, entry in _geometry_store.items()
+        for r in records
     ]
-    result.sort(key=lambda g: g.created_at, reverse=True)
-    return result
 
 
 @router.post("/", response_model=GeometrySummary, status_code=201)
-async def save_geometry(body: GeometryTextRequest) -> GeometrySummary:
+async def save_geometry(body: GeometryTextRequest, db: Session = Depends(get_db)) -> GeometrySummary:
     """Save a geometry project's YAML text.
 
-    Unlike the old behaviour, this does NOT require the geometry to be
-    valid or expandable. A geometry project tab in the frontend autosaves
-    on every edit, and the user is typing invalid/incomplete YAML for
-    most of that time — rejecting drafts would make autosave useless.
-
-    Validity is only enforced where it actually matters: job submission
-    (POST /jobs/submit) parses and expands the YAML itself and will
-    reject an invalid geometry there.
-
-    The only requirement here is that the YAML parses as a mapping —
-    i.e. loader.load() doesn't raise a structural LoadError. Pydantic
-    field-validation errors on individual components (e.g. a FuelPin
-    with a missing required field) are fine; n_surfaces/n_cells will
-    just read 0 for those components until they're fixed.
+    Same relaxed-validity rules as before: only rejects text that isn't
+    even parseable as a YAML mapping (loader.LoadError). Field-validation
+    errors on individual components are fine — n_surfaces/n_cells just
+    read 0 until fixed. See _compute_counts().
     """
-    from datetime import datetime, timezone
-    from ..dsl import expander
-    import uuid
-
-    surfaces_count = 0
-    cells_count = 0
-
     try:
-        schemas = sweep.preview_load(body.text)
-        try:
-            geom = expander.expand(schemas)
-            surfaces_count = len(geom.surfaces)
-            cells_count = len(geom.cells)
-        except Exception:
-            # Expansion failed (e.g. references an undefined template,
-            # or a placement is missing) — still a valid SAVE, just
-            # reports 0 surfaces/cells until the user fixes it.
-            pass
+        sweep.preview_load(body.text)
     except loader.LoadError as e:
-        # Only reject truly malformed YAML (not a mapping, bad syntax)
         raise HTTPException(status_code=422, detail=str(e))
+    except Exception:
+        pass  # non-structural error — still a valid save, counts will be 0
 
-    gid = str(uuid.uuid4())
-    created = datetime.now(timezone.utc)
-    _geometry_store[gid] = {
-        "name":       body.name or f"geometry_{gid[:8]}",
-        "text":       body.text,
-        "n_surfaces": surfaces_count,
-        "n_cells":    cells_count,
-        "created_at": created,
-    }
+    n_surfaces, n_cells = _compute_counts(body.text)
+
+    repo = GeometryRepository(db)
+    record = repo.create(
+        name=body.name or "",  # placeholder, fixed below once we have the id
+        text=body.text,
+        n_surfaces=n_surfaces,
+        n_cells=n_cells,
+    )
+    if not body.name:
+        record = repo.update(record.id, text=body.text, name=f"geometry_{record.id[:8]}",
+                              n_surfaces=n_surfaces, n_cells=n_cells)
 
     return GeometrySummary(
-        id=gid,
-        name=_geometry_store[gid]["name"],
-        created_at=created,
-        n_surfaces=surfaces_count,
-        n_cells=cells_count,
+        id=record.id, name=record.name, created_at=record.created_at,
+        n_surfaces=record.n_surfaces, n_cells=record.n_cells,
     )
 
 
 @router.put("/{geometry_id}", response_model=GeometrySummary)
-async def update_geometry(geometry_id: str, body: GeometryTextRequest) -> GeometrySummary:
-    """Update an existing geometry project's text (autosave target).
-
-    Same relaxed-validity rules as save_geometry — drafts save freely.
-    """
-    from datetime import datetime, timezone
-    from ..dsl import expander
-
-    entry = _geometry_store.get(geometry_id)
-    if entry is None:
-        raise HTTPException(status_code=404, detail=f"Geometry '{geometry_id}' not found.")
-
-    surfaces_count = 0
-    cells_count = 0
-
+async def update_geometry(geometry_id: str, body: GeometryTextRequest, db: Session = Depends(get_db)) -> GeometrySummary:
+    """Update an existing geometry project's text (autosave target)."""
     try:
-        schemas = sweep.preview_load(body.text)
-        try:
-            geom = expander.expand(schemas)
-            surfaces_count = len(geom.surfaces)
-            cells_count = len(geom.cells)
-        except Exception:
-            pass
+        sweep.preview_load(body.text)
     except loader.LoadError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    except Exception:
+        pass
 
-    entry["text"]       = body.text
-    entry["n_surfaces"] = surfaces_count
-    entry["n_cells"]    = cells_count
-    if body.name:
-        entry["name"] = body.name
+    n_surfaces, n_cells = _compute_counts(body.text)
+
+    record = GeometryRepository(db).update(
+        geometry_id, text=body.text, name=body.name,
+        n_surfaces=n_surfaces, n_cells=n_cells,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Geometry '{geometry_id}' not found.")
 
     return GeometrySummary(
-        id=geometry_id,
-        name=entry["name"],
-        created_at=entry["created_at"],
-        n_surfaces=surfaces_count,
-        n_cells=cells_count,
+        id=record.id, name=record.name, created_at=record.created_at,
+        n_surfaces=record.n_surfaces, n_cells=record.n_cells,
     )
 
 
 @router.get("/{geometry_id}", response_model=GeometryDetail)
-async def get_geometry(geometry_id: str) -> GeometryDetail:
+async def get_geometry(geometry_id: str, db: Session = Depends(get_db)) -> GeometryDetail:
     """Retrieve a saved geometry by ID."""
-    entry = _geometry_store.get(geometry_id)
-    if entry is None:
+    record = GeometryRepository(db).get(geometry_id)
+    if record is None:
         raise HTTPException(status_code=404, detail=f"Geometry '{geometry_id}' not found.")
 
     return GeometryDetail(
-        id=geometry_id,
-        name=entry["name"],
-        created_at=entry["created_at"],
-        n_surfaces=entry["n_surfaces"],
-        n_cells=entry["n_cells"],
-        yaml_text=entry["text"],
-        param_values={},
+        id=record.id, name=record.name, created_at=record.created_at,
+        n_surfaces=record.n_surfaces, n_cells=record.n_cells,
+        yaml_text=record.text, param_values={},
     )
 
 
 @router.delete("/{geometry_id}", response_model=DeletedResponse)
-async def delete_geometry(geometry_id: str) -> DeletedResponse:
+async def delete_geometry(geometry_id: str, db: Session = Depends(get_db)) -> DeletedResponse:
     """Delete a saved geometry by ID."""
-    if geometry_id not in _geometry_store:
+    deleted = GeometryRepository(db).delete(geometry_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail=f"Geometry '{geometry_id}' not found.")
-    del _geometry_store[geometry_id]
     return DeletedResponse(id=geometry_id)

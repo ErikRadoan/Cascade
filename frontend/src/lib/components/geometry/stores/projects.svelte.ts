@@ -97,6 +97,49 @@ export function activeProject(): GeometryProject {
   return found ?? projects.list[0];
 }
 
+/**
+ * Restore previously saved geometries as open tabs on app startup.
+ * Called once from GeometryEditor's onMount. If there are no saved
+ * geometries yet (fresh install), falls back to the default blank tab
+ * already seeded by the module-level `projects` state above.
+ */
+export async function restoreProjects(): Promise<void> {
+  let saved: { id: string; name: string; created_at: string }[];
+  try {
+    saved = await api.geometry.list();
+  } catch {
+    return; // network error — keep the default blank tab, don't crash startup
+  }
+
+  if (saved.length === 0) return; // nothing persisted yet — keep the default tab
+
+  // Load full text for each saved geometry and replace the default
+  // placeholder tab with real ones, most recently created first.
+  const loaded: GeometryProject[] = [];
+  for (const g of saved) {
+    try {
+      const detail = await api.geometry.get(g.id);
+      loaded.push(makeProject({
+        id:      detail.id,
+        name:    detail.name,
+        text:    detail.yaml_text ?? DEFAULT_TEXT,
+        isSaved: true,
+      }));
+    } catch {
+      // skip any geometry that fails to load individually
+    }
+  }
+
+  if (loaded.length === 0) return;
+
+  projects.list = loaded;
+  projects.activeId = loaded[0].id;
+
+  // Validate + build scene for whichever tab ends up active, same as
+  // newProject()/openExistingProject() already do.
+  setGeometryText(activeProject().text, { immediate: true });
+}
+
 // ---------------------------------------------------------------------------
 // Validation / scene refresh — operates on a specific project, not a
 // global singleton. Debounce timer is per-project so editing two tabs

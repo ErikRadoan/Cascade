@@ -9,6 +9,7 @@
     closeProject,
     renameProject,
     openExistingProject,
+    deleteProjectPermanently,
   } from './stores/projects.svelte';
   import * as api from '$lib/api';
 
@@ -59,6 +60,20 @@
 
   function closeOpenMenu() {
     showOpenMenu = false;
+  }
+
+  let deletingId = $state<string | null>(null);
+
+  async function onDeleteExisting(e: MouseEvent, id: string, name: string) {
+    e.stopPropagation(); // don't trigger pickExisting
+    if (!confirm(`Delete geometry "${name}"? This cannot be undone.`)) return;
+    deletingId = id;
+    try {
+      await deleteProjectPermanently(id);
+      existingGeometries = existingGeometries.filter(g => g.id !== id);
+    } finally {
+      deletingId = null;
+    }
   }
 </script>
 
@@ -136,10 +151,23 @@
         <div class="open-menu-empty">No saved geometries yet.</div>
       {:else}
         {#each existingGeometries as g}
-          <button class="open-menu-item" onclick={() => pickExisting(g.id)}>
-            <span class="open-menu-item-mark"></span>
-            {g.name}
-          </button>
+          <div class="open-menu-row">
+            <button class="open-menu-item" onclick={() => pickExisting(g.id)}>
+              <span class="open-menu-item-mark"></span>
+              {g.name}
+            </button>
+            <button
+              class="open-menu-delete"
+              title="Delete geometry"
+              aria-label="Delete geometry"
+              disabled={deletingId === g.id}
+              onclick={(e) => onDeleteExisting(e, g.id, g.name)}
+            >
+              <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.3">
+                <path d="M2 3.5h8M4.5 3.5V2.2h3v1.3M4.8 5.5v3.4M7.2 5.5v3.4M3 3.5l.6 5.8h4.8l.6-5.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
         {/each}
       {/if}
     </div>
@@ -354,4 +382,23 @@
     outline: 1px solid var(--color-accent);
     outline-offset: -1px;
   }
+
+.open-menu-row {
+  display: flex;
+  align-items: center;
+}
+.open-menu-row .open-menu-item { flex: 1; }
+
+.open-menu-delete {
+  width: 22px; height: 22px;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-subtext);
+  border-radius: 3px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.open-menu-delete:hover { color: #f87171; background: var(--color-bg-raised); }
+.open-menu-delete:disabled { opacity: 0.4; cursor: default; }
 </style>

@@ -37,6 +37,7 @@ from typing import Any
 import h5py
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from starlette.responses import FileResponse
 
 from ..adapters.openmc_adapter import OpenMCAdapter
 from ..repositories.db import get_db
@@ -243,3 +244,24 @@ async def get_statepoint_path(
     sp_path, sp = _open_statepoint(job)
     sp.close()
     return {"job_id": job_id, "path": str(sp_path)}
+
+
+# ---------------------------------------------------------------------------
+# /download
+# ---------------------------------------------------------------------------
+
+@router.get("/{job_id}/download")
+async def download_statepoint(
+    job_id: str,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    """Stream the job's final statepoint HDF5 file as a binary download."""
+    job = _get_job_or_404(job_id, db)
+    _require_completed(job)
+    sp_path, sp = _open_statepoint(job)
+    sp.close()  # we only needed it to resolve/validate the path
+    return FileResponse(
+        path=sp_path,
+        media_type="application/x-hdf5",
+        filename=sp_path.name,
+    )

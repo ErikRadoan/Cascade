@@ -1,6 +1,6 @@
 """Backend profile repository — persists named backend profiles to the database.
 
-Replaces the in-memory dict in execution/profile_registry.py.
+Replaces the in-memory dict in execution/profile_registry_service.py.
 The ProfileRegistry class is updated to use this instead of self._profiles.
 
 Usage:

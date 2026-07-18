@@ -165,32 +165,6 @@ class MaterialImportResponse(BaseModel):
 # Jobs
 # ---------------------------------------------------------------------------
 
-class JobSubmitRequest(BaseModel):
-    """Submit a single simulation job."""
-    geometry_text: str = Field(..., description="YAML geometry definition.")
-    material_ids:  list[str] = Field(
-        ...,
-        description="Material IDs to include. Must exist in the material library.",
-    )
-    backend:       str  = Field("docker", description="Execution backend.")
-    particles:     int  = Field(1000,  gt=0)
-    inactive:      int  = Field(20,    gt=0)
-    batches:       int  = Field(100,   gt=0)
-    seed:          int  = Field(1)
-    notes:         str | None = None
-
-
-class SweepSubmitRequest(BaseModel):
-    """Submit a parametric sweep — one job per parameter combination."""
-    geometry_text: str
-    material_ids:  list[str]
-    backend:       str  = "docker"
-    particles:     int  = Field(1000, gt=0)
-    inactive:      int  = Field(20,   gt=0)
-    batches:       int  = Field(100,  gt=0)
-    seed:          int  = 1
-    notes:         str | None = None
-
 
 class JobSummary(BaseModel):
     id:           str
@@ -213,28 +187,3 @@ class SweepResponse(BaseModel):
     sweep_id: str
     jobs:     list[JobSummary]
     total:    int
-
-
-# ---------------------------------------------------------------------------
-# Results
-# ---------------------------------------------------------------------------
-
-class TallyResultOut(BaseModel):
-    job_id:      str
-    tally:       str
-    value:       float
-    uncertainty: float
-    units:       str | None = None
-
-
-class TallyResultSet(BaseModel):
-    job_id:       str
-    param_values: dict[str, float]
-    tallies:      list[TallyResultOut]
-    k_effective:  float | None = None
-    k_uncertainty: float | None = None
-
-
-class SweepResultsResponse(BaseModel):
-    sweep_id: str
-    points:   list[TallyResultSet]

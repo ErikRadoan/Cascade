@@ -24,6 +24,31 @@ from sqlalchemy.types import JSON
 
 from .db import Base
 
+# ---------------------------------------------------------------------------
+# Geometry
+# ---------------------------------------------------------------------------
+
+class GeometryRow(Base):
+    """Persisted geometry project — the YAML text plus derived summary stats.
+
+    Mirrors what api/geometry.py's in-memory `_geometry_store` dict used to
+    hold. `text` is stored even when it doesn't parse/expand — the autosave
+    contract in save_geometry()/update_geometry() explicitly allows drafts
+    (see that module's docstrings), so this column must accept anything.
+    """
+
+    __tablename__ = "geometries"
+
+    id:         Mapped[str]      = mapped_column(String, primary_key=True)
+    name:       Mapped[str]      = mapped_column(String, nullable=False)
+    text:       Mapped[str]      = mapped_column(Text,   nullable=False)
+    n_surfaces: Mapped[int]      = mapped_column(Integer, nullable=False, default=0)
+    n_cells:    Mapped[int]      = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
 
 # ---------------------------------------------------------------------------
 # Jobs
