@@ -12,10 +12,10 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
-from ..repositories.db import SessionLocal, get_db
+from ..repositories.db import get_db
 from ..repositories.job_repository import JobRepository
 from ..repositories.sweep_repository import SweepRepository
-from ..adapters.openmc_adapter import OpenMCRunSettings
+from ..domain.geometry import region_to_json
 from ..domain.job import JobStatus, SimulationJob
 from ..domain.results_config import (
     DiagnosticsConfig,
@@ -1023,6 +1023,40 @@ async def get_job_scene(
 
     return build_scene_response(job.geometry_text)
 
+@router.get("/{job_id}/csg")
+async def get_job_csg(job_id: str, db: Session = Depends(get_db)) -> dict:
+    """Return the fully-expanded CSG geometry (surfaces + cells + region
+    trees) for a job — structured JSON, not XML — so the frontend can
+    rasterize material-colored slices itself without invoking OpenMC.
+
+    This is the exact same CascadeGeometry OpenMCAdapter.export_geometry()
+    serializes to geometry.xml (job.geometry, already-expanded — not the
+    mid-level component schemas /scene works from). Unlike /scene, this
+    is agnostic to component type — it's raw surfaces/cells, so it works
+    for any geometry the expander can produce, present or future.
+    """
+    job = _get_job_or_404(job_id, db)
+    geom = job.geometry
+    return {
+        "surfaces": [
+            {
+                "id": s.id,
+                "type": s.type_.value,
+                "params": s.params,
+                "boundary_type": s.boundary_type.value,
+            }
+            for s in geom.surfaces
+        ],
+        "cells": [
+            {
+                "id": c.id,
+                "material_id": c.material_id,
+                "name": c.name,
+                "region": region_to_json(c.region),
+            }
+            for c in geom.cells
+        ],
+    }
 
 @router.post("/{job_id}/cancel", response_model=JobSummary)
 async def cancel_job(

@@ -11,16 +11,10 @@
 // silently trust a shape the backend doesn't actually guarantee.
 
 import type {
-  JobDetail,
-  JobSummary,
-  MaterialDetail,
-  MaterialSummary,
-  SceneResponse,
-  SweepResponse,
-  SweepResultsResponse,
-  TallyResultSet,
-  ValidationResponse,
+  JobDetail, JobSummary, MaterialDetail, MaterialSummary, SceneResponse,
+  SweepResponse, SweepResultsResponse, TallyResultSet, ValidationResponse,
   BackendProfile, ProfileCreatePayload, ProfileUpdatePayload,
+  CsgGeometry,
 } from '$lib/types';
 
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
@@ -291,6 +285,9 @@ export const jobs = {
   // should treat that as "no preview available", not an error to surface.
   scene: (id: string): Promise<SceneResponse> =>
       request(`/api/jobs/${encodeURIComponent(id)}/scene`),
+
+  csg: (id: string): Promise<CsgGeometry> =>
+    request(`/api/jobs/${encodeURIComponent(id)}/csg`),
 };
 
 // ---------------------------------------------------------------------------

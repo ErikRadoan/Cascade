@@ -329,8 +329,8 @@ def _region_from_str(region_str: str):
 
     if s.startswith("(") and s.endswith(")"):
         inner = s[1:-1]
-        if " | " in inner:
-            parts = inner.split(" | ")
+        if " : " in inner:
+            parts = inner.split(" : ")
             return Union([_region_from_str(p) for p in parts])
         else:
             parts = inner.split()

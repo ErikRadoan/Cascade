@@ -345,3 +345,38 @@ export interface SelectedItem {
   kind: 'template' | 'placement';
   name: string;
 }
+
+// ---------------------------------------------------------------------------
+// CSG geometry (for client-side geometry-plot rasterization)
+// ---------------------------------------------------------------------------
+
+export type CsgSurfaceType =
+  | 'plane_x' | 'plane_y' | 'plane_z'
+  | 'cylinder_x' | 'cylinder_y' | 'cylinder_z'
+  | 'sphere' | 'cone_z' | 'torus';
+
+export interface CsgSurface {
+  id: string;
+  type: CsgSurfaceType;
+  params: Record<string, number>;
+  boundary_type: string;
+}
+
+export type RegionNode =
+  | { op: 'inside'; surface: string }
+  | { op: 'outside'; surface: string }
+  | { op: 'and'; items: RegionNode[] }
+  | { op: 'or'; items: RegionNode[] }
+  | { op: 'not'; item: RegionNode };
+
+export interface CsgCell {
+  id: string;
+  material_id: string | null;
+  name: string | null;
+  region: RegionNode;
+}
+
+export interface CsgGeometry {
+  surfaces: CsgSurface[];
+  cells: CsgCell[];
+}

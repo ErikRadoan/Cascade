@@ -25,6 +25,26 @@ class BoundaryType(StrEnum):
     REFLECTIVE = "reflective"  # particles bounce back
     PERIODIC   = "periodic"    # used for lattice symmetry
 
+def region_to_json(region: Region) -> dict:
+    """Serialize a Region tree to nested JSON, for client-side point
+    classification (geometry-plot rasterization) — the structured
+    counterpart to Region.__repr__()'s flattened string, which Cell.to_dict()
+    already uses for DB persistence. Kept separate from to_dict() so nothing
+    about existing storage/parsing (job_repository.py's _region_from_str)
+    has to change.
+    """
+    if isinstance(region, Inside):
+        return {"op": "inside", "surface": region.surface_id}
+    if isinstance(region, Outside):
+        return {"op": "outside", "surface": region.surface_id}
+    if isinstance(region, Intersection):
+        return {"op": "and", "items": [region_to_json(r) for r in region.regions]}
+    if isinstance(region, Union):
+        return {"op": "or", "items": [region_to_json(r) for r in region.regions]}
+    if isinstance(region, Complement):
+        return {"op": "not", "item": region_to_json(region.region)}
+    raise TypeError(f"Unknown Region type: {type(region).__name__}")
+
 class Region(ABC):
     """Base class for CSG region expressions."""
 

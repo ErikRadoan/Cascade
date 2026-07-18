@@ -11,14 +11,17 @@
   import ScalarsPanel from './ScalarPanel.svelte';
   import type { ImportSummaryResponse, ImportTalliesResponse } from '../shared/ResultsTypes';
   import type { SceneResponse } from '$lib/types';
+  import MeshPanel from './MeshPanel.svelte';
+  import GeometryPlotPanel from './GeometryPlotPanel.svelte';
 
   let { jobId }: { jobId: string } = $props();
 
-  type TabId = 'scalars' | 'mesh' | 'spectra' | 'depletion';
+  type TabId = 'scalars' | 'mesh' | 'spectra' | 'depletion' | 'geometry';
   const tabs: { id: TabId; label: string }[] = [
     { id: 'scalars', label: 'Scalars' },
     { id: 'mesh', label: 'Mesh' },
     { id: 'spectra', label: 'Spectra' },
+    { id: 'geometry', label: 'Geometry Plot' },
     { id: 'depletion', label: 'Depletion / R2S' },
   ];
 
@@ -100,11 +103,13 @@
             <div class="stub">No scalar tally data available for this job.</div>
           {/if}
         {:else if activeTab === 'mesh'}
-          <div class="stub">Panel C — Mesh tally (slice / volumetric / profile) — not yet built.</div>
+          <MeshPanel {jobId} />
         {:else if activeTab === 'spectra'}
           <div class="stub">Panel D — Energy spectra (log-log step plot / table) — not yet built.</div>
         {:else if activeTab === 'depletion'}
           <div class="stub">Depletion / R2S results — blocked on backend schema (spec §2.5). Not yet available.</div>
+        {:else if activeTab === 'geometry'}
+          <GeometryPlotPanel {jobId} />
         {/if}
       </div>
     </section>
