@@ -3,6 +3,8 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from ..dsl import expander
+from ..services.csg_export_service import geometry_to_csg_dict
 from ..dsl import loader
 from ..dsl import sweep
 from ..repositories.db import get_db
@@ -210,3 +212,23 @@ async def delete_geometry(geometry_id: str, db: Session = Depends(get_db)) -> De
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Geometry '{geometry_id}' not found.")
     return DeletedResponse(id=geometry_id)
+
+@router.post("/csg")
+async def build_csg(body: SceneRequest) -> dict:
+    """Fully-expanded CSG (surfaces + cells + region trees) for live editor
+    text — the general-purpose counterpart to /scene's template-aware
+    SceneBuilder output. Renders arbitrary surfaces/regions, including
+    future Union/Subtraction component types, unlike /scene which only
+    knows FuelPin/Box.
+
+    Mirrors GET /jobs/{job_id}/csg for a job that hasn't been submitted yet.
+    """
+    errors = sweep.validate_preview(body.text)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors[0]["message"])
+    try:
+        schemas = sweep.preview_load(body.text)
+        geometry = expander.expand(schemas)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return geometry_to_csg_dict(geometry)

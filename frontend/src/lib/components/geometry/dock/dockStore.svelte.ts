@@ -43,7 +43,7 @@ function defaultLayout(): DockNode {
     'row',
     [
       split('column', [leaf('objects'), leaf('templates')], [0.5, 0.5]),
-      leaf('viewport'),
+      leaf('viewport', 'csgViewport'),
       leaf('parameters'),
     ],
     [0.22, 0.56, 0.22],

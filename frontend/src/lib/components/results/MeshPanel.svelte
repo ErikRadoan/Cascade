@@ -29,7 +29,7 @@
     notRequested = false;
     mesh = null;
     try {
-      mesh = await api.results.mesh(id);
+      mesh = (await api.results.mesh(id)) as unknown as ImportMeshResponse;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       // Backend 404s with "not requested" when results_config.mesh.enabled

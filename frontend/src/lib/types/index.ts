@@ -380,3 +380,15 @@ export interface CsgGeometry {
   surfaces: CsgSurface[];
   cells: CsgCell[];
 }
+
+export interface RasterLegendEntry {
+  cell_name: string | null;
+  material_id: string | null;
+}
+
+export interface RasterResponse {
+  width: number;
+  height: number;
+  cell_index: number[]; // flattened row-major, -1 = void
+  legend: RasterLegendEntry[];
+}

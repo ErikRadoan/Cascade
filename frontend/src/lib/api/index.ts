@@ -11,10 +11,10 @@
 // silently trust a shape the backend doesn't actually guarantee.
 
 import type {
-  JobDetail, JobSummary, MaterialDetail, MaterialSummary, SceneResponse,
-  SweepResponse, SweepResultsResponse, TallyResultSet, ValidationResponse,
-  BackendProfile, ProfileCreatePayload, ProfileUpdatePayload,
-  CsgGeometry,
+    JobDetail, JobSummary, MaterialDetail, MaterialSummary, SceneResponse,
+    SweepResponse, SweepResultsResponse, TallyResultSet, ValidationResponse,
+    BackendProfile, ProfileCreatePayload, ProfileUpdatePayload,
+    CsgGeometry, RasterResponse,
 } from '$lib/types';
 
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
@@ -141,6 +141,12 @@ export const geometry = {
   // not this file.
   delete: (id: string): Promise<{ deleted: boolean; id: string }> =>
     request(`/api/geometry/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  csg: (text: string): Promise<CsgGeometry> =>
+    request('/api/geometry/csg', {
+    method: 'POST',
+    body: JSON.stringify({ text }),
+    }),
 };
 
 // ---------------------------------------------------------------------------
@@ -288,6 +294,23 @@ export const jobs = {
 
   csg: (id: string): Promise<CsgGeometry> =>
     request(`/api/jobs/${encodeURIComponent(id)}/csg`),
+
+  raster: (id: string, params: {
+  axis: 'x' | 'y' | 'z';
+  coord: number;
+  h_min: number; h_max: number;
+  v_min: number; v_max: number;
+  resolution?: number;
+}): Promise<RasterResponse> => {
+  const q = new URLSearchParams({
+    axis: params.axis,
+    coord: String(params.coord),
+    h_min: String(params.h_min), h_max: String(params.h_max),
+    v_min: String(params.v_min), v_max: String(params.v_max),
+  });
+  if (params.resolution != null) q.set('resolution', String(params.resolution));
+  return request(`/api/jobs/${encodeURIComponent(id)}/raster?${q}`);
+},
 };
 
 // ---------------------------------------------------------------------------

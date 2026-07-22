@@ -9,6 +9,7 @@ import ObjectPanel from './ObjectPanel.svelte';
 import TemplatePanel from './TemplatePanel.svelte';
 import ParametersPanel from './ParametersPanel.svelte';
 import ViewportPanel from './ViewportPanel.svelte';
+import CsgViewportPanel from "$lib/components/geometry/panels/CsgViewportPanel.svelte";
 
 export interface PanelDef {
   title: string;
@@ -19,5 +20,6 @@ export const PANEL_REGISTRY: Record<string, PanelDef> = {
   objects: { title: 'Objects', component: ObjectPanel },
   templates: { title: 'Templates', component: TemplatePanel },
   viewport: { title: 'Viewport', component: ViewportPanel },
+  csgViewport: { title: 'CSG Viewport', component: CsgViewportPanel },
   parameters: { title: 'Parameters', component: ParametersPanel },
 };

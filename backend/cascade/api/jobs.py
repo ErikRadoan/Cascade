@@ -8,10 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, Query
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session
 
+from ..services.csg_export_service import geometry_to_csg_dict
 from ..repositories.db import get_db
 from ..repositories.job_repository import JobRepository
 from ..repositories.sweep_repository import SweepRepository
@@ -1180,3 +1181,40 @@ def _read_stepped_stdout(job: SimulationJob) -> dict:
     if not chunks:
         return {"lines": "", "available": False}
     return {"lines": "\n\n".join(chunks), "available": True}
+
+@router.get("/{job_id}/raster")
+async def get_job_raster(
+    job_id: str,
+    axis: Literal["x", "y", "z"],
+    coord: float,
+    h_min: float,
+    h_max: float,
+    v_min: float,
+    v_max: float,
+    resolution: int = Query(250, ge=16, le=800),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Rasterize one slice of a job's geometry, server-side.
+
+    Supersedes the client-side CSG rasterization GeometryPlotPanel.svelte
+    used to do against GET /csg — see geometry_raster_service.py's
+    docstring for why this is dramatically faster (numpy-vectorized over
+    the whole pixel grid vs. a per-pixel JS loop). `legend[i].cell_name`
+    is the same join key /results/{job_id}/tallies and ResultsViewport3D
+    use, so the frontend can recolor by tally score with no extra call.
+    """
+    job = _get_job_or_404(job_id, db)
+    from ..services.geometry_raster_service import rasterize_slice
+    try:
+        return rasterize_slice(
+            job.geometry, axis=axis, coord=coord,
+            h_range=(h_min, h_max), v_range=(v_min, v_max),
+            resolution=resolution,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+@router.get("/{job_id}/csg")
+async def get_job_csg(job_id: str, db: Session = Depends(get_db)) -> dict:
+    job = _get_job_or_404(job_id, db)
+    return geometry_to_csg_dict(job.geometry)
