@@ -10,12 +10,17 @@ from .schema.box import BoxSchema
 from .schema.fuel_pin import FuelPinSchema
 from .schema.lattice import HexLatticeSchema, SquareLatticeSchema
 from .schema.single_placement import SinglePlacementSchema
-
+from .schema.sphere import SphereSchema
+from .schema.boolean import UnionSchema, SubtractionSchema, IntersectionSchema
 
 SCHEMA_MAP: dict[str, type[BaseComponentSchema]] = {
     # Templates
     "FuelPin":         FuelPinSchema,
     "Box":             BoxSchema,
+    "Sphere":          SphereSchema,
+    "Union":           UnionSchema,
+    "Subtraction":     SubtractionSchema,
+    "Intersection":    IntersectionSchema,
     # Placements
     "SinglePlacement": SinglePlacementSchema,
     "SquareLattice":   SquareLatticeSchema,

@@ -9,7 +9,11 @@
 
 export type FieldOptions = string[] | ((doc: Record<string, { type?: string }>) => string[]);
 
-const BOUNDARY_TYPES = ['reflective', 'vacuum', 'periodic'];
+// 'none' included alongside the backend's BoundaryType enum (see
+// domain/geometry.py) — Sphere defaults to it (an ordinary interior
+// shape has no boundary condition of its own), and it's a legitimate
+// choice for Box too, so it's shared rather than duplicated per type.
+const BOUNDARY_TYPES = ['reflective', 'vacuum', 'periodic', 'none'];
 const HEX_ORIENTATIONS = ['pointy_top', 'flat_top'];
 
 // Common material IDs pre-seeded on the backend (api/materials.py).
@@ -36,10 +40,30 @@ export const FIELD_OPTIONS: Record<string, FieldOptions> = {
   'FuelPin.pellet_material':   KNOWN_MATERIALS,
   'FuelPin.gap_material':      KNOWN_MATERIALS,
   'FuelPin.clad_material':     KNOWN_MATERIALS,
+  'Sphere.material':           KNOWN_MATERIALS,
+  'Sphere.boundary_type':      BOUNDARY_TYPES,
   'SinglePlacement.template':  templateOptions,
   'SquareLattice.template':    templateOptions,
   'HexLattice.template':       templateOptions,
   'HexLattice.orientation':    HEX_ORIENTATIONS,
+  // Union/Subtraction/Intersection's `a`/`b` reference any OTHER template
+  // by name (dsl/schema/boolean.py) — reuses the same templateOptions
+  // resolver SinglePlacement/lattices use for their `template` field.
+  // This deliberately does NOT filter out FuelPin here even though the
+  // backend rejects it as an operand (expander.py's
+  // _expand_shape_at_origin raises a clear TypeError) — the dropdown
+  // stays a simple "pick any template" list, same as everywhere else in
+  // this file, and the backend's validation error is what surfaces the
+  // FuelPin-specific constraint to the user.
+  'Union.a':                   templateOptions,
+  'Union.b':                   templateOptions,
+  'Union.material':            KNOWN_MATERIALS,
+  'Subtraction.a':             templateOptions,
+  'Subtraction.b':             templateOptions,
+  'Subtraction.material':      KNOWN_MATERIALS,
+  'Intersection.a':            templateOptions,
+  'Intersection.b':            templateOptions,
+  'Intersection.material':     KNOWN_MATERIALS,
 };
 
 /** Resolve the dropdown options for a field, or null if it should stay a free input. */

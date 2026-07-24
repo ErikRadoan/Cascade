@@ -36,7 +36,8 @@ from .schema.box import BoxSchema
 from .schema.fuel_pin import FuelPinSchema
 from .schema.lattice import HexLatticeSchema, SquareLatticeSchema
 from .schema.single_placement import SinglePlacementSchema
-
+from .schema.sphere import SphereSchema
+from .schema.boolean import UnionSchema, SubtractionSchema, IntersectionSchema
 
 # ---------------------------------------------------------------------------
 # Context
@@ -45,8 +46,17 @@ from .schema.single_placement import SinglePlacementSchema
 @dataclass
 class Context:
     param_values:       dict[str, float]       = field(default_factory=dict)
-    outermost_surfaces: list[str]              = field(default_factory=list)
-    # Axial bounds from the placed Box — shared by all pin placements
+    # Regions already claimed by placed inner objects — the Box's fill
+    # cell excludes Complement() of each of these, so any object placed
+    # inside the boundary correctly carves a hole out of the fill
+    # material regardless of the object's shape (a single convex radius,
+    # as with FuelPin, or an arbitrary CSG union/subtraction/intersection
+    # tree). Replaces the old `outermost_surfaces: list[str]` field, which
+    # only worked because every placeable shape used to be a single
+    # cylinder's Outside(id) — that assumption breaks for a non-convex
+    # boolean shape, where "outside the shape" isn't expressible as one
+    # surface's positive halfspace.
+    excluded_regions:   list[Region]            = field(default_factory=list)
     axial_bot_id:       str | None             = field(default=None)
     axial_top_id:       str | None             = field(default=None)
     _counter:           int                    = field(default=0, init=False, repr=False)
@@ -57,7 +67,6 @@ class Context:
 
     def has_axial_bounds(self) -> bool:
         return self.axial_bot_id is not None and self.axial_top_id is not None
-
 
 # ---------------------------------------------------------------------------
 # Translation helpers
@@ -242,6 +251,112 @@ def _expand_box_surfaces(
     }
     return [s_xlo, s_xhi, s_ylo, s_yhi, s_bot, s_top], label_map
 
+# ---------------------------------------------------------------------------
+# Self-contained shape expansion — Sphere, Box, and boolean composites
+#
+# Unlike FuelPin (radial surfaces only, borrows axial bounds from a placed
+# Box — see _place_fuel_pin), every shape reachable from here produces its
+# own complete surface set at the origin, so it can be placed standalone
+# via SinglePlacement OR nested as an operand inside a Union/Subtraction/
+# Intersection with no special-casing at the placement site.
+# ---------------------------------------------------------------------------
+
+_BOOLEAN_SCHEMAS = (UnionSchema, SubtractionSchema, IntersectionSchema)
+
+
+def _expand_shape_at_origin(
+    template_name: str,
+    templates: dict[str, BaseComponentSchema],
+    ctx: Context,
+) -> tuple[list[Surface], Region]:
+    """Return (surfaces, region) for `template_name` at the origin.
+
+    Recurses into Union/Subtraction/Intersection operands. Raises
+    TypeError for FuelPin (see boolean.py's module docstring) or any
+    other template type with no self-contained shape.
+    """
+    schema = templates.get(template_name)
+    if schema is None:
+        raise ValueError(f"Undefined template '{template_name}'.")
+
+    if isinstance(schema, SphereSchema):
+        s = Surface(
+            id=ctx.fresh_id("s"), type_=SurfaceType.SPHERE,
+            params={"r": schema.radius, "x0": 0.0, "y0": 0.0, "z0": 0.0},
+            boundary_type=schema.boundary_type,
+        )
+        return [s], Inside(s.id)
+
+    if isinstance(schema, BoxSchema):
+        surfaces, label_map = _expand_box_surfaces(schema, ctx)
+        region = Intersection([
+            Outside(label_map["xlo"]), Inside(label_map["xhi"]),
+            Outside(label_map["ylo"]), Inside(label_map["yhi"]),
+            Outside(label_map["bot"]), Inside(label_map["top"]),
+        ])
+        return surfaces, region
+
+    if isinstance(schema, _BOOLEAN_SCHEMAS):
+        a_surfaces, a_region = _expand_shape_at_origin(schema.a, templates, ctx)
+        b_surfaces, b_region = _expand_shape_at_origin(schema.b, templates, ctx)
+        combined_surfaces = a_surfaces + b_surfaces
+
+        if isinstance(schema, UnionSchema):
+            region = Union([a_region, b_region])
+        elif isinstance(schema, SubtractionSchema):
+            region = Intersection([a_region, Complement(b_region)])
+        else:  # IntersectionSchema
+            region = Intersection([a_region, b_region])
+
+        return combined_surfaces, region
+
+    raise TypeError(
+        f"Template '{template_name}' of type {type(schema).__name__} has no "
+        f"self-contained shape and cannot be placed standalone or used as a "
+        f"Union/Subtraction/Intersection operand. FuelPin in particular "
+        f"depends on shared axial bounds from a placed Box — place it via "
+        f"SinglePlacement/lattice against a Box boundary instead."
+    )
+
+
+def _place_boolean_shape(
+    template_name: str,
+    templates: dict[str, BaseComponentSchema],
+    position: tuple[float, float, float],
+    ctx: Context,
+    cell_name: str,
+    material: str,
+) -> list[Surface | Cell]:
+    """Place a self-contained shape (Sphere/Box/boolean composite) as one
+    filled cell at `position`. No axial-bounds dependency, unlike
+    _place_fuel_pin — every surface this needs comes from
+    _expand_shape_at_origin().
+    """
+    origin_surfaces, origin_region = _expand_shape_at_origin(template_name, templates, ctx)
+    dx, dy, dz = position
+
+    translated: list[Surface] = []
+    id_map: dict[str, str] = {}
+    for s in origin_surfaces:
+        new_id = ctx.fresh_id("s")
+        id_map[s.id] = new_id
+        translated.append(Surface(
+            id=            new_id,
+            type_=         s.type_,
+            params=        _translate_params(s.type_, s.params, dx, dy, dz),
+            boundary_type= s.boundary_type,
+        ))
+
+    region = _remap_region(origin_region, id_map)
+    cell = Cell(id=ctx.fresh_id("c"), region=region, material_id=material, name=cell_name)
+
+    # Register this shape's occupied region so a surrounding Box's fill
+    # cell excludes exactly the volume it occupies — correct even for a
+    # non-convex union/subtraction, unlike the single-cylinder
+    # approximation _place_fuel_pin uses (see Context.excluded_regions).
+    ctx.excluded_regions.append(region)
+
+    return [*translated, cell]
 
 # ---------------------------------------------------------------------------
 # Placement functions
@@ -322,11 +437,15 @@ def _place_fuel_pin(
             boundary_type= s.boundary_type,
         ))
 
-    # Register translated outermost cylinder for fill cell
+    # Register this pin's occupied region so the box's fill cell excludes
+    # it (see Context.excluded_regions). Radial-only, same approximation
+    # as before this generalization — the pin's axial extent is assumed
+    # to already match the box's own axial bounds, so excluding just the
+    # "inside this radius" cross-section is sufficient.
     if outermost_id:
         new_outermost = id_map.get(outermost_id)
         if new_outermost:
-            ctx.outermost_surfaces.append(new_outermost)
+            ctx.excluded_regions.append(Inside(new_outermost))
 
     # Build cells using translated surface IDs and shared axial bounds
     translated_layer_ids = [id_map[s.id] for s in radial_surfaces]
@@ -367,7 +486,10 @@ def _build_fill_cell(
         Outside(translated_labels["bot"]),
         Inside(translated_labels["top"]),
     ]
-    outer_exclusions = [Outside(sid) for sid in ctx.outermost_surfaces]
+    # Complement() of every placed inner object's own region — see
+    # Context.excluded_regions docstring for why this replaced the old
+    # per-surface Outside(sid) list.
+    outer_exclusions = [Complement(r) for r in ctx.excluded_regions]
 
     return Cell(
         id=          ctx.fresh_id("c"),
@@ -453,6 +575,12 @@ def expand(
 
             if isinstance(tpl, FuelPinSchema):
                 placed = _place_fuel_pin(tpl, schema.position(), ctx, cell_name_prefix=name)
+                all_objects.extend(placed)
+            elif isinstance(tpl, (SphereSchema, UnionSchema, SubtractionSchema, IntersectionSchema)):
+                placed = _place_boolean_shape(
+                    schema.template, templates, schema.position(), ctx,
+                    cell_name=name, material=tpl.material,
+                )
                 all_objects.extend(placed)
             else:
                 raise TypeError(

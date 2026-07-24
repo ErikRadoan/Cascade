@@ -24,6 +24,37 @@ export const TEMPLATE_DEFAULTS: Record<string, Record<string, unknown>> = {
     material: 'H2O',
     boundary_type: 'reflective',
   },
+  Sphere: {
+    type: 'Sphere',
+    radius: 1.0,
+    material: 'H2O',
+    boundary_type: 'none',
+  },
+  // Union/Subtraction/Intersection reference two other templates by name
+  // (a, b — see dsl/schema/boolean.py). There's no "current template" to
+  // default them to at creation time the way SinglePlacement/lattices get
+  // a concrete templateName passed in from ObjectPanel's "place" flow —
+  // these are created blank via TemplatePanel's "+" menu instead, so a/b
+  // start empty and the user picks both operands afterward via the
+  // Parameters panel's template dropdowns (see fieldOptions.ts).
+  Union: {
+    type: 'Union',
+    a: '',
+    b: '',
+    material: 'H2O',
+  },
+  Subtraction: {
+    type: 'Subtraction',
+    a: '',
+    b: '',
+    material: 'H2O',
+  },
+  Intersection: {
+    type: 'Intersection',
+    a: '',
+    b: '',
+    material: 'H2O',
+  },
 };
 
 export const PLACEMENT_DEFAULTS: Record<string, (templateName: string) => Record<string, unknown>> = {
