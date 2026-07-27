@@ -1,15 +1,11 @@
-"""Sphere schema — a standalone spherical shape.
+"""Sphere primitive schema — Tier-1 primitive (geometry-restructuring-
+plan.md Phase A).
 
-Unlike FuelPin (radial-surfaces-only, dependent on a placed Box for its
-axial bounds — see expander.py's _place_fuel_pin), a Sphere is fully
-self-contained: it carries its own bounding surface and can be placed
-anywhere via SinglePlacement without requiring a Box to be placed first.
-This is also what makes it usable as an operand inside Union/Subtraction/
-Intersection (see boolean.py) — those recurse into whatever templates
-their `a`/`b` fields name, and every shape they can reach must be able to
-produce its own surfaces without depending on shared context the way
-FuelPin does.
+Pure geometry, no material — exactly like a real OpenMC surface. Material
+assignment happens one layer up, in a Tier-2 Cell (schema/cell.py), which
+references this sphere by its YAML key inside a region expression.
 """
+
 from __future__ import annotations
 
 from pydantic import Field
@@ -19,24 +15,21 @@ from .base import BaseComponentSchema
 
 
 class SphereSchema(BaseComponentSchema):
-    """A solid sphere — fill material inside, one bounding surface.
+    """A single sphere surface (Surface.type_ = SPHERE).
 
     Example:
-        my_sphere:
+        s_sphere:
           type: Sphere
-          radius: 2.0
-          material: H2O
-
-    boundary_type defaults to 'none' (an ordinary interior object) since
-    a bare Sphere is usually placed as an inner absorber/void/moderator
-    shape, not the outer problem boundary — set it explicitly (e.g.
-    'vacuum') if you do want a Sphere to serve as the boundary.
+          radius: 1.0
+          x: 0.0
+          y: 0.0
+          z: 0.0
     """
-    radius: float = Field(default=1.0, gt=0, description="Sphere radius (cm).")
-    material: str = Field(default="H2O", description="Fill material ID.")
-    boundary_type: BoundaryType = Field(
-        default=BoundaryType.NONE,
-        description="Boundary condition on the sphere's surface. 'none' for an ordinary interior shape.",
-    )
+
+    radius: float = Field(..., gt=0, description="Sphere radius (cm).")
+    x: float = Field(0.0, description="X of the sphere's center (cm).")
+    y: float = Field(0.0, description="Y of the sphere's center (cm).")
+    z: float = Field(0.0, description="Z of the sphere's center (cm).")
+    boundary_type: BoundaryType = Field(default=BoundaryType.NONE)
 
     model_config = {"frozen": True}

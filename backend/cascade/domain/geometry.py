@@ -45,6 +45,65 @@ def region_to_json(region: Region) -> dict:
         return {"op": "not", "item": region_to_json(region.region)}
     raise TypeError(f"Unknown Region type: {type(region).__name__}")
 
+
+def region_from_yaml_dict(d: dict, name_to_id: dict[str, str]) -> Region:
+    """Inverse of region_to_json() — the DSL-facing counterpart used by
+    schema/cell.py's CellSchema.region.
+
+    Reconstructs a Region tree from the nested-dict shape CellSchema.region
+    validates for shape (see that module), resolving each `surface` NAME
+    reference to its Surface.id via `name_to_id`. `name_to_id` is built by
+    the expander from every Tier-1 primitive's authored YAML key once all
+    primitives in the document have been expanded — see expander.py's
+    ordering note (a Cell may reference a primitive declared later in the
+    file; this function itself doesn't care about declaration order at
+    all, it just looks names up in a dict that's already complete by the
+    time it's called).
+
+    Kept in this module, next to region_to_json(), so the two stay in sync
+    in one place (geometry-restructuring-plan.md §3.2) rather than one
+    living here and its inverse living in the DSL layer.
+
+    Raises:
+        ValueError: for an unknown `op`, or a `surface` name not present in
+        `name_to_id` — never a bare KeyError, so callers (e.g.
+        POST /geometry/validate) can surface a clean validation error
+        instead of a 500.
+    """
+    if not isinstance(d, dict):
+        raise ValueError(f"Region node must be a mapping, got {type(d).__name__}.")
+
+    op = d.get("op")
+
+    if op in ("inside", "outside"):
+        surface_name = d.get("surface")
+        surface_id = name_to_id.get(surface_name)
+        if surface_id is None:
+            raise ValueError(
+                f"Region references unknown surface '{surface_name}'. "
+                f"Known surfaces: {sorted(name_to_id)}."
+            )
+        return Inside(surface_id) if op == "inside" else Outside(surface_id)
+
+    if op == "and":
+        items = d.get("items") or []
+        return Intersection([region_from_yaml_dict(i, name_to_id) for i in items])
+
+    if op == "or":
+        items = d.get("items") or []
+        return Union([region_from_yaml_dict(i, name_to_id) for i in items])
+
+    if op == "not":
+        item = d.get("item")
+        if item is None:
+            raise ValueError("A 'not' region node requires an 'item'.")
+        return Complement(region_from_yaml_dict(item, name_to_id))
+
+    raise ValueError(
+        f"Unknown region op '{op}'. Must be one of: inside, outside, and, or, not."
+    )
+
+
 class Region(ABC):
     """Base class for CSG region expressions."""
 

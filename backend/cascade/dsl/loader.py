@@ -7,24 +7,33 @@ from pydantic import ValidationError
 
 from .schema.base import BaseComponentSchema
 from .schema.box import BoxSchema
+from .schema.cell import CellSchema
+from .schema.cylinder import CylinderXSchema, CylinderYSchema, CylinderZSchema
 from .schema.fuel_pin import FuelPinSchema
 from .schema.lattice import HexLatticeSchema, SquareLatticeSchema
+from .schema.plane import PlaneXSchema, PlaneYSchema, PlaneZSchema
 from .schema.single_placement import SinglePlacementSchema
 from .schema.sphere import SphereSchema
-from .schema.boolean import UnionSchema, SubtractionSchema, IntersectionSchema
+
 
 SCHEMA_MAP: dict[str, type[BaseComponentSchema]] = {
-    # Templates
+    # Templates (legacy sugar — expand to Tier-1/2 objects internally)
     "FuelPin":         FuelPinSchema,
     "Box":             BoxSchema,
-    "Sphere":          SphereSchema,
-    "Union":           UnionSchema,
-    "Subtraction":     SubtractionSchema,
-    "Intersection":    IntersectionSchema,
     # Placements
     "SinglePlacement": SinglePlacementSchema,
     "SquareLattice":   SquareLatticeSchema,
-    "HexLattice":      HexLatticeSchema,
+    "HexLattice":       HexLatticeSchema,
+    # Tier-1 primitives (geometry-restructuring-plan.md Phase A)
+    "PlaneX":          PlaneXSchema,
+    "PlaneY":          PlaneYSchema,
+    "PlaneZ":          PlaneZSchema,
+    "Sphere":          SphereSchema,
+    "CylinderX":       CylinderXSchema,
+    "CylinderY":       CylinderYSchema,
+    "CylinderZ":       CylinderZSchema,
+    # Tier-2 region-expression cells (geometry-restructuring-plan.md Phase B)
+    "Cell":            CellSchema,
 }
 
 
@@ -39,8 +48,15 @@ def load(text: str) -> dict[str, BaseComponentSchema]:
     """Parse and validate YAML geometry definition text.
 
     Returns ordered dict preserving YAML declaration order.
-    Templates must be declared before the placements that reference them
-    (validated in expander, not here).
+
+    Ordering note: legacy templates must still be declared before the
+    placements that reference them (validated in expander.py). Tier-1
+    primitives and Tier-2 Cells have NO such constraint — a Cell may
+    reference a primitive declared later in the same document, because the
+    expander resolves every primitive's Surface.id before resolving any
+    Cell's region (see expander.py's Step 0 docstring). This is a
+    deliberate, user-visible relaxation of the old rule for the new
+    primitive/cell tier, not an oversight.
     """
     try:
         raw = yaml.safe_load(text)

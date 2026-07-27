@@ -104,6 +104,7 @@ class WireframeBoxOut(BaseModel):
     # Join key — see CylinderLayerOut.cell_name and expander.py's
     # _build_fill_cell.
     cell_name:        str = ""
+    is_composite_approx: bool = False
 
 
 class SceneComponentOut(BaseModel):
@@ -112,6 +113,7 @@ class SceneComponentOut(BaseModel):
     position: list[float]
     layers:   list[CylinderLayerOut] = Field(default_factory=list)
     box:      WireframeBoxOut | None = None
+    sphere: SphereShapeOut | None = None
 
 
 class BoundsOut(BaseModel):
@@ -128,6 +130,13 @@ class SceneResponse(BaseModel):
     material_colors: dict[str, str]
     bounds:          BoundsOut
     error:           str | None = None
+
+class SphereShapeOut(BaseModel):
+    radius:      float
+    material_id: str
+    color:       str
+    opacity:     float
+    cell_name:   str = ""
 
 
 # ---------------------------------------------------------------------------
