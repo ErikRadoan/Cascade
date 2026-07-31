@@ -38,12 +38,20 @@ function split(direction: DockSplit['direction'], children: DockNode[], sizes?: 
 // Mirrors the original fixed 3-column layout (Objects+Templates stacked on
 // the left, Viewport center, Parameters right) but every pane is now a
 // real dock leaf, so it can be dragged, tabbed, split, and resized.
+//
+// Phase D of geometry-restructuring-plan.md: the center pane used to tab
+// together two ids ('viewport', 'csgViewport') that rendered two DIFFERENT
+// components (the old FuelPin/Box-only Viewport3D, and the general CSG
+// raymarcher) side by side as redundant tabs. Now that 'viewport' itself
+// points at the CSG viewer (see panelRegistry.ts), there's only one tab
+// here — 'csgViewport' remains a registered alias for old persisted
+// layouts, it's just never emitted by a fresh default layout anymore.
 function defaultLayout(): DockNode {
   return split(
     'row',
     [
       split('column', [leaf('objects'), leaf('templates')], [0.5, 0.5]),
-      leaf('viewport', 'csgViewport'),
+      leaf('viewport'),
       leaf('parameters'),
     ],
     [0.22, 0.56, 0.22],

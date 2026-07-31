@@ -45,6 +45,43 @@ class ExpansionContext(Protocol):
     def fresh_id(self, prefix: str = "s") -> str: ...
 
 
+# ---------------------------------------------------------------------------
+# Shared surface-translation helper (Phase C)
+#
+# Both templates.py's FuelPin expander and expander.py's Box handling need
+# to translate a surface built "at the origin" to a placement position.
+# Lives here (rather than in expander.py, where it originated) so
+# templates.py can use it too without importing expander.py — the intended
+# dependency direction is primitives.py <- templates.py <- expander.py,
+# never the reverse. Byte-identical to the pre-Phase-C version in
+# expander.py; only its address changed.
+# ---------------------------------------------------------------------------
+
+_TRANSLATE_PARAMS: dict[SurfaceType, dict[str, str]] = {
+    SurfaceType.PLANE_X:    {"x": "dx", "x0": "dx"},
+    SurfaceType.PLANE_Y:    {"y": "dy", "y0": "dy"},
+    SurfaceType.PLANE_Z:    {"z": "dz", "z0": "dz"},
+    SurfaceType.CYLINDER_Z: {"x": "dx", "x0": "dx", "y": "dy", "y0": "dy"},
+    SurfaceType.CYLINDER_X: {"y": "dy", "y0": "dy", "z": "dz", "z0": "dz"},
+    SurfaceType.CYLINDER_Y: {"x": "dx", "x0": "dx", "z": "dz", "z0": "dz"},
+    SurfaceType.SPHERE:     {"x": "dx", "x0": "dx", "y": "dy", "y0": "dy",
+                             "z": "dz", "z0": "dz"},
+}
+
+
+def translate_params(type_: SurfaceType, params: dict,
+                     dx: float, dy: float, dz: float) -> dict:
+    """Shift a surface's own params by (dx, dy, dz), respecting whichever
+    of the canonical ('x0') or shorthand ('x') param spellings is present."""
+    offsets = {"dx": dx, "dy": dy, "dz": dz}
+    axes    = _TRANSLATE_PARAMS.get(type_, {})
+    result  = dict(params)
+    for param_key, offset_key in axes.items():
+        if param_key in result:
+            result[param_key] = float(result[param_key]) + offsets[offset_key]
+    return result
+
+
 class PrimitiveExpander(Protocol):
     """Implemented once per Tier-1 primitive schema type
     (geometry-restructuring-plan.md §3.1)."""

@@ -1,41 +1,41 @@
 <script lang="ts">
-  // ObjectPanel — shows ALL placed objects, including Box placements
-  // (boundary boxes are real placements, not a special hidden category).
-  // Each row has an eye toggle to show/hide that placement in the
-  // viewport — Boxes default to visible but are the most common thing
-  // a user will want to hide since they can occlude inner geometry.
+  // ObjectPanel — Phase D of geometry-restructuring-plan.md.
+  //
+  // Pre-Phase-D, this listed `activeProject().scene?.components` — output
+  // of the FuelPin/Box-only SceneBuilder. It now lists the shared
+  // /geometry/csg cells (via stores/csg.svelte.ts), grouped by owning
+  // placement (csgCellGrouping.baseGroupName) — the same grouping the old
+  // SceneComponent baseName-stripping did, just derived from raw cells
+  // instead of a shape-specific scene description. This is what makes the
+  // panel render arbitrary future component types (Union/Subtraction/
+  // Intersection, raw Cells) with zero new frontend code: a Cell is a
+  // Cell here regardless of what expander.py pipeline produced it.
+  //
+  // Each Box's fill cell shows as its own row (cell.name has no "_layerN"/
+  // "_N" suffix to strip, so baseGroupName is the identity function for
+  // it) — same "Boxes are the most common thing you'll want to hide"
+  // rationale the eye toggle already existed for.
 
   import { activeProject, setGeometryText } from '../stores/projects.svelte.js';
   import { geometrySelection } from '../stores/selection.svelte.js';
   import { isVisible, toggleVisibility } from '../stores/visibility.svelte.js';
+  import { csgState, requestCsgRefresh } from '../stores/csg.svelte.js';
+  import { baseGroupName } from '../csgCellGrouping';
   import yaml from '../yamlParseHelper';
   import {dump} from 'js-yaml';
   import PanelHeader from '../dock/PanelHeader.svelte';
   import TypePickerMenu from '../TypePickerMenu.svelte';
   import { PLACEMENT_DEFAULTS, PLACEMENT_TYPES, uniqueName } from '../componentDefaults';
-  import type { SceneComponent } from '$lib/types';
 
-  let placements = $derived(activeProject().scene?.components ?? []);
+  $effect(() => {
+    requestCsgRefresh(activeProject().text);
+  });
 
   interface Group {
-    name: string;
-    count: number;
-    type: string;
-    firstComponent: SceneComponent;
+    name: string;   // owning placement/Cell name — matches a top-level YAML key
+    count: number;  // number of raw CSG cells folded into this row
+    type: string;   // the YAML block's own `type` field, or 'Cell' as a fallback
   }
-
-  let groups = $derived((): Group[] => {
-    const map = new Map<string, Group>();
-    for (const comp of placements) {
-      const baseName = comp.name.replace(/_\d+$/, '');
-      if (map.has(baseName)) {
-        map.get(baseName)!.count++;
-      } else {
-        map.set(baseName, { name: baseName, count: 1, type: comp.type, firstComponent: comp });
-      }
-    }
-    return [...map.values()];
-  });
 
   const NON_TEMPLATE_TYPES = new Set(['SinglePlacement', 'SquareLattice', 'HexLattice']);
 
@@ -43,6 +43,31 @@
     const raw = yaml.parse(activeProject().text);
     if (!raw || typeof raw !== 'object') return null;
     return raw as Record<string, { type?: string }>;
+  });
+
+  let groups = $derived((): Group[] => {
+    const cells = csgState.data?.cells ?? [];
+    const doc = parsedDoc();
+    const map = new Map<string, Group>();
+
+    for (const cell of cells) {
+      if (cell.material_id == null) continue; // void cells aren't placeable objects
+      const rawName = cell.name ?? cell.id;
+      const groupName = baseGroupName(rawName);
+
+      const existing = map.get(groupName);
+      if (existing) {
+        existing.count++;
+        continue;
+      }
+      map.set(groupName, {
+        name:  groupName,
+        count: 1,
+        type:  doc?.[groupName]?.type ?? 'Cell',
+      });
+    }
+
+    return [...map.values()];
   });
 
   let availableTemplates = $derived((): string[] => {
@@ -133,8 +158,12 @@
   {/if}
 
   <div class="panel-body">
-    {#if groups().length === 0}
-      <p class="empty-hint">No objects placed yet.<br>Add a SinglePlacement or lattice.</p>
+    {#if csgState.loading && !csgState.data}
+      <p class="empty-hint">Loading…</p>
+    {:else if csgState.error}
+      <p class="empty-hint error">{csgState.error}</p>
+    {:else if groups().length === 0}
+      <p class="empty-hint">No objects placed yet.<br>Add a SinglePlacement, lattice, or a Cell.</p>
     {:else}
       {#each groups() as group}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -282,6 +311,8 @@
     line-height: 1.6;
     opacity: 0.7;
   }
+
+  .empty-hint.error { color: #f87171; opacity: 1; }
 
   .object-row {
     display: flex;
