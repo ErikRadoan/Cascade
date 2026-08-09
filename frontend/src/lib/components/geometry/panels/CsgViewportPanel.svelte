@@ -1,31 +1,6 @@
 <script lang="ts">
-  // CsgViewportPanel — Phase D of geometry-restructuring-plan.md: this is
-  // now the editor's ONLY 3D viewport (see panelRegistry.ts / dockStore's
-  // defaultLayout — the old FuelPin/Box-only Viewport3D + ViewportPanel
-  // are retired). Renders the FULLY EXPANDED CSG (surfaces + region
-  // trees), not a shape-specific scene description, via a raymarched
-  // signed-distance-field shader — see the original file header (kept
-  // below) for why raymarching, and why this already renders arbitrary
-  // Union/Subtraction/Intersection region trees with zero new shader code.
-  //
-  // Phase D changes:
-  //   - CSG data now comes from the shared stores/csg.svelte.ts store
-  //     (one request backs both this panel and ObjectPanel) instead of
-  //     each fetching /geometry/csg independently.
-  //   - New `cellColors` prop: an optional cell_name -> hex color map,
-  //     the same shape ResultsViewport3D/GeometryPlotPanel already use for
-  //     tally overlays. When set, it overrides this panel's default
-  //     per-material hash color for that cell — this is what would let a
-  //     results-style overlay reuse this viewport instead of
-  //     ResultsViewport3D, should that consolidation happen later (not
-  //     part of this phase — see plan §9 open questions).
-  //   - Cells belonging to a hidden ObjectPanel group (the eye toggle) are
-  //     now excluded before the MAX_CELLS cap is applied, via the same
-  //     csgCellGrouping.baseGroupName() ObjectPanel groups by — so hiding
-  //     a lattice in the object list actually hides it here now, matching
-  //     the old Viewport3D/ObjectPanel behavior this panel replaces.
-  //
-  // Original header, unchanged:
+  // CsgViewportPanel — renders the FULLY EXPANDED CSG (surfaces + region
+  // trees), not the template-aware SceneBuilder output ViewportPanel uses.
   //
   // Why this exists: SceneBuilder (scene_builder_service.py) only knows
   // how to draw FuelPin/Box specifically — see its _build_placed(). It has
@@ -60,13 +35,9 @@
 
   import { onMount, onDestroy } from 'svelte';
   import * as THREE from 'three';
+  import * as api from '$lib/api';
   import { activeProject } from '../stores/projects.svelte.js';
-  import { csgState, requestCsgRefresh } from '../stores/csg.svelte.js';
-  import { isVisible, visibility } from '../stores/visibility.svelte.js';
-  import { baseGroupName } from '../csgCellGrouping';
   import type { CsgGeometry, CsgSurface, RegionNode } from '$lib/types';
-
-  let { cellColors = null }: { cellColors?: Record<string, string> | null } = $props();
 
   // ---- Capacity caps — see block comment above ----------------------------
   const MAX_SURFACES = 96;
@@ -166,13 +137,6 @@
     return [r1 + m, g1 + m, b1 + m];
   }
 
-  // Parses a "#rrggbb" cellColors override into the same [0,1] RGB triple
-  // shape hashColor() returns, so both feed uCellColor identically.
-  function hexToRgb01(hex: string): [number, number, number] {
-    const v = parseInt(hex.replace('#', ''), 16) || 0;
-    return [((v >> 16) & 255) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255];
-  }
-
   function computeBounds(csg: CsgGeometry) {
     let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity, zMin = Infinity, zMax = -Infinity;
     for (const s of csg.surfaces) {
@@ -197,15 +161,37 @@
   }
 
   // ---- Component state ------------------------------------------------------
+  let csg = $state<CsgGeometry | null>(null);
+  let loading = $state(false);
+  let loadError = $state<string | null>(null);
   let truncatedSurfaces = $state(false);
   let truncatedCells = $state(false);
   let truncatedTokens = $state(false);
   let cellCount = $state(0);
   let materialLegend = $state<{ id: string; color: string }[]>([]);
 
+  const projectText = $derived(activeProject().text);
+
+  let fetchHandle: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
-    requestCsgRefresh(activeProject().text);
+    const text = projectText; // dependency
+    clearTimeout(fetchHandle);
+    fetchHandle = setTimeout(() => load(text), 400);
   });
+
+  async function load(text: string) {
+    loading = true;
+    loadError = null;
+    try {
+      csg = await api.geometry.csg(text);
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+      csg = null;
+    } finally {
+      loading = false;
+      rebuildAndRender();
+    }
+  }
 
   // ---- Three.js scaffolding: one full-screen quad, no meshes -----------------
   let canvasEl: HTMLCanvasElement;
@@ -405,7 +391,6 @@
   function rebuildAndRender() {
     if (!shaderMaterial) return;
     const u = shaderMaterial.uniforms;
-    const csg = csgState.data;
 
     if (!csg) {
       u.uCellCount.value = 0;
@@ -429,13 +414,7 @@
     });
     for (let i = surfacesUsed.length; i < MAX_SURFACES; i++) { surfType[i] = -1; surfParams[i].set(0, 0, 0, 0); }
 
-    // Skip void cells AND cells whose owning ObjectPanel group is
-    // currently hidden (the eye toggle) — grouped via the same
-    // baseGroupName() ObjectPanel uses, so "hide the lattice" here means
-    // exactly what it means there.
-    const nonVoid = csg.cells.filter(
-      (c) => c.material_id != null && isVisible(baseGroupName(c.name ?? c.id)),
-    );
+    const nonVoid = csg.cells.filter((c) => c.material_id != null);
     const cellsUsed = nonVoid.slice(0, MAX_CELLS);
     truncatedCells = nonVoid.length > MAX_CELLS;
 
@@ -447,8 +426,7 @@
 
     cellsUsed.forEach((cell, ci) => {
       const matId = cell.material_id!;
-      const override = cellColors?.[cell.name ?? ''];
-      const [r, g, b] = override ? hexToRgb01(override) : hashColor(matId);
+      const [r, g, b] = hashColor(matId);
       cellColor[ci].setRGB(r, g, b);
       if (!legendSeen.has(matId)) legendSeen.set(matId, `#${cellColor[ci].getHexString()}`);
 
@@ -488,7 +466,6 @@
   function resetCamera() {
     cameraTheta = Math.PI / 4;
     cameraPhi = Math.PI / 3;
-    const csg = csgState.data;
     if (csg) {
       const b = computeBounds(csg);
       const span = Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin, 1);
@@ -512,6 +489,28 @@
   let isDragging = false;
   let lastX = 0, lastY = 0;
 
+  // pointermove can fire far faster than the display refresh rate — browsers
+  // don't coalesce it to rAF the way they do some other input events — and
+  // render() is a full per-pixel raymarch that brute-force tests every cell
+  // at every step (see sceneSDF/evalRegion above). Calling render()
+  // synchronously from the DOM event handler meant an orbit-drag could issue
+  // many full raymarches per displayed frame — that's what actually caused
+  // the severe lag (worse with more cells: a lattice, not just a single
+  // pin). Camera-state math stays cheap and per-event; the expensive draw
+  // call is batched to at most once per animation frame.
+  let renderQueued = false;
+  let pendingRenderFrame: number | null = null;
+
+  function requestRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    pendingRenderFrame = requestAnimationFrame(() => {
+      renderQueued = false;
+      pendingRenderFrame = null;
+      render();
+    });
+  }
+
   function onPointerDown(e: PointerEvent) {
     isDragging = true; lastX = e.clientX; lastY = e.clientY;
     canvasEl.setPointerCapture(e.pointerId);
@@ -522,7 +521,7 @@
     lastX = e.clientX; lastY = e.clientY;
     cameraTheta -= dx * 0.005;
     cameraPhi = Math.max(0.05, Math.min(Math.PI - 0.05, cameraPhi - dy * 0.005));
-    render();
+    requestRender();
   }
   function onPointerUp(e: PointerEvent) {
     isDragging = false;
@@ -531,7 +530,7 @@
   function onWheel(e: WheelEvent) {
     e.preventDefault();
     cameraDistance = Math.max(0.5, Math.min(500, cameraDistance * (1 + e.deltaY * 0.001)));
-    render();
+    requestRender();
   }
 
   function resize() {
@@ -539,7 +538,7 @@
     const w = containerEl.clientWidth, h = containerEl.clientHeight;
     renderer.setSize(w, h, false);
     shaderMaterial.uniforms.uAspect.value = w / Math.max(1, h);
-    render();
+    requestRender();
   }
 
   onMount(() => {
@@ -566,19 +565,9 @@
   });
 
   onDestroy(() => {
+    if (pendingRenderFrame !== null) cancelAnimationFrame(pendingRenderFrame);
     tokenTexture?.dispose();
     renderer?.dispose();
-  });
-
-  // Re-run whenever the shared CSG data, color overrides, or visibility
-  // toggles change. Reading `visibility` here (the raw reactive store
-  // object, not just isVisible()) registers it as a dependency — same
-  // pattern Viewport3D used pre-Phase-D.
-  $effect(() => {
-    csgState.data;
-    cellColors;
-    visibility;
-    if (shaderMaterial) rebuildAndRender();
   });
 </script>
 
@@ -593,7 +582,7 @@
 
   <div class="overlay">
     <button class="viewport-btn" onclick={resetCamera} title="Reset camera">Reset view</button>
-    {#if !csgState.loading && !csgState.error}
+    {#if !loading && !loadError}
       <span class="count-badge">{cellCount} cell{cellCount === 1 ? '' : 's'}</span>
     {/if}
   </div>
@@ -606,11 +595,11 @@
     </div>
   {/if}
 
-  {#if csgState.loading}
+  {#if loading}
     <div class="badge">Loading CSG…</div>
   {/if}
-  {#if csgState.error}
-    <div class="badge error">{csgState.error}</div>
+  {#if loadError}
+    <div class="badge error">{loadError}</div>
   {/if}
   {#if truncatedSurfaces || truncatedCells || truncatedTokens}
     <div class="badge warning">

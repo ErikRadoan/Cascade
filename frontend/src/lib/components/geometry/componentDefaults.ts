@@ -27,7 +27,6 @@ export const TEMPLATE_DEFAULTS: Record<string, Record<string, unknown>> = {
   Sphere: {
     type: 'Sphere',
     radius: 1.0,
-    material: 'H2O',
     boundary_type: 'none',
   },
   // Union/Subtraction/Intersection reference two other templates by name
