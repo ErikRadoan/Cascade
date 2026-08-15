@@ -22,16 +22,39 @@
   //     mesh rebuild on every keystroke in the editor; a raymarch shader
   //     just re-uploads uniforms/a texture and redraws.
   //
-  // Known scaling limit (documented, not silently swallowed): every cell
-  // is brute-force tested at every raymarch step, capped at MAX_CELLS/
-  // MAX_SURFACES below. A single pin cell or a small lattice is fine; a
-  // large lattice (dozens+ of pins) will get truncated with a banner
-  // rather than silently rendering wrong or hanging the GPU. Fixing that
-  // for real needs a spatial accelerator, the same problem
-  // GeometryPlotPanel.svelte solves for its 2D slice with a bucket-grid
-  // index (see that file's block comment) — a 3D analogue (or a BVH baked
-  // into a texture) is the natural next step once lattice-scale CSG
-  // viewing matters, not part of this pass.
+  // PERFORMANCE (BVH-pruned raymarch — see plan doc, "lag fix"):
+  //   sceneSDF() previously ran the expensive per-cell evalRegion() (a
+  //   full RPN region-tree walk) for EVERY cell, at EVERY one of the 160
+  //   raymarch steps, per pixel — O(cells x steps x pixels), completely
+  //   unconditionally. An earlier interim patch added a flat per-cell
+  //   bounding-sphere test (one sphere per cell, no hierarchy); this is
+  //   the real fix that supersedes it.
+  //
+  //   A BVH is built on the CPU (buildBvh()/flattenBvh() below) over each
+  //   cell's AABB (computed from the surfaces its region tree actually
+  //   references — cellAABB()), leaves = 1 cell each, split on the
+  //   longest axis at the median (no SAH — not worth it at <=48 leaves).
+  //   It's flattened into a small texture (3 texels/node: bmin+isLeaf,
+  //   bmax+cellIndex, leftChild+rightChild) and traversed in the shader
+  //   with an explicit stack (GLSL ES 1.00 has no recursion).
+  //
+  //   Soundness: pruning uses the EXACT signed box distance (boxSDF, see
+  //   shader below), not a sphere. For a box B that fully contains a
+  //   shape S, boxSDF(p) <= trueSDF_S(p) for every point p, inside or
+  //   outside B — any ball around p that fits inside S also fits inside
+  //   B (S subset-of B), so B's "room to grow" at p can never be smaller
+  //   than S's. That inequality holds regardless of sign, which is what
+  //   lets internal BVH nodes (unions of children's boxes) be pruned
+  //   too, not just leaves — the sphere patch this replaces only had a
+  //   sound bound for points OUTSIDE the sphere, which is why it had to
+  //   fall back to "evaluate everything the point is inside" instead of
+  //   skipping whole subtrees. A node is skipped outright whenever its
+  //   box distance is already >= the best hit found so far in the
+  //   traversal; only surviving leaves ever call the expensive
+  //   evalRegion(). This is a genuine spatial hierarchy (O(log cells)
+  //   box tests instead of O(cells)), not a heuristic margin — it scales
+  //   to far more than 48 cells without the pruning quality degrading,
+  //   which is what would eventually be needed if MAX_CELLS is raised.
 
   import { onMount, onDestroy } from 'svelte';
   import * as THREE from 'three';
@@ -78,6 +101,26 @@
       case 'not':
         flattenRegion(node.item, surfIndex, out);
         out.push(OP_NOT, 0);
+        return;
+    }
+  }
+
+  // Collect every surface NAME referenced anywhere in a region tree
+  // (Inside AND Outside both count — see cellAABB()'s doc comment
+  // for why restricting to just Inside would under-bound a Box-shaped
+  // cell, whose interior is Outside(lo) + Inside(hi) per axis).
+  function surfaceIdsInRegion(node: RegionNode, out: string[]) {
+    switch (node.op) {
+      case 'inside':
+      case 'outside':
+        out.push(node.surface);
+        return;
+      case 'and':
+      case 'or':
+        for (const item of node.items) surfaceIdsInRegion(item, out);
+        return;
+      case 'not':
+        surfaceIdsInRegion(node.item, out);
         return;
     }
   }
@@ -137,27 +180,257 @@
     return [r1 + m, g1 + m, b1 + m];
   }
 
-  function computeBounds(csg: CsgGeometry) {
-    let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity, zMin = Infinity, zMax = -Infinity;
-    for (const s of csg.surfaces) {
-      const p = s.params;
-      if (s.type === 'plane_x') { const v = num(p, 'x0', 'x'); xMin = Math.min(xMin, v); xMax = Math.max(xMax, v); }
-      else if (s.type === 'plane_y') { const v = num(p, 'y0', 'y'); yMin = Math.min(yMin, v); yMax = Math.max(yMax, v); }
-      else if (s.type === 'plane_z') { const v = num(p, 'z0', 'z'); zMin = Math.min(zMin, v); zMax = Math.max(zMax, v); }
-      else if (s.type === 'cylinder_z') {
-        const x0 = num(p, 'x0', 'x'), y0 = num(p, 'y0', 'y'), r = num(p, 'r', 'r', 1);
-        xMin = Math.min(xMin, x0 - r); xMax = Math.max(xMax, x0 + r);
-        yMin = Math.min(yMin, y0 - r); yMax = Math.max(yMax, y0 + r);
-      } else if (s.type === 'sphere') {
-        const x0 = num(p, 'x0', 'x'), y0 = num(p, 'y0', 'y'), z0 = num(p, 'z0', 'z'), r = num(p, 'r', 'r', 1);
-        xMin = Math.min(xMin, x0 - r); xMax = Math.max(xMax, x0 + r);
-        yMin = Math.min(yMin, y0 - r); yMax = Math.max(yMax, y0 + r);
-        zMin = Math.min(zMin, z0 - r); zMax = Math.max(zMax, z0 + r);
-      }
+  // ---- Bounding-box helpers -------------------------------------------------
+  // Shared shape: accumulate min/max per axis over a set of surfaces,
+  // exactly like computeBounds() does for the whole scene below — a
+  // surface's own offset is treated as a candidate bound on EITHER side of
+  // an axis, regardless of whether it's referenced via Inside or Outside
+  // in the region tree. That's a loose-but-safe approximation (it doesn't
+  // know which side of a plane the cell's material is actually on), but
+  // for real reactor geometry (each axis bounded by one "lo" and one "hi"
+  // plane, or one cylinder radius) it produces a tight box in practice.
+  interface AxisBounds { xMin: number; xMax: number; yMin: number; yMax: number; zMin: number; zMax: number; }
+
+  function accumulateSurfaceBounds(b: AxisBounds, s: CsgSurface): AxisBounds {
+    const p = s.params;
+    if (s.type === 'plane_x') {
+      const v = num(p, 'x0', 'x');
+      return { ...b, xMin: Math.min(b.xMin, v), xMax: Math.max(b.xMax, v) };
     }
-    if (!isFinite(xMin)) return { xMin: -5, xMax: 5, yMin: -5, yMax: 5, zMin: -5, zMax: 5 };
-    if (!isFinite(zMin)) { zMin = -5; zMax = 5; }
-    return { xMin, xMax, yMin, yMax, zMin, zMax };
+    if (s.type === 'plane_y') {
+      const v = num(p, 'y0', 'y');
+      return { ...b, yMin: Math.min(b.yMin, v), yMax: Math.max(b.yMax, v) };
+    }
+    if (s.type === 'plane_z') {
+      const v = num(p, 'z0', 'z');
+      return { ...b, zMin: Math.min(b.zMin, v), zMax: Math.max(b.zMax, v) };
+    }
+    if (s.type === 'cylinder_z') {
+      const x0 = num(p, 'x0', 'x'), y0 = num(p, 'y0', 'y'), r = num(p, 'r', 'r', 1);
+      return {
+        ...b,
+        xMin: Math.min(b.xMin, x0 - r), xMax: Math.max(b.xMax, x0 + r),
+        yMin: Math.min(b.yMin, y0 - r), yMax: Math.max(b.yMax, y0 + r),
+      };
+    }
+    if (s.type === 'cylinder_x') {
+      const y0 = num(p, 'y0', 'y'), z0 = num(p, 'z0', 'z'), r = num(p, 'r', 'r', 1);
+      return {
+        ...b,
+        yMin: Math.min(b.yMin, y0 - r), yMax: Math.max(b.yMax, y0 + r),
+        zMin: Math.min(b.zMin, z0 - r), zMax: Math.max(b.zMax, z0 + r),
+      };
+    }
+    if (s.type === 'cylinder_y') {
+      const x0 = num(p, 'x0', 'x'), z0 = num(p, 'z0', 'z'), r = num(p, 'r', 'r', 1);
+      return {
+        ...b,
+        xMin: Math.min(b.xMin, x0 - r), xMax: Math.max(b.xMax, x0 + r),
+        zMin: Math.min(b.zMin, z0 - r), zMax: Math.max(b.zMax, z0 + r),
+      };
+    }
+    if (s.type === 'sphere') {
+      const x0 = num(p, 'x0', 'x'), y0 = num(p, 'y0', 'y'), z0 = num(p, 'z0', 'z'), r = num(p, 'r', 'r', 1);
+      return {
+        ...b,
+        xMin: Math.min(b.xMin, x0 - r), xMax: Math.max(b.xMax, x0 + r),
+        yMin: Math.min(b.yMin, y0 - r), yMax: Math.max(b.yMax, y0 + r),
+        zMin: Math.min(b.zMin, z0 - r), zMax: Math.max(b.zMax, z0 + r),
+      };
+    }
+    return b; // cone_z / torus — unsupported, contributes nothing
+  }
+
+  function computeBounds(csg: CsgGeometry): AxisBounds {
+    let b: AxisBounds = {
+      xMin: Infinity, xMax: -Infinity, yMin: Infinity, yMax: -Infinity, zMin: Infinity, zMax: -Infinity,
+    };
+    for (const s of csg.surfaces) b = accumulateSurfaceBounds(b, s);
+    if (!isFinite(b.xMin)) return { xMin: -5, xMax: 5, yMin: -5, yMax: 5, zMin: -5, zMax: 5 };
+    if (!isFinite(b.zMin)) { b = { ...b, zMin: -5, zMax: 5 }; }
+    return b;
+  }
+
+  // Unbounded-region detection — cellAABB() below only looks at WHICH
+  // surfaces a region tree references, not whether Inside/Outside/
+  // Complement actually bounds the resulting solid. That's safe for
+  // FuelPin/Box (every referenced surface there imposes a real bound),
+  // but not in general: `Complement(Inside(sphere))` ("everywhere
+  // outside this sphere") references only the sphere, whose own params
+  // are perfectly finite — so cellAABB would return a tight box hugging
+  // the sphere for a region that's actually unbounded. Since every
+  // number involved is finite, the existing `!isFinite(...)` guard in
+  // cellAABB doesn't catch it, and the BVH would then prune away
+  // camera-ray points that are geometrically inside the cell but outside
+  // its undersized box — silent holes in the render, no error.
+  //
+  // Walks the tree looking for the two patterns that break boundedness:
+  // a Complement anywhere, or a bare Outside(cylinder/sphere)
+  // (Outside(plane) is fine — it only bounds from one side, same as
+  // Inside(plane), so it doesn't introduce unboundedness on its own; a
+  // cylinder/sphere's Outside is the one that opens up to infinity).
+  // Deliberately conservative, not exact: doesn't try to prove that some
+  // deeper AND-branch still bounds things (e.g. `Box AND NOT Sphere` IS
+  // actually bounded, but this flags it anyway) — false positives just
+  // cost pruning quality for that one cell, never correctness.
+  function regionIsPotentiallyUnbounded(node: RegionNode): boolean {
+    switch (node.op) {
+      case 'not':
+        return true;
+      case 'outside':
+        return true; // conservative: covers cylinder/sphere; harmless overkill for plane
+      case 'inside':
+        return false;
+      case 'and':
+      case 'or':
+        return node.items.some(regionIsPotentiallyUnbounded);
+    }
+  }
+
+  /**
+   * AABB for ONE cell, derived only from the surfaces its own region tree
+   * references (see surfaceIdsInRegion), padded 2% so a BVH leaf strictly
+   * contains the true shape. Falls back to `fallback` (the whole scene's
+   * bounds) when a cell references no bounding-relevant surfaces at all,
+   * or when the region is potentially unbounded by construction (see
+   * regionIsPotentiallyUnbounded) — must never produce an under-sized box
+   * for a shape that isn't actually contained by it, since that would
+   * silently break the BVH's pruning correctness.
+   */
+  function cellAABB(
+    region: RegionNode,
+    surfaceById: Map<string, CsgSurface>,
+    fallback: AxisBounds,
+  ): AxisBounds {
+    if (regionIsPotentiallyUnbounded(region)) {
+      return fallback;
+    }
+
+    const names: string[] = [];
+    surfaceIdsInRegion(region, names);
+
+    let b: AxisBounds = {
+      xMin: Infinity, xMax: -Infinity, yMin: Infinity, yMax: -Infinity, zMin: Infinity, zMax: -Infinity,
+    };
+    for (const n of names) {
+      const s = surfaceById.get(n);
+      if (s) b = accumulateSurfaceBounds(b, s);
+    }
+    if (!isFinite(b.xMin) || !isFinite(b.yMin) || !isFinite(b.zMin)) b = fallback;
+    if (!isFinite(b.zMin)) b = { ...b, zMin: fallback.zMin, zMax: fallback.zMax };
+
+    const pad = 0.02 * Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin, 1);
+    return {
+      xMin: b.xMin - pad, xMax: b.xMax + pad,
+      yMin: b.yMin - pad, yMax: b.yMax + pad,
+      zMin: b.zMin - pad, zMax: b.zMax + pad,
+    };
+  }
+
+  function unionAABB(a: AxisBounds, b: AxisBounds): AxisBounds {
+    return {
+      xMin: Math.min(a.xMin, b.xMin), xMax: Math.max(a.xMax, b.xMax),
+      yMin: Math.min(a.yMin, b.yMin), yMax: Math.max(a.yMax, b.yMax),
+      zMin: Math.min(a.zMin, b.zMin), zMax: Math.max(a.zMax, b.zMax),
+    };
+  }
+
+  // ---- BVH construction (CPU) ------------------------------------------
+  // Simple top-down median-split over cell AABBs, one cell per leaf. No
+  // SAH (surface-area heuristic) — at <=MAX_CELLS=48 leaves the build
+  // cost and tree quality difference aren't worth the complexity; revisit
+  // if MAX_CELLS is ever raised significantly. See the PERFORMANCE block
+  // comment at the top of this file for why the resulting tree is safe to
+  // prune with plain box-distance tests (both leaves AND internal nodes).
+
+  const MAX_BVH_NODES = 128; // full binary tree over 48 leaves needs <= 95 nodes — comfortable headroom
+
+  interface BvhBuildNode {
+    bounds: AxisBounds;
+    isLeaf: boolean;
+    cellIndex: number;          // valid only when isLeaf
+    left: BvhBuildNode | null;  // valid only when !isLeaf
+    right: BvhBuildNode | null;
+  }
+
+  function buildBvh(indices: number[], boxes: AxisBounds[]): BvhBuildNode {
+    if (indices.length === 1) {
+      const i = indices[0];
+      return { bounds: boxes[i], isLeaf: true, cellIndex: i, left: null, right: null };
+    }
+
+    let combined = boxes[indices[0]];
+    for (let k = 1; k < indices.length; k++) combined = unionAABB(combined, boxes[indices[k]]);
+
+    const spanX = combined.xMax - combined.xMin;
+    const spanY = combined.yMax - combined.yMin;
+    const spanZ = combined.zMax - combined.zMin;
+    const axis: 'x' | 'y' | 'z' = spanX >= spanY && spanX >= spanZ ? 'x' : spanY >= spanZ ? 'y' : 'z';
+
+    const centroid = (i: number) => {
+      const b = boxes[i];
+      if (axis === 'x') return (b.xMin + b.xMax) / 2;
+      if (axis === 'y') return (b.yMin + b.yMax) / 2;
+      return (b.zMin + b.zMax) / 2;
+    };
+    const sorted = [...indices].sort((a, b) => centroid(a) - centroid(b));
+    const mid = Math.floor(sorted.length / 2);
+
+    const left = buildBvh(sorted.slice(0, mid), boxes);
+    const right = buildBvh(sorted.slice(mid), boxes);
+    return { bounds: unionAABB(left.bounds, right.bounds), isLeaf: false, cellIndex: -1, left, right };
+  }
+
+  // Row layout per node: 3 texels (RGBA) —
+  //   col 0: (bmin.x, bmin.y, bmin.z, isLeaf ? 1 : 0)
+  //   col 1: (bmax.x, bmax.y, bmax.z, cellIndex)        [leaf only]
+  //   col 2: (leftChildIdx, rightChildIdx, 0, 0)        [internal only]
+  function writeBvhTexel(data: Float32Array, nodeIdx: number, col: number, x: number, y: number, z: number, w: number) {
+    const base = (nodeIdx * 3 + col) * 4;
+    data[base] = x; data[base + 1] = y; data[base + 2] = z; data[base + 3] = w;
+  }
+
+  /**
+   * Flatten the built tree into `data` (pre-order: a node's own texels are
+   * written on entry, its children's subtree indices are back-filled into
+   * its own col-2 texel once known). Returns the total node count used
+   * (root is always index 0). Silently stops writing past MAX_BVH_NODES —
+   * unreachable in practice since the cell cap already bounds tree size,
+   * kept as defensive insurance rather than an unchecked assumption.
+   */
+  function flattenBvh(root: BvhBuildNode, data: Float32Array): number {
+    let counter = 0;
+
+    function assign(node: BvhBuildNode): number {
+      const idx = counter;
+      counter += 1;
+
+      if (idx < MAX_BVH_NODES) {
+        const b = node.bounds;
+        writeBvhTexel(data, idx, 0, b.xMin, b.yMin, b.zMin, node.isLeaf ? 1 : 0);
+        if (node.isLeaf) {
+          writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, node.cellIndex);
+          writeBvhTexel(data, idx, 2, 0, 0, 0, 0);
+        } else {
+          writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, 0);
+        }
+      }
+
+      if (!node.isLeaf) {
+        const leftIdx = counter;
+        assign(node.left!);
+        const rightIdx = counter;
+        assign(node.right!);
+        if (idx < MAX_BVH_NODES) {
+          writeBvhTexel(data, idx, 2, leftIdx, rightIdx, 0, 0);
+        }
+      }
+
+      return idx;
+    }
+
+    assign(root);
+    return Math.min(counter, MAX_BVH_NODES);
   }
 
   // ---- Component state ------------------------------------------------------
@@ -201,6 +474,7 @@
   let camera: THREE.OrthographicCamera;
   let shaderMaterial: THREE.ShaderMaterial;
   let tokenTexture: THREE.DataTexture | null = null;
+  let bvhTexture: THREE.DataTexture | null = null;
 
   let cameraTheta = $state(Math.PI / 4);
   let cameraPhi = $state(Math.PI / 3);
@@ -225,6 +499,11 @@
     #define TOK_TEX_H ${MAX_CELLS}.0
     #define MAX_TOKEN_ITERS ${MAX_TOKENS_PER_CELL}
 
+    #define MAX_BVH_NODES ${MAX_BVH_NODES}
+    #define BVH_TEX_H ${MAX_BVH_NODES}.0
+    #define MAX_BVH_STACK 32
+    #define MAX_BVH_ITERS 160
+
     uniform vec3 uCamPos;
     uniform vec3 uCamForward;
     uniform vec3 uCamRight;
@@ -240,6 +519,14 @@
     uniform vec3 uCellColor[MAX_CELLS];
     uniform int uCellTokenCount[MAX_CELLS];
     uniform sampler2D uTokenTex;
+
+    // BVH over cell AABBs — see PERFORMANCE comment at the top of the
+    // <script> block. 3 texels per node (width=3, height=MAX_BVH_NODES):
+    //   col 0: (bmin.x, bmin.y, bmin.z, isLeaf ? 1 : 0)
+    //   col 1: (bmax.x, bmax.y, bmax.z, cellIndex)         [leaf only]
+    //   col 2: (leftChildIdx, rightChildIdx, -, -)         [internal only]
+    uniform sampler2D uBvhTex;
+    uniform int uBvhNodeCount;
 
     varying vec2 vUv;
 
@@ -263,11 +550,33 @@
       return texture2D(uTokenTex, vec2(u, v)).rg;
     }
 
+    vec4 fetchBvhTexel(int nodeIdx, int col) {
+      float u = (float(col) + 0.5) / 3.0;
+      float v = (float(nodeIdx) + 0.5) / BVH_TEX_H;
+      return texture2D(uBvhTex, vec2(u, v));
+    }
+
+    // Exact signed distance to an axis-aligned box — negative inside,
+    // positive outside, zero on the boundary. Valid as a BVH pruning
+    // bound for BOTH leaves and internal nodes — see the PERFORMANCE
+    // comment at the top of the <script> block for the proof sketch
+    // (any ball around p that fits inside the true shape also fits
+    // inside a box containing that shape, so the box can never claim
+    // less "room" at p than the shape actually has).
+    float boxSDF(vec3 p, vec3 bmin, vec3 bmax) {
+      vec3 c = (bmin + bmax) * 0.5;
+      vec3 h = (bmax - bmin) * 0.5;
+      vec3 q = abs(p - c) - h;
+      return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+    }
+
     // Region -> signed distance. Inside/Outside read a surface's own exact
     // SDF (negated for Outside); Intersection = max (AND), Union = min
     // (OR), Complement = negate (NOT) — the standard SDF-CSG combinators.
     // This is what makes union/subtraction "just work" once the DSL grows
-    // component types that produce those Region shapes.
+    // component types that produce those Region shapes. This is the
+    // EXPENSIVE per-cell evaluation the BVH traversal below exists to
+    // avoid calling except at surviving leaves.
     float evalRegion(int cellIdx, vec3 p) {
       int tokenCount = uCellTokenCount[cellIdx];
       float stack[16];
@@ -296,14 +605,53 @@
       return sp > 0 ? stack[0] : 1.0e6;
     }
 
+    // Iterative BVH descent (GLSL ES 1.00 has no recursion — explicit
+    // stack, same dynamic-local-array-indexing pattern evalRegion already
+    // uses above). At each popped node: box-test it against the best hit
+    // found so far and skip the whole subtree if it can't possibly beat
+    // that (boxSDF is a valid lower bound for every cell in that
+    // subtree — see the comment on boxSDF()). Only leaves that survive
+    // pruning ever call the expensive evalRegion().
     float sceneSDF(vec3 p, out int hitCell) {
-      float best = 1.0e6;
       hitCell = -1;
-      for (int i = 0; i < MAX_CELLS; i++) {
-        if (i >= uCellCount) break;
-        float d = evalRegion(i, p);
-        if (d < best) { best = d; hitCell = i; }
+      float best = 1.0e6;
+
+      if (uBvhNodeCount <= 0) return best;
+
+      int stack[MAX_BVH_STACK];
+      int sp = 0;
+      stack[sp] = 0; sp++; // root is always node index 0
+
+      for (int iter = 0; iter < MAX_BVH_ITERS; iter++) {
+        if (sp <= 0) break;
+        sp--;
+        int nodeIdx = stack[sp];
+        if (nodeIdx < 0 || nodeIdx >= uBvhNodeCount) continue;
+
+        vec4 t0 = fetchBvhTexel(nodeIdx, 0);
+        vec4 t1 = fetchBvhTexel(nodeIdx, 1);
+        vec3 bmin = t0.xyz;
+        vec3 bmax = t1.xyz;
+
+        float boxD = boxSDF(p, bmin, bmax);
+        if (boxD >= best) continue; // subtree cannot contain anything closer than what we already have
+
+        if (t0.w > 0.5) {
+          // Leaf — exact evaluation.
+          int cellIdx = int(t1.w + 0.5);
+          float exact = evalRegion(cellIdx, p);
+          if (exact < best) { best = exact; hitCell = cellIdx; }
+        } else {
+          // Internal — push both children, let the box test on their own
+          // pop prune them if they turn out not to matter.
+          vec4 t2 = fetchBvhTexel(nodeIdx, 2);
+          int leftIdx = int(t2.x + 0.5);
+          int rightIdx = int(t2.y + 0.5);
+          if (sp < MAX_BVH_STACK) { stack[sp] = leftIdx; sp++; }
+          if (sp < MAX_BVH_STACK) { stack[sp] = rightIdx; sp++; }
+        }
       }
+
       return best;
     }
 
@@ -364,6 +712,8 @@
       uCellColor: { value: Array.from({ length: MAX_CELLS }, () => new THREE.Color(0, 0, 0)) },
       uCellTokenCount: { value: new Array(MAX_CELLS).fill(0) },
       uTokenTex: { value: null as THREE.DataTexture | null },
+      uBvhTex: { value: null as THREE.DataTexture | null },
+      uBvhNodeCount: { value: 0 },
     };
   }
 
@@ -404,6 +754,8 @@
     const surfacesUsed = csg.surfaces.slice(0, MAX_SURFACES);
     truncatedSurfaces = csg.surfaces.length > MAX_SURFACES;
     const surfIndex = new Map(surfacesUsed.map((s, i) => [s.id, i]));
+    const surfaceById = new Map(surfacesUsed.map((s) => [s.id, s]));
+    const sceneBounds = computeBounds(csg);
 
     const surfType = u.uSurfType.value as number[];
     const surfParams = u.uSurfParams.value as THREE.Vector4[];
@@ -423,6 +775,7 @@
     const texData = new Float32Array(MAX_TOKENS_PER_CELL * MAX_CELLS * 4);
     let anyCellTruncated = false;
     const legendSeen = new Map<string, string>();
+    const cellBoxes: AxisBounds[] = [];
 
     cellsUsed.forEach((cell, ci) => {
       const matId = cell.material_id!;
@@ -441,8 +794,13 @@
         texData[texelIdx] = tokens[p * 2];
         texData[texelIdx + 1] = tokens[p * 2 + 1];
       }
+
+      cellBoxes.push(cellAABB(cell.region, surfaceById, sceneBounds));
     });
-    for (let ci = cellsUsed.length; ci < MAX_CELLS; ci++) { cellColor[ci].setRGB(0, 0, 0); cellTokenCount[ci] = 0; }
+    for (let ci = cellsUsed.length; ci < MAX_CELLS; ci++) {
+      cellColor[ci].setRGB(0, 0, 0);
+      cellTokenCount[ci] = 0;
+    }
 
     truncatedTokens = anyCellTruncated;
     cellCount = cellsUsed.length;
@@ -458,6 +816,26 @@
     tokenTexture.generateMipmaps = false;
     tokenTexture.needsUpdate = true;
     u.uTokenTex.value = tokenTexture;
+
+    // Build the BVH over this frame's cell AABBs and upload it as a
+    // texture — see the PERFORMANCE comment at the top of the <script>
+    // block. Node count 0 (no cells) is a valid, cheap no-op case the
+    // shader handles directly (sceneSDF returns early).
+    const bvhTexData = new Float32Array(3 * MAX_BVH_NODES * 4);
+    let bvhNodeCount = 0;
+    if (cellsUsed.length > 0) {
+      const root = buildBvh(cellsUsed.map((_, i) => i), cellBoxes);
+      bvhNodeCount = flattenBvh(root, bvhTexData);
+    }
+    u.uBvhNodeCount.value = bvhNodeCount;
+
+    bvhTexture?.dispose();
+    bvhTexture = new THREE.DataTexture(bvhTexData, 3, MAX_BVH_NODES, THREE.RGBAFormat, THREE.FloatType);
+    bvhTexture.magFilter = THREE.NearestFilter;
+    bvhTexture.minFilter = THREE.NearestFilter;
+    bvhTexture.generateMipmaps = false;
+    bvhTexture.needsUpdate = true;
+    u.uBvhTex.value = bvhTexture;
 
     if (!hasFramedOnce) { resetCamera(); hasFramedOnce = true; }
     else { render(); }
@@ -491,13 +869,13 @@
 
   // pointermove can fire far faster than the display refresh rate — browsers
   // don't coalesce it to rAF the way they do some other input events — and
-  // render() is a full per-pixel raymarch that brute-force tests every cell
-  // at every step (see sceneSDF/evalRegion above). Calling render()
-  // synchronously from the DOM event handler meant an orbit-drag could issue
-  // many full raymarches per displayed frame — that's what actually caused
-  // the severe lag (worse with more cells: a lattice, not just a single
-  // pin). Camera-state math stays cheap and per-event; the expensive draw
-  // call is batched to at most once per animation frame.
+  // render() is a full per-pixel raymarch. Calling render() synchronously
+  // from the DOM event handler meant an orbit-drag could issue many full
+  // raymarches per displayed frame. Camera-state math stays cheap and
+  // per-event; the expensive draw call is batched to at most once per
+  // animation frame. This throttles how OFTEN a frame draws — it's
+  // complementary to, not a substitute for, the bounding-sphere pruning
+  // above, which reduces how expensive EACH frame is.
   let renderQueued = false;
   let pendingRenderFrame: number | null = null;
 
@@ -567,6 +945,7 @@
   onDestroy(() => {
     if (pendingRenderFrame !== null) cancelAnimationFrame(pendingRenderFrame);
     tokenTexture?.dispose();
+    bvhTexture?.dispose();
     renderer?.dispose();
   });
 </script>

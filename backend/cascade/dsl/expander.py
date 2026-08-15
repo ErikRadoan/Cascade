@@ -43,6 +43,27 @@ docstring has always described but that never actually existed in this
 file. Every Union/Subtraction/Intersection placement previously failed at
 Step 2 with the generic "no placement handler" TypeError, regardless of
 how the YAML was written; that dispatch gap is closed below.
+
+Phase C cleanup (this pass): FuelPin's radial-surface/cell-layer expansion
+previously lived TWICE — once here (`_expand_fuel_pin_radial` /
+`_build_fuel_pin_cells` / `_place_fuel_pin`), and once, byte-for-byte
+identically, in `dsl/templates.py`'s `_FuelPinTemplateExpander` behind
+`TEMPLATE_REGISTRY` (geometry-restructuring-plan.md Phase C). The registry
+was built but never actually wired up here — `expand()` still dispatched
+on `isinstance(tpl, FuelPinSchema)` and called its own private copy of the
+expansion logic instead of `templates.expand_template()`. That's fixed
+now: this file's copies of those three functions are gone, and every
+composite-template dispatch (`SinglePlacement` + both lattice types) now
+goes through `templates.is_composite_template()` /
+`templates.expand_template()`. `FuelPinSchema` is still imported directly
+here only for the boolean-operand rejection check in
+`_expand_shape_at_origin()` (a FuelPin cannot be used as a boolean operand
+— see that function's docstring) and for the Box-vs-FuelPin ordering
+skip in Step 2. Box remains the one explicit, documented exception to the
+registry (geometry-restructuring-plan.md Phase C, resolution (a)) — its
+axial-plane-sharing with FuelPin doesn't fit the registry's
+independent-per-template contract, and generalizing that coupling isn't
+worth it for a pattern with exactly one user.
 """
 
 from __future__ import annotations
@@ -57,6 +78,7 @@ from ..domain.geometry import (
     region_from_yaml_dict,
 )
 from . import primitives
+from . import templates
 from .schema.base import BaseComponentSchema
 from .schema.boolean import IntersectionSchema, SubtractionSchema, UnionSchema
 from .schema.box import BoxSchema
@@ -159,53 +181,18 @@ def _translate(objects: list[Surface | Cell], dx: float, dy: float, dz: float,
 
 
 # ---------------------------------------------------------------------------
-# Template expanders — produce geometry at the origin, NO axial planes
-# for FuelPin (axial bounds come from the Box)
+# Box — the one explicit, documented exception to TEMPLATE_REGISTRY.
+#
+# Box is not in templates.TEMPLATE_REGISTRY (see templates.py's module
+# docstring and geometry-restructuring-plan.md Phase C's "Box axial-sharing
+# problem"): its fill cell must exclude every fuel pin's outermost surface,
+# but pins are placed AFTER the box (so they can borrow its z-planes as
+# their own axial bounds) — the fill cell can't be computed until every
+# pin placement has run, which doesn't fit a registry entry's "return
+# everything for this instance, right now" contract. Resolution (a) from
+# the plan: Box stays a narrow, explicitly-named exception here; every
+# other template goes through the registry.
 # ---------------------------------------------------------------------------
-
-def _expand_fuel_pin_radial(
-    schema: FuelPinSchema,
-    ctx: Context,
-) -> tuple[list[Surface], str | None]:
-    surfaces: list[Surface] = []
-    layer_surfaces: list[Surface] = []
-
-    for outer_r, _ in schema.radial_layers():
-        s = Surface(id=ctx.fresh_id("s"), type_=SurfaceType.CYLINDER_Z,
-                    params={"r": outer_r, "x0": 0.0, "y0": 0.0})
-        surfaces.append(s)
-        layer_surfaces.append(s)
-
-    outermost_id = layer_surfaces[-1].id if layer_surfaces else None
-    return surfaces, outermost_id
-
-
-def _build_fuel_pin_cells(
-    schema: FuelPinSchema,
-    layer_surface_ids: list[str],
-    bot_id: str,
-    top_id: str,
-    ctx: Context,
-    cell_name_prefix: str,
-) -> list[Cell]:
-    cells: list[Cell] = []
-    axial = [Outside(bot_id), Inside(top_id)]
-
-    for i, (_, mat_id) in enumerate(schema.radial_layers()):
-        outer_id = layer_surface_ids[i]
-        radial = (
-            [Inside(outer_id)]
-            if i == 0
-            else [Outside(layer_surface_ids[i-1]), Inside(outer_id)]
-        )
-        cells.append(Cell(
-            id=          ctx.fresh_id("c"),
-            region=      Intersection(radial + axial),
-            material_id= mat_id,
-            name=        f"{cell_name_prefix}_layer{i}",
-        ))
-    return cells
-
 
 def _expand_box_surfaces(
     schema: BoxSchema, ctx: Context,
@@ -235,10 +222,6 @@ def _expand_box_surfaces(
     return [s_xlo, s_xhi, s_ylo, s_yhi, s_bot, s_top], label_map
 
 
-# ---------------------------------------------------------------------------
-# Placement functions
-# ---------------------------------------------------------------------------
-
 def _place_box(
     schema: BoxSchema,
     position: tuple[float, float, float],
@@ -265,53 +248,6 @@ def _place_box(
     ctx.axial_top_id = translated_labels["top"]
 
     return translated, translated_labels
-
-
-def _place_fuel_pin(
-    schema: FuelPinSchema,
-    position: tuple[float, float, float],
-    ctx: Context,
-    cell_name_prefix: str,
-) -> list[Surface | Cell]:
-    if not ctx.has_axial_bounds():
-        raise RuntimeError(
-            "Cannot place a FuelPin without axial bounds. "
-            "Place a Box (via SinglePlacement) before placing fuel pins. "
-            "The Box provides the z-plane surfaces shared by all pins."
-        )
-
-    dx, dy, dz = position
-
-    radial_surfaces, outermost_id = _expand_fuel_pin_radial(schema, ctx)
-
-    translated_surfaces: list[Surface] = []
-    id_map: dict[str, str] = {}
-    for s in radial_surfaces:
-        new_id = ctx.fresh_id("s")
-        id_map[s.id] = new_id
-        translated_surfaces.append(Surface(
-            id=            new_id,
-            type_=         s.type_,
-            params=        _translate_params(s.type_, s.params, dx, dy, 0.0),
-            boundary_type= s.boundary_type,
-        ))
-
-    if outermost_id:
-        new_outermost = id_map.get(outermost_id)
-        if new_outermost:
-            ctx.outermost_surfaces.append(new_outermost)
-
-    translated_layer_ids = [id_map[s.id] for s in radial_surfaces]
-    cells = _build_fuel_pin_cells(
-        schema=            schema,
-        layer_surface_ids= translated_layer_ids,
-        bot_id=            ctx.axial_bot_id,
-        top_id=            ctx.axial_top_id,
-        ctx=               ctx,
-        cell_name_prefix=  cell_name_prefix,
-    )
-
-    return translated_surfaces + cells
 
 
 def _build_fill_cell(
@@ -390,8 +326,9 @@ def _expand_shape_at_origin(
         - FuelPin
             Explicitly rejected. A FuelPin has no self-contained region:
             its axial bounds are borrowed from a placed Box at placement
-            time (see _place_fuel_pin), so — unlike every other operand
-            type here — it cannot be resolved in isolation at all.
+            time (see templates.py's _FuelPinTemplateExpander), so —
+            unlike every other operand type here — it cannot be resolved
+            in isolation at all.
 
     Args:
         schema:    The operand's own schema, already looked up by the
@@ -499,14 +436,13 @@ def _place_boolean_composite(
     """Place one boolean composite at `position`, producing translated
     surfaces plus ONE filled cell.
 
-    Mirrors _place_box()/_place_fuel_pin()'s origin-then-translate
-    pattern: _expand_shape_at_origin() resolves the entire operand tree
-    once, entirely untranslated, and this function is the single point
-    where that tree is shifted to its actual placement position. v1 scope
-    is exactly what schema/boolean.py documents — one placement, one
-    region, one material — not a lattice of composites (SquareLattice/
-    HexLattice still only accept a FuelPin template; see Step 2's `else`
-    branches for those, unchanged by this addition).
+    Mirrors _place_box()'s origin-then-translate pattern:
+    _expand_shape_at_origin() resolves the entire operand tree once,
+    entirely untranslated, and this function is the single point where
+    that tree is shifted to its actual placement position. v1 scope is
+    exactly what schema/boolean.py documents — one placement, one region,
+    one material — not a lattice of composites (SquareLattice/HexLattice
+    still only accept a FuelPin template; see Step 2's dispatch below).
 
     Args:
         schema:        The resolved UnionSchema/SubtractionSchema/
@@ -518,7 +454,7 @@ def _place_boolean_composite(
         position:      (dx, dy, dz) from the SinglePlacement.
         cell_name:      The placement's own name — becomes the resulting
                        Cell's name, same convention _build_fill_cell() and
-                       _place_fuel_pin() already use.
+                       templates.py's FuelPin expander already use.
     """
     dx, dy, dz = position
     local_surfaces, local_region = _expand_shape_at_origin(schema, template_name, schemas, ctx)
@@ -547,20 +483,29 @@ def expand(
 ) -> CascadeGeometry:
     """Expand validated schemas into a CascadeGeometry.
 
-    Step 0 (new — Phase A/B): expand every Tier-1 primitive, then resolve
-        every Tier-2 Cell's region against the complete primitive
-        name -> Surface.id map. See module docstring's ordering note.
-    Step 1: Find the Box SinglePlacement, translate its surfaces,
-        register axial bounds in ctx. (legacy template pipeline)
-    Step 2: Place all fuel pin placements (SinglePlacement + lattices),
-        sharing the box's z-planes as axial bounds. (legacy)
-    Step 3: Build the fill cell using ctx.outermost_surfaces. (legacy)
+    Step 0: expand every Tier-1 primitive, then resolve every Tier-2 Cell's
+        region against the complete primitive name -> Surface.id map (see
+        module docstring's ordering note).
+    Step 1: Find the Box SinglePlacement, translate its surfaces, register
+        axial bounds in ctx. Box stays the one explicit exception to
+        TEMPLATE_REGISTRY (see module docstring).
+    Step 2: Dispatch every other placement (SinglePlacement + both lattice
+        types) through templates.TEMPLATE_REGISTRY via
+        templates.expand_template() — this is what Phase C's cleanup
+        wired up; FuelPin's expansion logic now lives in exactly one
+        place (dsl/templates.py), not duplicated here. Boolean composites
+        (Union/Subtraction/Intersection) remain their own explicit branch,
+        since they aren't part of TEMPLATE_REGISTRY (they're the pre-Phase-B
+        design Phase F has not removed yet).
+    Step 3: Build the Box's fill cell using ctx.outermost_surfaces, which
+        every composite-template placement (via templates.py) and boolean
+        composite placement populates identically to before this cleanup.
     """
     ctx = Context(param_values=param_values or {})
     all_objects: list[Surface | Cell] = []
 
     # ------------------------------------------------------------------
-    # Step 0 — Tier-1 primitives and Tier-2 Cells (new in v4)
+    # Step 0 — Tier-1 primitives and Tier-2 Cells
     # ------------------------------------------------------------------
     primitive_name_to_id: dict[str, str] = {}
     cell_schemas: dict[str, CellSchema] = {}
@@ -589,11 +534,11 @@ def expand(
         ))
 
     # ------------------------------------------------------------------
-    # Legacy pipeline (Box/FuelPin/lattice templates + placements) —
-    # unchanged from v3, operating only on whatever wasn't a Tier-1
+    # Legacy pipeline (Box/FuelPin/lattice templates + placements +
+    # boolean composites) — operating only on whatever wasn't a Tier-1
     # primitive or Tier-2 Cell above.
     # ------------------------------------------------------------------
-    templates:  dict[str, BaseComponentSchema] = {}
+    templates_by_name: dict[str, BaseComponentSchema] = {}
     placements: dict[str, BaseComponentSchema] = {}
 
     _PLACEMENT_TYPES = (SinglePlacementSchema, SquareLatticeSchema, HexLatticeSchema)
@@ -601,19 +546,19 @@ def expand(
         if isinstance(schema, _PLACEMENT_TYPES):
             placements[name] = schema
         else:
-            templates[name] = schema
+            templates_by_name[name] = schema
 
     box_schema:            BoxSchema | None        = None
     box_translated_labels: dict[str, str] | None  = None
     box_placement_name:    str | None              = None
 
     # ------------------------------------------------------------------
-    # Step 1 — Box placements first
+    # Step 1 — Box placements first (the documented registry exception)
     # ------------------------------------------------------------------
     for name, schema in placements.items():
         if not isinstance(schema, SinglePlacementSchema):
             continue
-        tpl = templates.get(schema.template)
+        tpl = templates_by_name.get(schema.template)
         if not isinstance(tpl, BoxSchema):
             continue
 
@@ -630,11 +575,13 @@ def expand(
         box_placement_name    = name
 
     # ------------------------------------------------------------------
-    # Step 2 — Fuel pin placements (SinglePlacement + lattices)
+    # Step 2 — Every other placement: composite templates via
+    # TEMPLATE_REGISTRY (Phase C), boolean composites via their own
+    # explicit branch (pre-Phase-F design).
     # ------------------------------------------------------------------
     for name, schema in placements.items():
         if isinstance(schema, SinglePlacementSchema):
-            tpl = templates.get(schema.template)
+            tpl = templates_by_name.get(schema.template)
             if tpl is None:
                 raise ValueError(
                     f"SinglePlacement '{name}' references undefined template "
@@ -643,9 +590,10 @@ def expand(
             if isinstance(tpl, BoxSchema):
                 continue  # already handled in Step 1
 
-            if isinstance(tpl, FuelPinSchema):
-                placed = _place_fuel_pin(tpl, schema.position(), ctx, cell_name_prefix=name)
-                all_objects.extend(placed)
+            if templates.is_composite_template(tpl):
+                surfaces, cells = templates.expand_template(ctx, tpl, name, schema.position())
+                all_objects.extend(surfaces)
+                all_objects.extend(cells)
             elif isinstance(tpl, _BOOLEAN_COMPOSITE_TYPES):
                 placed = _place_boolean_composite(
                     tpl, schema.template, schema.position(), ctx, schemas,
@@ -660,16 +608,17 @@ def expand(
                 )
 
         elif isinstance(schema, SquareLatticeSchema):
-            tpl = templates.get(schema.template)
+            tpl = templates_by_name.get(schema.template)
             if tpl is None:
                 raise ValueError(
                     f"SquareLattice '{name}' references undefined template "
                     f"'{schema.template}'."
                 )
-            if isinstance(tpl, FuelPinSchema):
+            if templates.is_composite_template(tpl):
                 for i, pos in enumerate(schema.pin_positions()):
-                    placed = _place_fuel_pin(tpl, pos, ctx, cell_name_prefix=f"{name}_{i}")
-                    all_objects.extend(placed)
+                    surfaces, cells = templates.expand_template(ctx, tpl, f"{name}_{i}", pos)
+                    all_objects.extend(surfaces)
+                    all_objects.extend(cells)
             else:
                 raise TypeError(
                     f"SquareLattice '{name}': template type "
@@ -677,16 +626,17 @@ def expand(
                 )
 
         elif isinstance(schema, HexLatticeSchema):
-            tpl = templates.get(schema.template)
+            tpl = templates_by_name.get(schema.template)
             if tpl is None:
                 raise ValueError(
                     f"HexLattice '{name}' references undefined template "
                     f"'{schema.template}'."
                 )
-            if isinstance(tpl, FuelPinSchema):
+            if templates.is_composite_template(tpl):
                 for i, pos in enumerate(schema.pin_positions()):
-                    placed = _place_fuel_pin(tpl, pos, ctx, cell_name_prefix=f"{name}_{i}")
-                    all_objects.extend(placed)
+                    surfaces, cells = templates.expand_template(ctx, tpl, f"{name}_{i}", pos)
+                    all_objects.extend(surfaces)
+                    all_objects.extend(cells)
             else:
                 raise TypeError(
                     f"HexLattice '{name}': template type "
