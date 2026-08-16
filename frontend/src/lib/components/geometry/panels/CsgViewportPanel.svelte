@@ -55,6 +55,13 @@
   //   box tests instead of O(cells)), not a heuristic margin — it scales
   //   to far more than 48 cells without the pruning quality degrading,
   //   which is what would eventually be needed if MAX_CELLS is raised.
+  //
+  // PERF DEBUG INSTRUMENTATION (temporary — see conversation, remove once
+  // the rotation-lag investigation is resolved): console.log timing for
+  // fetch/rebuild/BVH-build/render, GPU renderer identification, and
+  // per-frame min/avg/max timing broken out from pointer-move event
+  // counts, so a stutter (spike hidden by an average) is distinguishable
+  // from elevated steady-state cost or an event-flood problem.
 
   import { onMount, onDestroy } from 'svelte';
   import * as THREE from 'three';
@@ -452,17 +459,22 @@
     fetchHandle = setTimeout(() => load(text), 400);
   });
 
+  // ---- PERF DEBUG: fetch + rebuild timing ----------------------------------
   async function load(text: string) {
+    const t0 = performance.now();
     loading = true;
     loadError = null;
     try {
       csg = await api.geometry.csg(text);
+      console.log(`[perf] /geometry/csg fetch: ${(performance.now() - t0).toFixed(1)}ms`);
     } catch (e) {
       loadError = e instanceof Error ? e.message : String(e);
       csg = null;
     } finally {
       loading = false;
+      const tRebuild0 = performance.now();
       rebuildAndRender();
+      console.log(`[perf] rebuildAndRender: ${(performance.now() - tRebuild0).toFixed(1)}ms`);
     }
   }
 
@@ -717,25 +729,38 @@
     };
   }
 
+  // ---- PERF DEBUG: hoisted scratch vectors ---------------------------------
+  // updateCameraUniforms() previously allocated 4 fresh THREE.Vector3s on
+  // every call — and it's called on every rendered frame, including every
+  // pointer-move-triggered frame during a drag. On weak/integrated GPUs
+  // with a less aggressive young-gen GC this is a plausible source of
+  // periodic micro-stutter that doesn't show up as elevated average frame
+  // time (see conversation — render() itself measured well under budget).
+  // Hoisted to module scope and mutated in place: zero allocations/frame.
+  const _camPos = new THREE.Vector3();
+  const _forward = new THREE.Vector3();
+  const _worldUp = new THREE.Vector3(0, 0, 1); // OpenMC z is "up" — same convention as Viewport3D's toThree()
+  const _right = new THREE.Vector3();
+  const _up = new THREE.Vector3();
+
   function updateCameraUniforms() {
     if (!shaderMaterial) return;
     const camX = cameraTarget.x + cameraDistance * Math.sin(cameraPhi) * Math.cos(cameraTheta);
     const camY = cameraTarget.y + cameraDistance * Math.sin(cameraPhi) * Math.sin(cameraTheta);
     const camZ = cameraTarget.z + cameraDistance * Math.cos(cameraPhi);
-    const camPos = new THREE.Vector3(camX, camY, camZ);
+    _camPos.set(camX, camY, camZ);
 
-    const forward = cameraTarget.clone().sub(camPos).normalize();
-    const worldUp = new THREE.Vector3(0, 0, 1); // OpenMC z is "up" — same convention as Viewport3D's toThree()
-    let right = new THREE.Vector3().crossVectors(forward, worldUp);
-    if (right.lengthSq() < 1e-8) right.set(1, 0, 0);
-    right.normalize();
-    const up = new THREE.Vector3().crossVectors(right, forward).normalize();
+    _forward.copy(cameraTarget).sub(_camPos).normalize();
+    _right.crossVectors(_forward, _worldUp);
+    if (_right.lengthSq() < 1e-8) _right.set(1, 0, 0);
+    _right.normalize();
+    _up.crossVectors(_right, _forward).normalize();
 
     const u = shaderMaterial.uniforms;
-    u.uCamPos.value.copy(camPos);
-    u.uCamForward.value.copy(forward);
-    u.uCamRight.value.copy(right);
-    u.uCamUp.value.copy(up);
+    u.uCamPos.value.copy(_camPos);
+    u.uCamForward.value.copy(_forward);
+    u.uCamRight.value.copy(_right);
+    u.uCamUp.value.copy(_up);
   }
 
   function rebuildAndRender() {
@@ -821,6 +846,9 @@
     // texture — see the PERFORMANCE comment at the top of the <script>
     // block. Node count 0 (no cells) is a valid, cheap no-op case the
     // shader handles directly (sceneSDF returns early).
+    // PERF DEBUG: timed separately from the rest of rebuildAndRender()
+    // since this is the newest piece of the pipeline.
+    const tBvh0 = performance.now();
     const bvhTexData = new Float32Array(3 * MAX_BVH_NODES * 4);
     let bvhNodeCount = 0;
     if (cellsUsed.length > 0) {
@@ -828,6 +856,7 @@
       bvhNodeCount = flattenBvh(root, bvhTexData);
     }
     u.uBvhNodeCount.value = bvhNodeCount;
+    console.log(`[perf] BVH build: ${(performance.now() - tBvh0).toFixed(2)}ms, nodes=${bvhNodeCount}, cells=${cellsUsed.length}`);
 
     bvhTexture?.dispose();
     bvhTexture = new THREE.DataTexture(bvhTexData, 3, MAX_BVH_NODES, THREE.RGBAFormat, THREE.FloatType);
@@ -857,10 +886,42 @@
     render();
   }
 
+  // ---- PERF DEBUG: per-frame min/avg/max + event-vs-render counts ---------
+  // Averages hide stutter — a scene that's fast 29 times and slow once
+  // still averages low but feels janky. Tracking max separately, plus
+  // how many pointermove events actually resulted in a render() call,
+  // distinguishes three different failure modes: (1) elevated steady-
+  // state cost -> avg is high, (2) periodic stutter (e.g. GC pauses) ->
+  // avg looks fine but max spikes, (3) rAF coalescing not working ->
+  // renders ~= pointermoves instead of << pointermoves.
+  let frameCount = 0;
+  let frameTimeSum = 0;
+  let frameTimeMax = 0;
+  let pointerMoveCount = 0;
+
   function render() {
     if (!renderer) return;
     updateCameraUniforms();
+    const t0 = performance.now();
     renderer.render(scene, camera);
+    const dt = performance.now() - t0;
+
+    frameCount++;
+    frameTimeSum += dt;
+    frameTimeMax = Math.max(frameTimeMax, dt);
+
+    if (frameCount % 30 === 0) {
+      const size = renderer.getSize(new THREE.Vector2());
+      console.log(
+        `[perf] avg=${(frameTimeSum / 30).toFixed(2)}ms max=${frameTimeMax.toFixed(2)}ms ` +
+        `(${(1000 / (frameTimeSum / 30)).toFixed(0)} fps) ` +
+        `canvas=${size.x}x${size.y} dpr=${renderer.getPixelRatio()} ` +
+        `cells=${cellCount} bvhNodes=${shaderMaterial.uniforms.uBvhNodeCount.value} ` +
+        `renders=${frameCount} pointermoves=${pointerMoveCount}`
+      );
+      frameTimeSum = 0;
+      frameTimeMax = 0;
+    }
   }
 
   // ---- Orbit / zoom (same feel as Viewport3D / ResultsViewport3D) -----------
@@ -895,6 +956,7 @@
   }
   function onPointerMove(e: PointerEvent) {
     if (!isDragging) return;
+    pointerMoveCount++;
     const dx = e.clientX - lastX, dy = e.clientY - lastY;
     lastX = e.clientX; lastY = e.clientY;
     cameraTheta -= dx * 0.005;
@@ -933,6 +995,28 @@
 
     renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: false });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // shader is per-pixel expensive — cap DPR
+
+    // PERF DEBUG: identify whether we're actually on hardware acceleration
+    // or a software (SwiftShader/llvmpipe) fallback — the single most
+    // common cause of "small scene, still laggy" reports. RENDERER/VENDOR
+    // are the non-deprecated replacements for the WEBGL_debug_renderer_info
+    // extension's UNMASKED_* constants where the browser supports them;
+    // fall back to the extension for browsers that don't expose the plain
+    // parameters without it.
+    const gl = renderer.getContext();
+    try {
+      const dbgInfo = gl.getExtension('WEBGL_debug_renderer_info');
+      const rendererStr = dbgInfo
+        ? gl.getParameter(dbgInfo.UNMASKED_RENDERER_WEBGL)
+        : gl.getParameter(gl.RENDERER);
+      const vendorStr = dbgInfo
+        ? gl.getParameter(dbgInfo.UNMASKED_VENDOR_WEBGL)
+        : gl.getParameter(gl.VENDOR);
+      console.log('[perf] GPU renderer:', rendererStr);
+      console.log('[perf] GPU vendor:', vendorStr);
+    } catch (e) {
+      console.log('[perf] Could not query GPU renderer info:', e);
+    }
 
     resize();
     rebuildAndRender();
