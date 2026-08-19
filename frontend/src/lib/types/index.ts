@@ -376,9 +376,32 @@ export interface CsgCell {
   region: RegionNode;
 }
 
+// ---------------------------------------------------------------------------
+// Lattice instancing (CSG_VIEWER_SCALING_PLAN.md Phase C)
+//
+// Additive, side-channel data alongside the existing flat surfaces/cells —
+// see backend/cascade/domain/geometry.py's LatticeInstance and
+// services/csg_export_service.py. `instances` are (x, y, z) offsets
+// relative to instance 0's own position (instances[0] is always
+// [0, 0, 0]) — translation only, no rotation component, since neither
+// SquareLatticeSchema nor HexLatticeSchema varies orientation per pin
+// today. Consumers that don't use this field can ignore it entirely and
+// fall back to the flat surfaces/cells lists, which are always complete
+// on their own (this is a side-channel accelerator, not a replacement).
+// ---------------------------------------------------------------------------
+
+export interface LatticeInstance {
+  lattice_name: string;
+  prototype_key: string;
+  prototype_surfaces: CsgSurface[];
+  prototype_cells: CsgCell[];
+  instances: [number, number, number][];
+}
+
 export interface CsgGeometry {
   surfaces: CsgSurface[];
   cells: CsgCell[];
+  lattice_instances: LatticeInstance[];
 }
 
 export interface RasterLegendEntry {

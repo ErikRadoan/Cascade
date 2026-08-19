@@ -44,26 +44,32 @@ file. Every Union/Subtraction/Intersection placement previously failed at
 Step 2 with the generic "no placement handler" TypeError, regardless of
 how the YAML was written; that dispatch gap is closed below.
 
-Phase C cleanup (this pass): FuelPin's radial-surface/cell-layer expansion
-previously lived TWICE — once here (`_expand_fuel_pin_radial` /
-`_build_fuel_pin_cells` / `_place_fuel_pin`), and once, byte-for-byte
-identically, in `dsl/templates.py`'s `_FuelPinTemplateExpander` behind
-`TEMPLATE_REGISTRY` (geometry-restructuring-plan.md Phase C). The registry
-was built but never actually wired up here — `expand()` still dispatched
-on `isinstance(tpl, FuelPinSchema)` and called its own private copy of the
-expansion logic instead of `templates.expand_template()`. That's fixed
-now: this file's copies of those three functions are gone, and every
-composite-template dispatch (`SinglePlacement` + both lattice types) now
-goes through `templates.is_composite_template()` /
-`templates.expand_template()`. `FuelPinSchema` is still imported directly
-here only for the boolean-operand rejection check in
-`_expand_shape_at_origin()` (a FuelPin cannot be used as a boolean operand
-— see that function's docstring) and for the Box-vs-FuelPin ordering
-skip in Step 2. Box remains the one explicit, documented exception to the
-registry (geometry-restructuring-plan.md Phase C, resolution (a)) — its
-axial-plane-sharing with FuelPin doesn't fit the registry's
-independent-per-template contract, and generalizing that coupling isn't
-worth it for a pattern with exactly one user.
+Phase C cleanup (template registry wiring, earlier pass): FuelPin's radial-
+surface/cell-layer expansion previously lived TWICE — once here, once in
+dsl/templates.py's _FuelPinTemplateExpander behind TEMPLATE_REGISTRY. The
+registry was built but never wired up here — that's fixed; every
+composite-template dispatch (SinglePlacement + both lattice types) goes
+through templates.is_composite_template()/templates.expand_template().
+Box remains the one explicit, documented exception to the registry — see
+templates.py's module docstring.
+
+Lattice-instancing capture (this pass — CSG_VIEWER_SCALING_PLAN.md Phase
+C): SquareLatticeSchema/HexLatticeSchema already resolve exactly one
+shared template and reuse it for every pin position. That grouping — "N
+cells are one template repeated N times" — is captured here as a
+domain.geometry.LatticeInstance record (prototype surfaces/cells from pin
+index 0, plus every pin's position as an offset relative to pin 0) and
+attached to the returned CascadeGeometry via `lattice_instances`. This is
+purely additive: the existing flat `all_objects` -> `surfaces`/`cells`
+expansion is completely unchanged, every pin is still fully expanded and
+translated exactly as before (OpenMC/Serpent2 XML export depends on the
+flat form and is untouched by this change — see the plan doc's §4.2).
+Consumers that don't know about `lattice_instances` see the exact same
+geometry they always did. Only composite-template lattices (FuelPin
+today) produce a LatticeInstance record; boolean-composite and
+unsupported-template lattice branches don't populate one, matching the
+fact that lattices only support composite templates today anyway (see the
+`raise TypeError` in each lattice branch below).
 """
 
 from __future__ import annotations
@@ -74,8 +80,8 @@ from typing import Any
 
 from ..domain.geometry import (
     BoundaryType, CascadeGeometry, Cell, Complement,
-    Inside, Intersection, Outside, Region, Surface, SurfaceType, Union,
-    region_from_yaml_dict,
+    Inside, Intersection, LatticeInstance, Outside, Region, Surface,
+    SurfaceType, Union, region_from_yaml_dict,
 )
 from . import primitives
 from . import templates
@@ -99,6 +105,11 @@ class Context:
     # Axial bounds from the placed Box — shared by all pin placements
     axial_bot_id:       str | None             = field(default=None)
     axial_top_id:       str | None             = field(default=None)
+    # Phase C — one LatticeInstance record per lattice placement that
+    # resolves to a composite template. Populated by the SquareLattice/
+    # HexLattice branches in expand(), read back out at the very end to
+    # populate CascadeGeometry.lattice_instances. See module docstring.
+    lattice_instances:  list[LatticeInstance]  = field(default_factory=list)
     _counter:           int                    = field(default=0, init=False, repr=False)
 
     def fresh_id(self, prefix: str = "s") -> str:
@@ -491,15 +502,17 @@ def expand(
         TEMPLATE_REGISTRY (see module docstring).
     Step 2: Dispatch every other placement (SinglePlacement + both lattice
         types) through templates.TEMPLATE_REGISTRY via
-        templates.expand_template() — this is what Phase C's cleanup
-        wired up; FuelPin's expansion logic now lives in exactly one
-        place (dsl/templates.py), not duplicated here. Boolean composites
+        templates.expand_template() — FuelPin's expansion logic lives in
+        exactly one place (dsl/templates.py). Boolean composites
         (Union/Subtraction/Intersection) remain their own explicit branch,
-        since they aren't part of TEMPLATE_REGISTRY (they're the pre-Phase-B
-        design Phase F has not removed yet).
+        since they aren't part of TEMPLATE_REGISTRY. Lattice branches also
+        capture a LatticeInstance record (Phase C — see module docstring)
+        alongside their existing per-pin expansion; this is additive and
+        does not change what's placed.
     Step 3: Build the Box's fill cell using ctx.outermost_surfaces, which
         every composite-template placement (via templates.py) and boolean
-        composite placement populates identically to before this cleanup.
+        composite placement populates identically to before.
+    Step 4: Attach ctx.lattice_instances to the returned CascadeGeometry.
     """
     ctx = Context(param_values=param_values or {})
     all_objects: list[Surface | Cell] = []
@@ -576,8 +589,7 @@ def expand(
 
     # ------------------------------------------------------------------
     # Step 2 — Every other placement: composite templates via
-    # TEMPLATE_REGISTRY (Phase C), boolean composites via their own
-    # explicit branch (pre-Phase-F design).
+    # TEMPLATE_REGISTRY, boolean composites via their own explicit branch.
     # ------------------------------------------------------------------
     for name, schema in placements.items():
         if isinstance(schema, SinglePlacementSchema):
@@ -615,10 +627,9 @@ def expand(
                     f"'{schema.template}'."
                 )
             if templates.is_composite_template(tpl):
-                for i, pos in enumerate(schema.pin_positions()):
-                    surfaces, cells = templates.expand_template(ctx, tpl, f"{name}_{i}", pos)
-                    all_objects.extend(surfaces)
-                    all_objects.extend(cells)
+                _expand_lattice_with_instancing(
+                    ctx, tpl, schema.template, name, schema.pin_positions(), all_objects,
+                )
             else:
                 raise TypeError(
                     f"SquareLattice '{name}': template type "
@@ -633,10 +644,9 @@ def expand(
                     f"'{schema.template}'."
                 )
             if templates.is_composite_template(tpl):
-                for i, pos in enumerate(schema.pin_positions()):
-                    surfaces, cells = templates.expand_template(ctx, tpl, f"{name}_{i}", pos)
-                    all_objects.extend(surfaces)
-                    all_objects.extend(cells)
+                _expand_lattice_with_instancing(
+                    ctx, tpl, schema.template, name, schema.pin_positions(), all_objects,
+                )
             else:
                 raise TypeError(
                     f"HexLattice '{name}': template type "
@@ -657,9 +667,74 @@ def expand(
     cells    = [obj for obj in all_objects if isinstance(obj, Cell)]
 
     return CascadeGeometry(
-        id=           str(uuid.uuid4()),
-        name=         geom_name,
-        surfaces=     surfaces,
-        cells=        cells,
-        param_values= ctx.param_values,
+        id=                 str(uuid.uuid4()),
+        name=               geom_name,
+        surfaces=           surfaces,
+        cells=              cells,
+        param_values=       ctx.param_values,
+        lattice_instances=  ctx.lattice_instances,
     )
+
+
+# ---------------------------------------------------------------------------
+# Lattice instancing capture (CSG_VIEWER_SCALING_PLAN.md Phase C)
+# ---------------------------------------------------------------------------
+
+def _expand_lattice_with_instancing(
+    ctx: Context,
+    tpl: BaseComponentSchema,
+    prototype_key: str,
+    lattice_name: str,
+    positions: list[tuple[float, float, float]],
+    all_objects: list[Surface | Cell],
+) -> None:
+    """Expand every pin in a lattice exactly as before (unchanged, additive
+    only — see module docstring), while separately recording a
+    LatticeInstance side-channel: pin 0's own translated surfaces/cells as
+    the "prototype", and every pin's position as an (x, y, z) offset
+    relative to pin 0's position.
+
+    `positions` is `SquareLatticeSchema.pin_positions()` /
+    `HexLatticeSchema.pin_positions()` — both return plain (x, y, z)
+    tuples (confirmed: neither schema varies orientation per pin, so
+    there is no rotation component to carry — see LatticeInstance's
+    docstring in domain/geometry.py). This is the same tuple shape
+    `SinglePlacementSchema.position()` returns and `templates.
+    expand_template()` already accepts as its `position` argument, so no
+    new coordinate-convention translation is needed here.
+
+    If `positions` is empty (a lattice with nx=0 or ny=0 — shouldn't
+    happen given the schemas' `gt=0` constraints, but defensive), no
+    LatticeInstance is recorded and nothing is placed, matching the
+    lattice's own definition of "zero pins."
+    """
+    if not positions:
+        return
+
+    origin = positions[0]
+    prototype_surfaces: list[Surface] | None = None
+    prototype_cells:    list[Cell] | None    = None
+    instances: list[tuple[float, float, float]] = []
+
+    for i, pos in enumerate(positions):
+        surfaces, cells = templates.expand_template(ctx, tpl, f"{lattice_name}_{i}", pos)
+        all_objects.extend(surfaces)
+        all_objects.extend(cells)
+
+        if i == 0:
+            prototype_surfaces = surfaces
+            prototype_cells    = cells
+
+        instances.append((
+            pos[0] - origin[0],
+            pos[1] - origin[1],
+            pos[2] - origin[2],
+        ))
+
+    ctx.lattice_instances.append(LatticeInstance(
+        lattice_name=       lattice_name,
+        prototype_key=      prototype_key,
+        prototype_surfaces= prototype_surfaces or [],
+        prototype_cells=    prototype_cells or [],
+        instances=          instances,
+    ))
