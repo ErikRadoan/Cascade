@@ -395,7 +395,14 @@ export interface LatticeInstance {
   prototype_key: string;
   prototype_surfaces: CsgSurface[];
   prototype_cells: CsgCell[];
+  /** Outer offsets (pins for Phase C; assemblies for Phase D). Relative to index 0. */
   instances: [number, number, number][];
+  /**
+   * Phase D nested lattice: pin offsets within an assembly (relative to assembly pin 0).
+   * Empty/absent = Phase C single-level lattice.
+   * World placement = instances[i] + inner_offsets[j].
+   */
+  inner_offsets?: [number, number, number][];
 }
 
 export interface CsgGeometry {

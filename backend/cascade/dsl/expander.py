@@ -565,6 +565,16 @@ def expand(
     box_translated_labels: dict[str, str] | None  = None
     box_placement_name:    str | None              = None
 
+    # Phase D — lattice schemas (may be used as nested templates).
+    lattice_schemas: dict[str, SquareLatticeSchema | HexLatticeSchema] = {
+        n: s for n, s in placements.items()
+        if isinstance(s, (SquareLatticeSchema, HexLatticeSchema))
+    }
+    nested_template_lattices: set[str] = set()
+    for _n, _s in lattice_schemas.items():
+        if _s.template in lattice_schemas:
+            nested_template_lattices.add(_s.template)
+
     # ------------------------------------------------------------------
     # Step 1 — Box placements first (the documented registry exception)
     # ------------------------------------------------------------------
@@ -619,39 +629,14 @@ def expand(
                     f"Add it to the expander."
                 )
 
-        elif isinstance(schema, SquareLatticeSchema):
-            tpl = templates_by_name.get(schema.template)
-            if tpl is None:
-                raise ValueError(
-                    f"SquareLattice '{name}' references undefined template "
-                    f"'{schema.template}'."
-                )
-            if templates.is_composite_template(tpl):
-                _expand_lattice_with_instancing(
-                    ctx, tpl, schema.template, name, schema.pin_positions(), all_objects,
-                )
-            else:
-                raise TypeError(
-                    f"SquareLattice '{name}': template type "
-                    f"'{type(tpl).__name__}' not supported in lattices yet."
-                )
-
-        elif isinstance(schema, HexLatticeSchema):
-            tpl = templates_by_name.get(schema.template)
-            if tpl is None:
-                raise ValueError(
-                    f"HexLattice '{name}' references undefined template "
-                    f"'{schema.template}'."
-                )
-            if templates.is_composite_template(tpl):
-                _expand_lattice_with_instancing(
-                    ctx, tpl, schema.template, name, schema.pin_positions(), all_objects,
-                )
-            else:
-                raise TypeError(
-                    f"HexLattice '{name}': template type "
-                    f"'{type(tpl).__name__}' not supported yet."
-                )
+        elif isinstance(schema, (SquareLatticeSchema, HexLatticeSchema)):
+            # Phase D: skip lattices that are only used as nested templates
+            # of another lattice (expanded inside the parent instead).
+            if name in nested_template_lattices:
+                continue
+            _dispatch_lattice(
+                ctx, schema, name, templates_by_name, lattice_schemas, all_objects,
+            )
 
     # ------------------------------------------------------------------
     # Step 3 — Fill cell
@@ -677,8 +662,54 @@ def expand(
 
 
 # ---------------------------------------------------------------------------
-# Lattice instancing capture (CSG_VIEWER_SCALING_PLAN.md Phase C)
+# Lattice instancing capture (CSG_VIEWER_SCALING_PLAN.md Phase C / Phase D)
 # ---------------------------------------------------------------------------
+
+def _dispatch_lattice(
+    ctx: Context,
+    schema: SquareLatticeSchema | HexLatticeSchema,
+    name: str,
+    templates_by_name: dict[str, BaseComponentSchema],
+    lattice_schemas: dict[str, SquareLatticeSchema | HexLatticeSchema],
+    all_objects: list[Surface | Cell],
+) -> None:
+    """Route a lattice placement to Phase C (pin template) or Phase D (nested)."""
+    tpl_name = schema.template
+    if tpl_name in lattice_schemas:
+        # Phase D — lattice of lattices
+        inner = lattice_schemas[tpl_name]
+        pin_tpl = templates_by_name.get(inner.template)
+        if pin_tpl is None:
+            raise ValueError(
+                f"Nested lattice '{name}' -> '{tpl_name}' references undefined "
+                f"pin template '{inner.template}'."
+            )
+        if not templates.is_composite_template(pin_tpl):
+            raise TypeError(
+                f"Nested lattice '{name}': inner template '{inner.template}' "
+                f"type '{type(pin_tpl).__name__}' not supported."
+            )
+        _expand_nested_lattice(
+            ctx, pin_tpl, inner.template, name,
+            schema.pin_positions(), inner.pin_positions(), all_objects,
+        )
+        return
+
+    tpl = templates_by_name.get(tpl_name)
+    if tpl is None:
+        raise ValueError(
+            f"Lattice '{name}' references undefined template '{tpl_name}'."
+        )
+    if templates.is_composite_template(tpl):
+        _expand_lattice_with_instancing(
+            ctx, tpl, tpl_name, name, schema.pin_positions(), all_objects,
+        )
+    else:
+        raise TypeError(
+            f"Lattice '{name}': template type '{type(tpl).__name__}' "
+            f"not supported in lattices yet."
+        )
+
 
 def _expand_lattice_with_instancing(
     ctx: Context,
@@ -688,25 +719,10 @@ def _expand_lattice_with_instancing(
     positions: list[tuple[float, float, float]],
     all_objects: list[Surface | Cell],
 ) -> None:
-    """Expand every pin in a lattice exactly as before (unchanged, additive
-    only — see module docstring), while separately recording a
-    LatticeInstance side-channel: pin 0's own translated surfaces/cells as
-    the "prototype", and every pin's position as an (x, y, z) offset
-    relative to pin 0's position.
+    """Phase C — single-level lattice (template is a composite e.g. FuelPin).
 
-    `positions` is `SquareLatticeSchema.pin_positions()` /
-    `HexLatticeSchema.pin_positions()` — both return plain (x, y, z)
-    tuples (confirmed: neither schema varies orientation per pin, so
-    there is no rotation component to carry — see LatticeInstance's
-    docstring in domain/geometry.py). This is the same tuple shape
-    `SinglePlacementSchema.position()` returns and `templates.
-    expand_template()` already accepts as its `position` argument, so no
-    new coordinate-convention translation is needed here.
-
-    If `positions` is empty (a lattice with nx=0 or ny=0 — shouldn't
-    happen given the schemas' `gt=0` constraints, but defensive), no
-    LatticeInstance is recorded and nothing is placed, matching the
-    lattice's own definition of "zero pins."
+    Expands every pin into the flat surface/cell lists (OpenMC path) and
+    records a LatticeInstance side-channel for the CSG viewer.
     """
     if not positions:
         return
@@ -737,4 +753,60 @@ def _expand_lattice_with_instancing(
         prototype_surfaces= prototype_surfaces or [],
         prototype_cells=    prototype_cells or [],
         instances=          instances,
+        inner_offsets=      [],
+    ))
+
+
+def _expand_nested_lattice(
+    ctx: Context,
+    pin_tpl: BaseComponentSchema,
+    pin_template_key: str,
+    outer_name: str,
+    outer_positions: list[tuple[float, float, float]],
+    inner_positions: list[tuple[float, float, float]],
+    all_objects: list[Surface | Cell],
+) -> None:
+    """Phase D — lattice of lattices (core of assemblies of pins).
+
+    Flat expansion (OpenMC): every pin at world = assembly_pos + pin_rel.
+    Viewer side-channel: pin prototype + inner_offsets (pins in assembly)
+    + instances (assembly positions). World = instances[a] + inner_offsets[p].
+    """
+    if not outer_positions or not inner_positions:
+        return
+
+    inner_origin = inner_positions[0]
+    inner_rel: list[tuple[float, float, float]] = [
+        (p[0] - inner_origin[0], p[1] - inner_origin[1], p[2] - inner_origin[2])
+        for p in inner_positions
+    ]
+
+    outer_origin = outer_positions[0]
+    outer_rel: list[tuple[float, float, float]] = [
+        (p[0] - outer_origin[0], p[1] - outer_origin[1], p[2] - outer_origin[2])
+        for p in outer_positions
+    ]
+
+    prototype_surfaces: list[Surface] | None = None
+    prototype_cells: list[Cell] | None = None
+
+    for ai, apos in enumerate(outer_positions):
+        for pi, prel in enumerate(inner_rel):
+            world = (apos[0] + prel[0], apos[1] + prel[1], apos[2] + prel[2])
+            surfaces, cells = templates.expand_template(
+                ctx, pin_tpl, f"{outer_name}_a{ai}_p{pi}", world,
+            )
+            all_objects.extend(surfaces)
+            all_objects.extend(cells)
+            if ai == 0 and pi == 0:
+                prototype_surfaces = surfaces
+                prototype_cells = cells
+
+    ctx.lattice_instances.append(LatticeInstance(
+        lattice_name=       outer_name,
+        prototype_key=      pin_template_key,
+        prototype_surfaces= prototype_surfaces or [],
+        prototype_cells=    prototype_cells or [],
+        instances=          outer_rel,
+        inner_offsets=      inner_rel,
     ))

@@ -9,10 +9,13 @@
   import { activeProject } from '../stores/projects.svelte.js';
   import type { CsgGeometry, CsgSurface, RegionNode, LatticeInstance } from '$lib/types';
 
-  const MAX_SURFACES = 256;
+  const MAX_SURFACES = 512;
   const MAX_PROTOTYPES = 64;
   const MAX_INSTANCES = 4096;
-  const MAX_TOKENS_PER_PROTO = 96;
+  // Fill cell = 6 box planes + Outside(each pin outer). A 10×10 lattice needs
+  // ~200 RPN pairs; 17×17 needs ~600. Cap of 96 was truncating the AND chain
+  // so the water solid lost constraints and pins appeared to punch through sides.
+  const MAX_TOKENS_PER_PROTO = 768;
   const MAX_BVH_NODES = 8192;
   const INTERACT_DPR = 0.65;
   const IDLE_DPR = Math.min(typeof window !== 'undefined' ? window.devicePixelRatio : 1.5, 1.5);
@@ -268,7 +271,7 @@
     #define MAX_BVH_ITERS 4096
     #define INF 1.0e6
     #define NEG_INF -1.0e6
-    #define LEAF_MARCH_STEPS 48
+    #define LEAF_MARCH_STEPS 96
 
     uniform vec3 uCamPos, uCamForward, uCamRight, uCamUp;
     uniform float uTanHalfFov, uAspect;
@@ -380,9 +383,11 @@
 
     float evalRegion(int protoIdx, vec3 pLocal) {
       int tokenCount = uProtoTokenCount[protoIdx];
-      float stack[16]; int sp = 0;
+      // Deep AND-chains (fill cell vs many pins) need more than 16 slots.
+      float stack[32]; int sp = 0;
       for (int i = 0; i < MAX_TOKEN_ITERS; i++) {
         if (i >= tokenCount) break;
+        if (sp >= 31) break;
         vec2 tok = fetchToken(protoIdx, i);
         int op = int(tok.x + 0.5); int operand = int(tok.y + 0.5);
         if (op == 0) { stack[sp++] = surfaceSDF(operand, pLocal); }
@@ -397,9 +402,10 @@
     // Phase B: interval CSG along ray in local frame → entry t (or INF)
     float evalIntervalEntry(int protoIdx, vec3 ro, vec3 rd) {
       int tokenCount = uProtoTokenCount[protoIdx];
-      vec2 stack[16]; int sp = 0;
+      vec2 stack[32]; int sp = 0;
       for (int i = 0; i < MAX_TOKEN_ITERS; i++) {
         if (i >= tokenCount) break;
+        if (sp >= 31) break;
         vec2 tok = fetchToken(protoIdx, i);
         int op = int(tok.x + 0.5); int operand = int(tok.y + 0.5);
         if (op == 0) { stack[sp++] = surfaceInterval(operand, ro, rd); }
@@ -673,10 +679,26 @@
           protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, protoSurfById, sceneBounds) });
         }
         const numLayers = protos.length - baseProtoIdx;
-        for (const off of li.instances) {
-          for (let k = 0; k < numLayers; k++) {
-            if (instances.length >= MAX_INSTANCES) break;
-            instances.push({ dx: off[0], dy: off[1], dz: off[2], protoIdx: baseProtoIdx + k });
+        // Phase D: inner_offsets non-empty → nested lattice
+        // world = assembly_offset + pin_offset; prototype stays one pin.
+        const innerOffs = (li as LatticeInstance & { inner_offsets?: [number, number, number][] }).inner_offsets ?? [];
+        const outerOffs = li.instances;
+        if (innerOffs.length > 0) {
+          for (const a of outerOffs) {
+            for (const pin of innerOffs) {
+              const dx = a[0] + pin[0], dy = a[1] + pin[1], dz = a[2] + pin[2];
+              for (let k = 0; k < numLayers; k++) {
+                if (instances.length >= MAX_INSTANCES) break;
+                instances.push({ dx, dy, dz, protoIdx: baseProtoIdx + k });
+              }
+            }
+          }
+        } else {
+          for (const off of outerOffs) {
+            for (let k = 0; k < numLayers; k++) {
+              if (instances.length >= MAX_INSTANCES) break;
+              instances.push({ dx: off[0], dy: off[1], dz: off[2], protoIdx: baseProtoIdx + k });
+            }
           }
         }
       }
