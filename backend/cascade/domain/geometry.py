@@ -49,26 +49,6 @@ def region_to_json(region: Region) -> dict:
 def region_from_yaml_dict(d: dict, name_to_id: dict[str, str]) -> Region:
     """Inverse of region_to_json() — the DSL-facing counterpart used by
     schema/cell.py's CellSchema.region.
-
-    Reconstructs a Region tree from the nested-dict shape CellSchema.region
-    validates for shape (see that module), resolving each `surface` NAME
-    reference to its Surface.id via `name_to_id`. `name_to_id` is built by
-    the expander from every Tier-1 primitive's authored YAML key once all
-    primitives in the document have been expanded — see expander.py's
-    ordering note (a Cell may reference a primitive declared later in the
-    file; this function itself doesn't care about declaration order at
-    all, it just looks names up in a dict that's already complete by the
-    time it's called).
-
-    Kept in this module, next to region_to_json(), so the two stay in sync
-    in one place (geometry-restructuring-plan.md §3.2) rather than one
-    living here and its inverse living in the DSL layer.
-
-    Raises:
-        ValueError: for an unknown `op`, or a `surface` name not present in
-        `name_to_id` — never a bare KeyError, so callers (e.g.
-        POST /geometry/validate) can surface a clean validation error
-        instead of a 500.
     """
     if not isinstance(d, dict):
         raise ValueError(f"Region node must be a mapping, got {type(d).__name__}.")
@@ -198,27 +178,32 @@ class Cell:
 
 
 # ---------------------------------------------------------------------------
-# Lattice instancing (CSG_VIEWER_SCALING_PLAN.md Phase C)
+# Lattice instancing (CSG_VIEWER_SCALING_PLAN.md Phase C / Phase D)
 #
-# Side-channel data captured by the expander when a SquareLattice /
-# HexLattice resolves a composite template (FuelPin today). The flat
-# surfaces/cells lists remain the source of truth for OpenMC/Serpent export;
-# lattice_instances is purely additive for the CSG viewer so it can evaluate
-# one prototype region tree and instance it via cheap translated AABBs.
+# Phase C (inner_offsets empty):
+#   prototype = one pin template; instances = pin offsets relative to pin 0.
 #
-# instances are (x, y, z) offsets relative to instance 0 (instances[0] is
-# always (0, 0, 0)). Translation only — neither lattice schema varies
-# orientation per pin today.
+# Phase D (inner_offsets non-empty) — nested instancing:
+#   prototype = one pin template;
+#   inner_offsets = pin offsets within an assembly (relative to assembly pin 0);
+#   instances = assembly offsets within the core (relative to assembly 0).
+#   World placement = instances[i] + inner_offsets[j].
 # ---------------------------------------------------------------------------
 
 @dataclass(slots=True)
 class LatticeInstance:
-    """One lattice placement's shared prototype + relative instance offsets."""
+    """One lattice placement's shared prototype + relative instance offsets.
+
+    Phase D: when ``inner_offsets`` is non-empty this is a nested (assembly)
+    lattice — world = instances[assembly] + inner_offsets[pin].
+    """
     lattice_name: str
     prototype_key: str
     prototype_surfaces: list[Surface] = field(default_factory=list)
     prototype_cells: list[Cell] = field(default_factory=list)
     instances: list[tuple[float, float, float]] = field(default_factory=list)
+    # Phase D — empty for single-level (Phase C) lattices.
+    inner_offsets: list[tuple[float, float, float]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -229,7 +214,6 @@ class CascadeGeometry:
     surfaces: list[Surface] = field(default_factory=list)
     cells: list[Cell] = field(default_factory=list)
     param_values: dict[str, float] = field(default_factory=dict)
-    # Phase C — empty when geometry has no lattice placements. Additive only.
     lattice_instances: list[LatticeInstance] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
