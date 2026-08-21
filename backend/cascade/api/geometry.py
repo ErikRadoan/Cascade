@@ -1,283 +1,236 @@
-"""Geometry domain models."""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum, StrEnum
-from abc import ABC
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from ..dsl import expander
+from ..services.csg_export_service import geometry_to_csg_dict
+from ..dsl import loader
+from ..dsl import sweep
+from ..repositories.db import get_db
+from ..repositories.geometry_repositroy import GeometryRepository
+from ..services.scene_builder_service import SceneBuilder
+from .schemas import (
+    BoundsOut,
+    CylinderLayerOut,
+    DeletedResponse,
+    GeometryDetail,
+    GeometrySummary,
+    GeometryTextRequest,
+    SceneComponentOut,
+    SceneRequest,
+    SceneResponse,
+    ValidationError,
+    ValidationResponse,
+    WireframeBoxOut,
+)
+
+router = APIRouter(prefix="/geometry", tags=["geometry"])
+_scene_builder = SceneBuilder()
+
+# _geometry_store is GONE — replaced by GeometryRepository (DB-backed).
+
+# ---------------------------------------------------------------------------
+# Scene building — UNCHANGED, still shared by /geometry/scene and
+# /jobs/{job_id}/scene. Not shown again here.
+# ---------------------------------------------------------------------------
+
+_EMPTY_BOUNDS = BoundsOut(x_min=0, x_max=1, y_min=0, y_max=1, z_min=0, z_max=1)
 
 
-class SurfaceType(Enum):
-    """Surface geometry type."""
-    PLANE_X = "plane_x"
-    PLANE_Y = "plane_y"
-    PLANE_Z = "plane_z"
-    CYLINDER_X = "cylinder_x"
-    CYLINDER_Y = "cylinder_y"
-    CYLINDER_Z = "cylinder_z"
-    SPHERE = "sphere"
-    CONE_Z = "cone_z"
-    TORUS = "torus"
-
-class BoundaryType(StrEnum):
-    NONE       = "none"        # interior surface, no special treatment
-    VACUUM     = "vacuum"      # particles crossing are killed
-    REFLECTIVE = "reflective"  # particles bounce back
-    PERIODIC   = "periodic"    # used for lattice symmetry
-
-def region_to_json(region: Region) -> dict:
-    """Serialize a Region tree to nested JSON, for client-side point
-    classification (geometry-plot rasterization) — the structured
-    counterpart to Region.__repr__()'s flattened string, which Cell.to_dict()
-    already uses for DB persistence. Kept separate from to_dict() so nothing
-    about existing storage/parsing (job_repository.py's _region_from_str)
-    has to change.
-    """
-    if isinstance(region, Inside):
-        return {"op": "inside", "surface": region.surface_id}
-    if isinstance(region, Outside):
-        return {"op": "outside", "surface": region.surface_id}
-    if isinstance(region, Intersection):
-        return {"op": "and", "items": [region_to_json(r) for r in region.regions]}
-    if isinstance(region, Union):
-        return {"op": "or", "items": [region_to_json(r) for r in region.regions]}
-    if isinstance(region, Complement):
-        return {"op": "not", "item": region_to_json(region.region)}
-    raise TypeError(f"Unknown Region type: {type(region).__name__}")
-
-
-def region_from_yaml_dict(d: dict, name_to_id: dict[str, str]) -> Region:
-    """Inverse of region_to_json() — the DSL-facing counterpart used by
-    schema/cell.py's CellSchema.region.
-
-    Reconstructs a Region tree from the nested-dict shape CellSchema.region
-    validates for shape (see that module), resolving each `surface` NAME
-    reference to its Surface.id via `name_to_id`. `name_to_id` is built by
-    the expander from every Tier-1 primitive's authored YAML key once all
-    primitives in the document have been expanded — see expander.py's
-    ordering note (a Cell may reference a primitive declared later in the
-    file; this function itself doesn't care about declaration order at
-    all, it just looks names up in a dict that's already complete by the
-    time it's called).
-
-    Kept in this module, next to region_to_json(), so the two stay in sync
-    in one place (geometry-restructuring-plan.md §3.2) rather than one
-    living here and its inverse living in the DSL layer.
-
-    Raises:
-        ValueError: for an unknown `op`, or a `surface` name not present in
-        `name_to_id` — never a bare KeyError, so callers (e.g.
-        POST /geometry/validate) can surface a clean validation error
-        instead of a 500.
-    """
-    if not isinstance(d, dict):
-        raise ValueError(f"Region node must be a mapping, got {type(d).__name__}.")
-
-    op = d.get("op")
-
-    if op in ("inside", "outside"):
-        surface_name = d.get("surface")
-        surface_id = name_to_id.get(surface_name)
-        if surface_id is None:
-            raise ValueError(
-                f"Region references unknown surface '{surface_name}'. "
-                f"Known surfaces: {sorted(name_to_id)}."
+def build_scene_response(text: str) -> SceneResponse:
+    # ... unchanged, keep exactly as-is ...
+    errors = sweep.validate_preview(text)
+    if errors:
+        return SceneResponse(
+            components=[], material_colors={}, bounds=_EMPTY_BOUNDS,
+            error=errors[0]["message"],
+        )
+    try:
+        schemas = sweep.preview_load(text)
+        scene = _scene_builder.build(schemas)
+    except Exception as e:
+        return SceneResponse(
+            components=[], material_colors={}, bounds=_EMPTY_BOUNDS,
+            error=str(e),
+        )
+    components_out = []
+    for comp in scene.components:
+        layers_out = [
+            CylinderLayerOut(
+                r_inner=l.r_inner, r_outer=l.r_outer, height=l.height, z_base=l.z_base,
+                material_id=l.material_id, color=l.color, opacity=l.opacity,
+                label=l.label, cell_name=l.cell_name,
             )
-        return Inside(surface_id) if op == "inside" else Outside(surface_id)
-
-    if op == "and":
-        items = d.get("items") or []
-        return Intersection([region_from_yaml_dict(i, name_to_id) for i in items])
-
-    if op == "or":
-        items = d.get("items") or []
-        return Union([region_from_yaml_dict(i, name_to_id) for i in items])
-
-    if op == "not":
-        item = d.get("item")
-        if item is None:
-            raise ValueError("A 'not' region node requires an 'item'.")
-        return Complement(region_from_yaml_dict(item, name_to_id))
-
-    raise ValueError(
-        f"Unknown region op '{op}'. Must be one of: inside, outside, and, or, not."
+            for l in comp.layers
+        ]
+        box_out = None
+        if comp.box:
+            b = comp.box
+            box_out = WireframeBoxOut(
+                x_size=b.x_size, y_size=b.y_size, z_size=b.z_size, z_base=b.z_base,
+                color=b.color, boundary_type=b.boundary_type,
+                fill_material_id=b.fill_material_id, fill_color=b.fill_color,
+                fill_opacity=b.fill_opacity, cell_name=b.cell_name,
+            )
+        components_out.append(SceneComponentOut(
+            type=comp.type, name=comp.name, position=list(comp.position),
+            layers=layers_out, box=box_out,
+        ))
+    b = scene.bounds
+    return SceneResponse(
+        components=components_out,
+        material_colors=scene.material_colors,
+        bounds=BoundsOut(x_min=b[0], x_max=b[1], y_min=b[2], y_max=b[3], z_min=b[4], z_max=b[5]),
     )
 
 
-class Region(ABC):
-    """Base class for CSG region expressions."""
+# ---------------------------------------------------------------------------
+# Validation and scene — UNCHANGED
+# ---------------------------------------------------------------------------
 
-    def __repr__(self) -> str:
-        """String representation for adapters."""
-        raise NotImplementedError
-
-
-@dataclass(slots=True)
-class Inside(Region):
-    """Inside a surface (negative side)."""
-    surface_id: str
-
-    def __repr__(self) -> str:
-        return f"-{self.surface_id}"
+@router.post("/validate", response_model=ValidationResponse)
+async def validate_geometry(body: GeometryTextRequest) -> ValidationResponse:
+    raw_errors = sweep.validate_preview(body.text)
+    errors = [ValidationError(**e) for e in raw_errors]
+    return ValidationResponse(valid=len(errors) == 0, errors=errors)
 
 
-@dataclass(slots=True)
-class Outside(Region):
-    """Outside a surface (positive side)."""
-    surface_id: str
-
-    def __repr__(self) -> str:
-        return f"+{self.surface_id}"
-
-
-@dataclass(slots=True)
-class Union(Region):
-    """Union of regions (OR)."""
-    regions: list[Region] = field(default_factory=list)
-
-    def __repr__(self) -> str:
-        if not self.regions:
-            return ""
-        inner = " : ".join(str(r) for r in self.regions)
-        return f"({inner})"
-
-
-@dataclass(slots=True)
-class Intersection(Region):
-    """Intersection of regions (AND)."""
-    regions: list[Region] = field(default_factory=list)
-
-    def __repr__(self) -> str:
-        if not self.regions:
-            return ""
-        inner = " ".join(str(r) for r in self.regions)
-        return f"({inner})"
-
-
-@dataclass(slots=True)
-class Complement(Region):
-    """Complement of a region (NOT)."""
-    region: Region
-
-    def __repr__(self) -> str:
-        return f"~({self.region})"
-
-
-@dataclass(slots=True)
-class Surface:
-    """Pure geometric surface with no material."""
-    id: str
-    type_: SurfaceType
-    params: dict[str, float | int | str | bool] = field(default_factory=dict)
-    boundary_type: BoundaryType     = BoundaryType.NONE
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "id": self.id,
-            "type": self.type_.value,
-            "params": dict(self.params),
-            "boundary_type": self.boundary_type.value,
-        }
-
-
-@dataclass(slots=True)
-class Cell:
-    """Region of space with a material."""
-    id: str
-    region: Region
-    material_id: str | None = None
-    name: str | None = None
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "id": self.id,
-            "region": str(self.region),
-            "material_id": self.material_id,
-            "name": self.name,
-        }
+@router.post("/scene", response_model=SceneResponse)
+async def build_scene(body: SceneRequest) -> SceneResponse:
+    return build_scene_response(body.text)
 
 
 # ---------------------------------------------------------------------------
-# Lattice instancing (CSG_VIEWER_SCALING_PLAN.md Phase C)
-#
-# Additive, side-channel data captured by dsl/expander.py alongside its
-# existing flat surfaces/cells expansion — NOT a replacement for the flat
-# form. The flat `CascadeGeometry.surfaces`/`.cells` lists still contain
-# every pin, fully translated, exactly as before (OpenMC/Serpent2 XML
-# export depends on that and is out of scope for this change — see the
-# plan doc's §4.2). This is purely extra information for consumers (today:
-# the CSG viewer) that want to know "these N cells are actually one
-# prototype repeated N times" without re-deriving it via duplicate
-# detection.
-#
-# `prototype_surfaces`/`prototype_cells` are pin/instance index 0's own
-# translated surfaces and cells (i.e. the flat form already contains
-# them — this does not duplicate geometry, it's pointer-equivalent data
-# in a different shape, though as dataclasses here rather than a shared
-# reference since CascadeGeometry.to_dict()/from_dict() round-trips
-# through plain dicts anyway).
-#
-# `instances` are (x, y, z) offsets *relative to instance 0's own
-# position* — i.e. instances[0] is always (0.0, 0.0, 0.0). Plain
-# translation only: neither SquareLatticeSchema nor HexLatticeSchema
-# varies orientation per pin today (see dsl/schema/lattice.py's
-# pin_positions() — both return bare (x, y, z) tuples), so there is no
-# rotation component. If a future lattice schema introduces per-pin
-# rotation, add it here as a fourth element rather than a new field, to
-# keep one lattice = one instances list.
+# CRUD — now DB-backed via GeometryRepository
 # ---------------------------------------------------------------------------
 
-@dataclass(slots=True)
-class LatticeInstance:
-    """One lattice's prototype + every instance placement of it.
+def _compute_counts(text: str) -> tuple[int, int]:
+    """Best-effort surface/cell counts — 0 if the geometry doesn't expand
+    yet (drafts are allowed to be invalid, per this module's original
+    docstring on save_geometry/update_geometry)."""
+    from ..dsl import expander
+    try:
+        schemas = sweep.preview_load(text)
+        geom = expander.expand(schemas)
+        return len(geom.surfaces), len(geom.cells)
+    except Exception:
+        return 0, 0
 
-    "Prototype" = the single template every position in this lattice was
-    expanded from (SquareLatticeSchema/HexLatticeSchema currently support
-    exactly one `template` per lattice — no heterogeneous fill/guide-tube
-    support in the schema today, so this is always ONE prototype per
-    lattice, never a dict keyed by position; revisit this shape if that
-    changes).
+
+@router.get("/", response_model=list[GeometrySummary])
+async def list_geometries(db: Session = Depends(get_db)) -> list[GeometrySummary]:
+    """List all saved geometry definitions, most recently created first."""
+    records = GeometryRepository(db).list()
+    return [
+        GeometrySummary(
+            id=r.id, name=r.name, created_at=r.created_at,
+            n_surfaces=r.n_surfaces, n_cells=r.n_cells,
+        )
+        for r in records
+    ]
+
+
+@router.post("/", response_model=GeometrySummary, status_code=201)
+async def save_geometry(body: GeometryTextRequest, db: Session = Depends(get_db)) -> GeometrySummary:
+    """Save a geometry project's YAML text.
+
+    Same relaxed-validity rules as before: only rejects text that isn't
+    even parseable as a YAML mapping (loader.LoadError). Field-validation
+    errors on individual components are fine — n_surfaces/n_cells just
+    read 0 until fixed. See _compute_counts().
     """
-    lattice_name:        str
-    prototype_key:        str                              # = schema.template
-    prototype_surfaces:   list[Surface] = field(default_factory=list)
-    prototype_cells:       list[Cell]    = field(default_factory=list)
-    # (x, y, z) offsets relative to instance 0's own position.
-    # instances[0] == (0.0, 0.0, 0.0) always.
-    instances:             list[tuple[float, float, float]] = field(default_factory=list)
+    try:
+        sweep.preview_load(body.text)
+    except loader.LoadError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception:
+        pass  # non-structural error — still a valid save, counts will be 0
 
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "lattice_name":       self.lattice_name,
-            "prototype_key":      self.prototype_key,
-            "prototype_surfaces": [s.to_dict() for s in self.prototype_surfaces],
-            "prototype_cells":    [c.to_dict() for c in self.prototype_cells],
-            "instances":          [list(p) for p in self.instances],
-        }
+    n_surfaces, n_cells = _compute_counts(body.text)
+
+    repo = GeometryRepository(db)
+    record = repo.create(
+        name=body.name or "",  # placeholder, fixed below once we have the id
+        text=body.text,
+        n_surfaces=n_surfaces,
+        n_cells=n_cells,
+    )
+    if not body.name:
+        record = repo.update(record.id, text=body.text, name=f"geometry_{record.id[:8]}",
+                              n_surfaces=n_surfaces, n_cells=n_cells)
+
+    return GeometrySummary(
+        id=record.id, name=record.name, created_at=record.created_at,
+        n_surfaces=record.n_surfaces, n_cells=record.n_cells,
+    )
 
 
-@dataclass(slots=True)
-class CascadeGeometry:
-    """Complete geometry: surfaces + cells."""
-    id: str
-    name: str
-    surfaces: list[Surface] = field(default_factory=list)
-    cells: list[Cell] = field(default_factory=list)
-    param_values: dict[str, float] = field(default_factory=dict)
-    # Phase C — see LatticeInstance docstring above. Empty for geometry
-    # with no lattice placements (single-shape edits, non-lattice
-    # components) — consumers must treat this as an optional accelerator,
-    # not assume it's always populated, and fall back to the flat
-    # surfaces/cells form when it's empty.
-    lattice_instances: list[LatticeInstance] = field(default_factory=list)
+@router.put("/{geometry_id}", response_model=GeometrySummary)
+async def update_geometry(geometry_id: str, body: GeometryTextRequest, db: Session = Depends(get_db)) -> GeometrySummary:
+    """Update an existing geometry project's text (autosave target)."""
+    try:
+        sweep.preview_load(body.text)
+    except loader.LoadError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception:
+        pass
 
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "id": self.id,
-            "name": self.name,
-            "surfaces": [surface.to_dict() for surface in self.surfaces],
-            "cells": [cell.to_dict() for cell in self.cells],
-            "param_values": self.param_values,
-            "lattice_instances": [li.to_dict() for li in self.lattice_instances],
-        }
+    n_surfaces, n_cells = _compute_counts(body.text)
 
+    record = GeometryRepository(db).update(
+        geometry_id, text=body.text, name=body.name,
+        n_surfaces=n_surfaces, n_cells=n_cells,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Geometry '{geometry_id}' not found.")
+
+    return GeometrySummary(
+        id=record.id, name=record.name, created_at=record.created_at,
+        n_surfaces=record.n_surfaces, n_cells=record.n_cells,
+    )
+
+
+@router.get("/{geometry_id}", response_model=GeometryDetail)
+async def get_geometry(geometry_id: str, db: Session = Depends(get_db)) -> GeometryDetail:
+    """Retrieve a saved geometry by ID."""
+    record = GeometryRepository(db).get(geometry_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Geometry '{geometry_id}' not found.")
+
+    return GeometryDetail(
+        id=record.id, name=record.name, created_at=record.created_at,
+        n_surfaces=record.n_surfaces, n_cells=record.n_cells,
+        yaml_text=record.text, param_values={},
+    )
+
+
+@router.delete("/{geometry_id}", response_model=DeletedResponse)
+async def delete_geometry(geometry_id: str, db: Session = Depends(get_db)) -> DeletedResponse:
+    """Delete a saved geometry by ID."""
+    deleted = GeometryRepository(db).delete(geometry_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"Geometry '{geometry_id}' not found.")
+    return DeletedResponse(id=geometry_id)
+
+
+@router.post("/csg")
+async def build_csg(body: SceneRequest) -> dict:
+    """Fully-expanded CSG (surfaces + cells + region trees) for live editor
+    text — the general-purpose counterpart to /scene's template-aware
+    SceneBuilder output. Renders arbitrary surfaces/regions, including
+    future Union/Subtraction component types, unlike /scene which only
+    knows FuelPin/Box.
+
+    Mirrors GET /jobs/{job_id}/csg for a job that hasn't been submitted yet.
+    Phase C: response also includes lattice_instances (additive field).
+    """
+    errors = sweep.validate_preview(body.text)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors[0]["message"])
+    try:
+        schemas = sweep.preview_load(body.text)
+        geometry = expander.expand(schemas)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return geometry_to_csg_dict(geometry)
