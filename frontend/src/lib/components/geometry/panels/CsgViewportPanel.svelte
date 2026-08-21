@@ -295,36 +295,6 @@
     let counter = 0;
 
     function assign(node: BvhBuildNode): number {
-      const idx = counter;
-      counter += 1;
-
-      if (idx < MAX_BVH_NODES) {
-        const b = node.bounds;
-        writeBvhTexel(data, idx, 0, b.xMin, b.yMin, b.zMin, node.isLeaf ? 1 : 0);
-        if (node.isLeaf) {
-          writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, node.instanceIndex);
-          writeBvhTexel(data, idx, 2, 0, 0, 0, 0);
-        } else {
-          writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, 0);
-        }
-      }
-
-      if (!node.isLeaf) {
-        assign(node.left!);
-        const rightIdx = counter;
-        assign(node.right!);
-        // left was assigned starting at idx+1; re-read via counter before right
-        // Actually we need left index — assign returns root of subtree.
-        // Fix: capture left index properly.
-        void rightIdx;
-      }
-
-      return idx;
-    }
-
-    // Proper pre-order with back-filled children:
-    counter = 0;
-    function assign2(node: BvhBuildNode): number {
       const idx = counter++;
       if (idx >= MAX_BVH_NODES) return idx;
 
@@ -336,14 +306,14 @@
         writeBvhTexel(data, idx, 2, 0, 0, 0, 0);
       } else {
         writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, 0);
-        const leftIdx = assign2(node.left!);
-        const rightIdx = assign2(node.right!);
+        const leftIdx = assign(node.left!);
+        const rightIdx = assign(node.right!);
         writeBvhTexel(data, idx, 2, leftIdx, rightIdx, 0, 0);
       }
       return idx;
     }
 
-    assign2(root);
+    assign(root);
     return Math.min(counter, MAX_BVH_NODES);
   }
 
@@ -568,8 +538,7 @@
     }
 
     vec3 calcNormal(vec3 pWorld, int protoIdx, vec3 offset) {
-      // Finite differences in world space; for pure translation the local
-      // gradient equals the world gradient.
+      // Finite differences in local frame; pure translation ⇒ same in world.
       vec2 e = vec2(0.001, 0.0);
       vec3 pLocal = pWorld - offset;
       float dx = evalRegion(protoIdx, pLocal + e.xyy) - evalRegion(protoIdx, pLocal - e.xyy);
@@ -579,7 +548,6 @@
     }
 
     // Second sceneSDF pass to recover the winning instance offset for normals.
-    // (Keeps the primary traversal free of extra out-params.)
     vec3 findHitOffset(vec3 p, int wantProto) {
       if (uBvhNodeCount <= 0) return vec3(0.0);
       int stack[MAX_BVH_STACK];
@@ -624,7 +592,6 @@
 
       vec3 col = vec3(0.059, 0.090, 0.165);
 
-      // Root AABB pre-test: if ray misses entire scene, skip march.
       float t = 0.0;
       int hitProto = -1;
       for (int i = 0; i < 160; i++) {
@@ -708,13 +675,12 @@
         const name = c.name ?? '';
         const m = name.match(/_0_layer(\d+)$/);
         if (m) layerSuffixes.push(`_layer${m[1]}`);
-        else if (name) layerSuffixes.push(''); // fallback: exact name only for pin0
+        else if (name) layerSuffixes.push('');
       }
       for (let i = 0; i < li.instances.length; i++) {
         for (const suf of layerSuffixes) {
           if (suf) set.add(`${li.lattice_name}_${i}${suf}`);
           else {
-            // no layer suffix parse — mark pin0 prototype names only
             for (const c of li.prototype_cells) if (c.name) set.add(c.name);
           }
         }
@@ -756,25 +722,21 @@
     for (let i = surfacesUsed.length; i < MAX_SURFACES; i++) { surfType[i] = -1; surfParams[i].set(0, 0, 0, 0); }
     u.uSurfCount.value = surfacesUsed.length;
 
-    // ---- Build prototypes + instances -------------------------------------
     interface ProtoEntry {
       region: RegionNode;
       material_id: string;
-      aabb: AxisBounds; // in prototype (pin-0 / identity) frame
+      aabb: AxisBounds;
     }
     const protos: ProtoEntry[] = [];
-    // instances: { dx,dy,dz, protoIdx }
     const instances: { dx: number; dy: number; dz: number; protoIdx: number }[] = [];
 
     const lis = csg.lattice_instances ?? [];
     usingInstancing = lis.length > 0;
 
     if (usingInstancing) {
-      // One prototype entry per non-void prototype_cell of each lattice.
       for (const li of lis) {
         const baseProtoIdx = protos.length;
         const protoCells = li.prototype_cells.filter((c) => c.material_id != null);
-        // Surfaces for AABB: prefer lattice prototype_surfaces, fall back to global map
         const protoSurfById = new Map(surfaceById);
         for (const s of li.prototype_surfaces) protoSurfById.set(s.id, s);
 
@@ -796,7 +758,6 @@
         }
       }
 
-      // Non-lattice cells (fill, single placements, Tier-1/2): single instance at origin.
       const latticeNames = latticeCellNameSet(lis);
       for (const cell of csg.cells) {
         if (cell.material_id == null) continue;
@@ -810,7 +771,6 @@
         }
       }
     } else {
-      // Flat path: each non-void cell is its own prototype with one identity instance.
       const nonVoid = csg.cells.filter((c) => c.material_id != null);
       for (const cell of nonVoid) {
         if (protos.length >= MAX_PROTOTYPES) break;
@@ -826,7 +786,6 @@
     truncatedProtos = protos.length >= MAX_PROTOTYPES;
     truncatedInstances = instances.length >= MAX_INSTANCES;
 
-    // ---- Pack prototype token texture + colours ---------------------------
     const protoColor = u.uProtoColor.value as THREE.Color[];
     const protoTokenCount = u.uProtoTokenCount.value as number[];
     const texData = new Float32Array(MAX_TOKENS_PER_PROTO * MAX_PROTOTYPES * 4);
@@ -872,7 +831,6 @@
     tokenTexture.needsUpdate = true;
     u.uTokenTex.value = tokenTexture;
 
-    // ---- Instance texture -------------------------------------------------
     const instData = new Float32Array(MAX_INSTANCES * 4);
     const instanceBoxes: AxisBounds[] = [];
     instances.forEach((inst, i) => {
@@ -893,7 +851,6 @@
     u.uInstanceTex.value = instanceTexture;
     u.uInstanceCount.value = instances.length;
 
-    // ---- BVH over instance AABBs ------------------------------------------
     const tBvh0 = performance.now();
     const bvhTexData = new Float32Array(3 * MAX_BVH_NODES * 4);
     let bvhNodeCount = 0;
