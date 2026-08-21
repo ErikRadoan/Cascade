@@ -262,10 +262,13 @@
     #define MAX_TOKEN_ITERS ${MAX_TOKENS_PER_PROTO}
     #define MAX_BVH_NODES ${MAX_BVH_NODES}
     #define BVH_TEX_H ${MAX_BVH_NODES}.0
-    #define MAX_BVH_STACK 48
-    #define MAX_BVH_ITERS 256
+    // Large lattices (e.g. 17x17 x layers) need a high iter budget; 256 was
+    // aborting traversal mid-tree and caused angle-dependent missing pins.
+    #define MAX_BVH_STACK 64
+    #define MAX_BVH_ITERS 4096
     #define INF 1.0e6
     #define NEG_INF -1.0e6
+    #define LEAF_MARCH_STEPS 48
 
     uniform vec3 uCamPos, uCamForward, uCamRight, uCamUp;
     uniform float uTanHalfFov, uAspect;
@@ -357,9 +360,14 @@
       vec3 q = abs(p - c) - h;
       return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
     }
-    // Ray vs AABB slab → (tEnter, tExit); empty if miss
+    // Ray vs AABB slab → (tEnter, tExit); empty if miss.
+    // Guard against rd components near 0 (1/rd → Inf/NaN on some GPUs).
     vec2 boxInterval(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {
-      vec3 inv = 1.0 / rd;
+      vec3 rdd = rd;
+      if (abs(rdd.x) < 1e-8) rdd.x = (rdd.x >= 0.0) ? 1e-8 : -1e-8;
+      if (abs(rdd.y) < 1e-8) rdd.y = (rdd.y >= 0.0) ? 1e-8 : -1e-8;
+      if (abs(rdd.z) < 1e-8) rdd.z = (rdd.z >= 0.0) ? 1e-8 : -1e-8;
+      vec3 inv = 1.0 / rdd;
       vec3 t0 = (bmin - ro) * inv;
       vec3 t1 = (bmax - ro) * inv;
       vec3 tsm = min(t0, t1);
@@ -437,7 +445,10 @@
       return tEnter;
     }
 
-    // Traverse BVH; for each leaf run analytic interval in local frame.
+    // Traverse BVH; for each leaf hybrid-hit in local frame:
+    //   1) analytic interval as a seed (fast when CSG is simple Inside-heavy)
+    //   2) SDF sphere-trace clamped to the leaf AABB interval (robust for
+    //      Outside/Complement, which single-interval CSG cannot represent)
     // Returns best t; outs proto + instance offset for shading.
     float sceneHit(vec3 ro, vec3 rd, out int hitProto, out vec3 hitOff) {
       hitProto = -1; hitOff = vec3(0.0);
@@ -459,26 +470,44 @@
           int protoIdx = int(inst.w + 0.5);
           if (protoIdx < 0 || protoIdx >= uProtoCount) continue;
           vec3 roL = ro - inst.xyz;
+          float tStart = max(bi.x, 0.0);
+          float tEnd = min(bi.y, best);
+          if (tStart >= tEnd) continue;
+
+          // Analytic seed (may be wrong for Outside/Complement — polish/march corrects)
           float tHit = evalIntervalEntry(protoIdx, roL, rd);
-          // Short SDF polish from analytic entry (handles complement approx residual)
-          if (tHit < best) {
-            vec3 p = roL + rd * tHit;
-            float d = evalRegion(protoIdx, p);
-            // If analytic put us slightly outside, walk in
-            for (int k = 0; k < 8; k++) {
-              if (abs(d) < 0.002) break;
-              tHit += clamp(d, -0.05, 0.05);
-              p = roL + rd * tHit;
-              d = evalRegion(protoIdx, p);
+          if (tHit < tStart || tHit >= tEnd) tHit = tStart;
+
+          // Sphere-trace within the leaf box interval
+          for (int k = 0; k < LEAF_MARCH_STEPS; k++) {
+            if (tHit >= tEnd) break;
+            float d = evalRegion(protoIdx, roL + rd * tHit);
+            if (d < 0.002) {
+              if (tHit >= 0.0 && tHit < best) {
+                best = tHit; hitProto = protoIdx; hitOff = inst.xyz;
+              }
+              break;
             }
-            if (tHit >= 0.0 && tHit < best && d < 0.01) {
-              best = tHit; hitProto = protoIdx; hitOff = inst.xyz;
-            }
+            tHit += max(d, 0.002);
           }
         } else {
           vec4 t2 = fetchBvhTexel(nodeIdx, 2);
-          if (sp < MAX_BVH_STACK) stack[sp++] = int(t2.x + 0.5);
-          if (sp < MAX_BVH_STACK) stack[sp++] = int(t2.y + 0.5);
+          // Push farther child first so nearer child is processed sooner (better early-out)
+          int leftIdx = int(t2.x + 0.5);
+          int rightIdx = int(t2.y + 0.5);
+          vec4 l0 = fetchBvhTexel(leftIdx, 0);
+          vec4 l1 = fetchBvhTexel(leftIdx, 1);
+          vec4 r0 = fetchBvhTexel(rightIdx, 0);
+          vec4 r1 = fetchBvhTexel(rightIdx, 1);
+          float tL = boxInterval(ro, rd, l0.xyz, l1.xyz).x;
+          float tR = boxInterval(ro, rd, r0.xyz, r1.xyz).x;
+          if (tL > tR) {
+            if (sp < MAX_BVH_STACK) stack[sp++] = leftIdx;
+            if (sp < MAX_BVH_STACK) stack[sp++] = rightIdx;
+          } else {
+            if (sp < MAX_BVH_STACK) stack[sp++] = rightIdx;
+            if (sp < MAX_BVH_STACK) stack[sp++] = leftIdx;
+          }
         }
       }
       return best;
@@ -609,8 +638,17 @@
     const surfIndex = new Map(surfacesUsed.map((s, i) => [s.id, i]));
     const surfaceById = new Map(surfacesUsed.map((s) => [s.id, s]));
     const sceneBounds = computeBounds(csg);
-    u.uSceneBMin.value.set(sceneBounds.xMin, sceneBounds.yMin, sceneBounds.zMin);
-    u.uSceneBMax.value.set(sceneBounds.xMax, sceneBounds.yMax, sceneBounds.zMax);
+    // Pad root AABB slightly so grazing rays / tight plane bounds don't miss.
+    {
+      const pad = 0.05 * Math.max(
+        sceneBounds.xMax - sceneBounds.xMin,
+        sceneBounds.yMax - sceneBounds.yMin,
+        sceneBounds.zMax - sceneBounds.zMin,
+        1,
+      );
+      u.uSceneBMin.value.set(sceneBounds.xMin - pad, sceneBounds.yMin - pad, sceneBounds.zMin - pad);
+      u.uSceneBMax.value.set(sceneBounds.xMax + pad, sceneBounds.yMax + pad, sceneBounds.zMax + pad);
+    }
 
     const surfType = u.uSurfType.value as number[];
     const surfParams = u.uSurfParams.value as THREE.Vector4[];
