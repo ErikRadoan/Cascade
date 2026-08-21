@@ -1,5 +1,6 @@
 <script lang="ts">
-  // CsgViewportPanel — CSG ray viewer with Phase A/B/C scaling work.
+  // CsgViewportPanel — CSG ray viewer with Phase A/B/C/D scaling work.
+  // Phase D: nested lattices (inner_offsets) + lattice-aware fill (plane-only).
   // Phase C: lattice instancing. Phase B: analytic ray intervals for primary hit.
   // Phase A: BVH, root AABB, tetrahedron normals, adaptive DPR, perf logs.
 
@@ -9,13 +10,13 @@
   import { activeProject } from '../stores/projects.svelte.js';
   import type { CsgGeometry, CsgSurface, RegionNode, LatticeInstance } from '$lib/types';
 
-  const MAX_SURFACES = 512;
+  const MAX_SURFACES = 256;
   const MAX_PROTOTYPES = 64;
   const MAX_INSTANCES = 4096;
   // Fill cell = 6 box planes + Outside(each pin outer). A 10×10 lattice needs
   // ~200 RPN pairs; 17×17 needs ~600. Cap of 96 was truncating the AND chain
   // so the water solid lost constraints and pins appeared to punch through sides.
-  const MAX_TOKENS_PER_PROTO = 768;
+  const MAX_TOKENS_PER_PROTO = 256;
   const MAX_BVH_NODES = 8192;
   const INTERACT_DPR = 0.65;
   const IDLE_DPR = Math.min(typeof window !== 'undefined' ? window.devicePixelRatio : 1.5, 1.5);
@@ -48,6 +49,54 @@
       case 'and': case 'or': for (const item of node.items) surfaceIdsInRegion(item, out); return;
       case 'not': surfaceIdsInRegion(node.item, out); return;
     }
+  }
+
+
+  /** Phase D fill scaling: keep only plane half-spaces from a region tree.
+   *  Used for the moderator fill cell under lattice instancing — pin holes are
+   *  already owned by pin protos (nearest-hit), so Outside(every pin) is redundant
+   *  for opaque primary rays and blows the token budget at core scale.
+   */
+  function planeOnlyRegion(node: RegionNode, surfaceById: Map<string, CsgSurface>): RegionNode | null {
+    switch (node.op) {
+      case 'inside':
+      case 'outside': {
+        const s = surfaceById.get(node.surface);
+        if (!s) return null;
+        if (s.type === 'plane_x' || s.type === 'plane_y' || s.type === 'plane_z') return node;
+        return null;
+      }
+      case 'and': {
+        const items: RegionNode[] = [];
+        for (const it of node.items) {
+          const k = planeOnlyRegion(it, surfaceById);
+          if (k) items.push(k);
+        }
+        if (items.length === 0) return null;
+        if (items.length === 1) return items[0];
+        return { op: 'and', items };
+      }
+      case 'or': {
+        const items: RegionNode[] = [];
+        for (const it of node.items) {
+          const k = planeOnlyRegion(it, surfaceById);
+          if (k) items.push(k);
+        }
+        if (items.length === 0) return null;
+        if (items.length === 1) return items[0];
+        return { op: 'or', items };
+      }
+      case 'not': {
+        const inner = planeOnlyRegion(node.item, surfaceById);
+        return inner ? { op: 'not', item: inner } : null;
+      }
+    }
+  }
+
+  function countSurfaceRefs(node: RegionNode): number {
+    const ids: string[] = [];
+    surfaceIdsInRegion(node, ids);
+    return ids.length;
   }
 
   function num(params: Record<string, number>, canon: string, alias: string, fallback = 0): number {
@@ -133,13 +182,17 @@
   }
 
   function cellAABB(region: RegionNode, surfaceById: Map<string, CsgSurface>, fallback: AxisBounds): AxisBounds {
-    if (regionIsPotentiallyUnbounded(region)) return fallback;
+    // Always accumulate bounds from surfaces referenced by the region (cylinders
+    // give tight xy even when the cell also has Outside(...)). Only fall back
+    // per-axis when that axis is missing — do NOT replace the whole box with
+    // sceneBounds solely because the region contains an Outside node.
     const names: string[] = [];
     surfaceIdsInRegion(region, names);
     let b: AxisBounds = { xMin: Infinity, xMax: -Infinity, yMin: Infinity, yMax: -Infinity, zMin: Infinity, zMax: -Infinity };
     for (const n of names) { const s = surfaceById.get(n); if (s) b = accumulateSurfaceBounds(b, s); }
-    if (!isFinite(b.xMin) || !isFinite(b.yMin) || !isFinite(b.zMin)) b = fallback;
-    if (!isFinite(b.zMin)) b = { ...b, zMin: fallback.zMin, zMax: fallback.zMax };
+    if (!isFinite(b.xMin) || !isFinite(b.xMax)) { b.xMin = fallback.xMin; b.xMax = fallback.xMax; }
+    if (!isFinite(b.yMin) || !isFinite(b.yMax)) { b.yMin = fallback.yMin; b.yMax = fallback.yMax; }
+    if (!isFinite(b.zMin) || !isFinite(b.zMax)) { b.zMin = fallback.zMin; b.zMax = fallback.zMax; }
     const pad = 0.02 * Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin, 1);
     return { xMin: b.xMin - pad, xMax: b.xMax + pad, yMin: b.yMin - pad, yMax: b.yMax + pad, zMin: b.zMin - pad, zMax: b.zMax + pad };
   }
@@ -281,6 +334,7 @@
     uniform int uProtoCount;
     uniform vec3 uProtoColor[MAX_PROTOTYPES];
     uniform int uProtoTokenCount[MAX_PROTOTYPES];
+    uniform int uProtoIsFill[MAX_PROTOTYPES];
     uniform sampler2D uTokenTex, uInstanceTex, uBvhTex;
     uniform int uInstanceCount, uBvhNodeCount;
     uniform vec3 uSceneBMin, uSceneBMax;
@@ -457,9 +511,14 @@
     //      Outside/Complement, which single-interval CSG cannot represent)
     // Returns best t; outs proto + instance offset for shading.
     float sceneHit(vec3 ro, vec3 rd, out int hitProto, out vec3 hitOff) {
+      // Track pin vs fill hits separately. Plane-only fill is a solid box (no
+      // pin holes); without priority, the shared top/bot plane makes fill win
+      // every ray from above and pins disappear past ~7 pins (when plane-only
+      // activates). Pin wins on near-ties and whenever it is clearly nearer.
       hitProto = -1; hitOff = vec3(0.0);
-      float best = INF;
-      if (uBvhNodeCount <= 0) return best;
+      float bestPin = INF; int pinProto = -1; vec3 pinOff = vec3(0.0);
+      float bestFill = INF; int fillProto = -1; vec3 fillOff = vec3(0.0);
+      if (uBvhNodeCount <= 0) return INF;
       int stack[MAX_BVH_STACK]; int sp = 0; stack[sp++] = 0;
       for (int iter = 0; iter < MAX_BVH_ITERS; iter++) {
         if (sp <= 0) break;
@@ -467,30 +526,34 @@
         if (nodeIdx < 0 || nodeIdx >= uBvhNodeCount) continue;
         vec4 t0 = fetchBvhTexel(nodeIdx, 0);
         vec4 t1 = fetchBvhTexel(nodeIdx, 1);
+        float bestAny = min(bestPin, bestFill);
         vec2 bi = boxInterval(ro, rd, t0.xyz, t1.xyz);
-        if (bi.x > bi.y || bi.x >= best) continue;
+        if (bi.x > bi.y || bi.x >= bestAny) continue;
         if (t0.w > 0.5) {
           int instIdx = int(t1.w + 0.5);
           if (instIdx < 0 || instIdx >= uInstanceCount) continue;
           vec4 inst = fetchInstance(instIdx);
           int protoIdx = int(inst.w + 0.5);
           if (protoIdx < 0 || protoIdx >= uProtoCount) continue;
+          bool isFill = uProtoIsFill[protoIdx] > 0;
           vec3 roL = ro - inst.xyz;
           float tStart = max(bi.x, 0.0);
-          float tEnd = min(bi.y, best);
+          float tEnd = min(bi.y, isFill ? bestFill : bestPin);
           if (tStart >= tEnd) continue;
 
-          // Analytic seed (may be wrong for Outside/Complement — polish/march corrects)
           float tHit = evalIntervalEntry(protoIdx, roL, rd);
           if (tHit < tStart || tHit >= tEnd) tHit = tStart;
 
-          // Sphere-trace within the leaf box interval
           for (int k = 0; k < LEAF_MARCH_STEPS; k++) {
             if (tHit >= tEnd) break;
             float d = evalRegion(protoIdx, roL + rd * tHit);
             if (d < 0.002) {
-              if (tHit >= 0.0 && tHit < best) {
-                best = tHit; hitProto = protoIdx; hitOff = inst.xyz;
+              if (tHit >= 0.0) {
+                if (isFill) {
+                  if (tHit < bestFill) { bestFill = tHit; fillProto = protoIdx; fillOff = inst.xyz; }
+                } else {
+                  if (tHit < bestPin) { bestPin = tHit; pinProto = protoIdx; pinOff = inst.xyz; }
+                }
               }
               break;
             }
@@ -498,7 +561,6 @@
           }
         } else {
           vec4 t2 = fetchBvhTexel(nodeIdx, 2);
-          // Push farther child first so nearer child is processed sooner (better early-out)
           int leftIdx = int(t2.x + 0.5);
           int rightIdx = int(t2.y + 0.5);
           vec4 l0 = fetchBvhTexel(leftIdx, 0);
@@ -516,7 +578,14 @@
           }
         }
       }
-      return best;
+      // Prefer pin when it is nearer or within epsilon (shared axial plane).
+      if (pinProto >= 0 && bestPin <= bestFill + 0.02) {
+        hitProto = pinProto; hitOff = pinOff; return bestPin;
+      }
+      if (fillProto >= 0) {
+        hitProto = fillProto; hitOff = fillOff; return bestFill;
+      }
+      return INF;
     }
 
     // Tetrahedron technique — 4 samples
@@ -567,6 +636,7 @@
       uProtoCount: { value: 0 },
       uProtoColor: { value: Array.from({ length: MAX_PROTOTYPES }, () => new THREE.Color(0, 0, 0)) },
       uProtoTokenCount: { value: new Array(MAX_PROTOTYPES).fill(0) },
+      uProtoIsFill: { value: new Array(MAX_PROTOTYPES).fill(0) },
       uTokenTex: { value: null as THREE.DataTexture | null },
       uInstanceTex: { value: null as THREE.DataTexture | null },
       uInstanceCount: { value: 0 },
@@ -662,7 +732,7 @@
     for (let i = surfacesUsed.length; i < MAX_SURFACES; i++) { surfType[i] = -1; surfParams[i].set(0, 0, 0, 0); }
     u.uSurfCount.value = surfacesUsed.length;
 
-    interface ProtoEntry { region: RegionNode; material_id: string; aabb: AxisBounds; }
+    interface ProtoEntry { region: RegionNode; material_id: string; aabb: AxisBounds; isFill?: boolean; }
     const protos: ProtoEntry[] = [];
     const instances: { dx: number; dy: number; dz: number; protoIdx: number }[] = [];
     const lis = csg.lattice_instances ?? [];
@@ -676,7 +746,7 @@
         for (const s of li.prototype_surfaces) protoSurfById.set(s.id, s);
         for (const cell of protoCells) {
           if (protos.length >= MAX_PROTOTYPES) break;
-          protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, protoSurfById, sceneBounds) });
+          protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, protoSurfById, sceneBounds), isFill: false });
         }
         const numLayers = protos.length - baseProtoIdx;
         // Phase D: inner_offsets non-empty → nested lattice
@@ -707,15 +777,29 @@
         if (cell.material_id == null) continue;
         if (cell.name && latticeNames.has(cell.name)) continue;
         if (protos.length >= MAX_PROTOTYPES) break;
+        // Phase D fill scaling: moderator fill = box ∩ Outside(every pin).
+        // Outside(pin) is redundant under opaque nearest-hit (pin protos own
+        // those volumes) and blows the token budget past ~6 pins (6 planes +
+        // 7 outsides > old threshold of 12 → plane-only kicked in and the
+        // solid lid hid every pin). Always strip to plane half-spaces when
+        // instancing; pin-vs-fill priority in the shader restores visibility.
+        let region = cell.region;
+        const simplified = planeOnlyRegion(region, surfaceById);
+        if (simplified) region = simplified;
         const protoIdx = protos.length;
-        protos.push({ region: cell.region, material_id: cell.material_id, aabb: cellAABB(cell.region, surfaceById, sceneBounds) });
+        protos.push({
+          region,
+          material_id: cell.material_id,
+          aabb: cellAABB(region, surfaceById, sceneBounds),
+          isFill: true,
+        });
         if (instances.length < MAX_INSTANCES) instances.push({ dx: 0, dy: 0, dz: 0, protoIdx });
       }
     } else {
       for (const cell of csg.cells.filter((c) => c.material_id != null)) {
         if (protos.length >= MAX_PROTOTYPES) break;
         const protoIdx = protos.length;
-        protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, surfaceById, sceneBounds) });
+        protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, surfaceById, sceneBounds), isFill: false });
         if (instances.length < MAX_INSTANCES) instances.push({ dx: 0, dy: 0, dz: 0, protoIdx });
       }
     }
@@ -725,6 +809,7 @@
 
     const protoColor = u.uProtoColor.value as THREE.Color[];
     const protoTokenCount = u.uProtoTokenCount.value as number[];
+    const protoIsFill = u.uProtoIsFill.value as number[];
     const texData = new Float32Array(MAX_TOKENS_PER_PROTO * MAX_PROTOTYPES * 4);
     let anyTokenTrunc = false;
     const legendSeen = new Map<string, string>();
@@ -732,6 +817,7 @@
       const [r, g, b] = hashColor(proto.material_id);
       protoColor[pi].setRGB(r, g, b);
       if (!legendSeen.has(proto.material_id)) legendSeen.set(proto.material_id, `#${protoColor[pi].getHexString()}`);
+      protoIsFill[pi] = proto.isFill ? 1 : 0;
       const tokens: number[] = [];
       flattenRegion(proto.region, surfIndex, tokens);
       const pairCount = tokens.length / 2;
@@ -743,7 +829,7 @@
         texData[texelIdx] = tokens[p * 2]; texData[texelIdx + 1] = tokens[p * 2 + 1];
       }
     });
-    for (let pi = protos.length; pi < MAX_PROTOTYPES; pi++) { protoColor[pi].setRGB(0, 0, 0); protoTokenCount[pi] = 0; }
+    for (let pi = protos.length; pi < MAX_PROTOTYPES; pi++) { protoColor[pi].setRGB(0, 0, 0); protoTokenCount[pi] = 0; protoIsFill[pi] = 0; }
     truncatedTokens = anyTokenTrunc;
     prototypeCount = protos.length; instanceCount = instances.length;
     materialLegend = [...legendSeen.entries()].map(([id, color]) => ({ id, color }));
@@ -845,6 +931,20 @@
     scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), shaderMaterial));
     renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: false });
     renderer.setPixelRatio(IDLE_DPR);
+    // Surface shader compile/link failures (often from oversized uniform arrays)
+    const gl = renderer.getContext();
+    const prog = (renderer as any).properties?.get?.(shaderMaterial)?.program;
+    // Force one compile pass and log errors
+    renderer.compile(scene, camera);
+    try {
+      const matProg = (renderer as any).properties?.get?.(shaderMaterial)?.program;
+      if (matProg?.diagnostics) {
+        console.warn('[csg-viewer] shader diagnostics', matProg.diagnostics);
+      }
+    } catch (_) { /* ignore */ }
+    const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const maxFragUniforms = gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS);
+    console.log(`[csg-viewer] WebGL MAX_TEXTURE_SIZE=${maxTex} MAX_FRAGMENT_UNIFORM_VECTORS=${maxFragUniforms}`);
     resize(); rebuildAndRender();
     const ro = new ResizeObserver(resize); ro.observe(containerEl);
     return () => ro.disconnect();
