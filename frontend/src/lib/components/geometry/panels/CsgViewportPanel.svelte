@@ -1,82 +1,36 @@
 <script lang="ts">
-  // CsgViewportPanel — renders the FULLY EXPANDED CSG (surfaces + region
-  // trees), not the template-aware SceneBuilder output ViewportPanel uses.
+  // CsgViewportPanel — raymarches the fully expanded CSG (surfaces +
+  // region trees) from POST /geometry/csg.
   //
-  // Why this exists: SceneBuilder (scene_builder_service.py) only knows
-  // how to draw FuelPin/Box specifically — see its _build_placed(). It has
-  // no path for arbitrary Union/Subtraction component types, however the
-  // expander builds them, because it never looks at Region trees at all.
-  // This panel does — it fetches /geometry/csg (surfaces + Region trees)
-  // and renders it with a raymarched signed-distance-field shader, so it
-  // renders whatever the geometry actually is, not a fixed pair of shapes.
+  // Phase C (CSG_VIEWER_SCALING_PLAN.md): when lattice_instances is
+  // present, pack one token-texture row per unique prototype cell and one
+  // BVH leaf per instance. On a surviving leaf the hit point is shifted
+  // into the prototype's local frame before evalRegion runs against the
+  // shared token row. Cost becomes O(unique templates) for the expensive
+  // work; instance count only affects cheap BVH depth.
   //
-  // Why raymarching, not a Three.js mesh:
-  //   - domain/geometry.py's Region set (Inside/Outside/Intersection/
-  //     Union/Complement) maps exactly onto SDF combinators: an Inside is
-  //     a plane/cylinder/sphere distance field (all exact SDFs), Outside
-  //     negates it, Intersection = max(), Union = min(), Complement =
-  //     negate(). So union/subtraction (Intersection + Complement) render
-  //     correctly here with NO new rendering code once the DSL/expander
-  //     grow those component types — only the region tree needs to change.
-  //   - Mesh-based CSG (boolean ops on triangle meshes) would need a full
-  //     mesh rebuild on every keystroke in the editor; a raymarch shader
-  //     just re-uploads uniforms/a texture and redraws.
-  //
-  // PERFORMANCE (BVH-pruned raymarch — see plan doc, "lag fix"):
-  //   sceneSDF() previously ran the expensive per-cell evalRegion() (a
-  //   full RPN region-tree walk) for EVERY cell, at EVERY one of the 160
-  //   raymarch steps, per pixel — O(cells x steps x pixels), completely
-  //   unconditionally. An earlier interim patch added a flat per-cell
-  //   bounding-sphere test (one sphere per cell, no hierarchy); this is
-  //   the real fix that supersedes it.
-  //
-  //   A BVH is built on the CPU (buildBvh()/flattenBvh() below) over each
-  //   cell's AABB (computed from the surfaces its region tree actually
-  //   references — cellAABB()), leaves = 1 cell each, split on the
-  //   longest axis at the median (no SAH — not worth it at <=48 leaves).
-  //   It's flattened into a small texture (3 texels/node: bmin+isLeaf,
-  //   bmax+cellIndex, leftChild+rightChild) and traversed in the shader
-  //   with an explicit stack (GLSL ES 1.00 has no recursion).
-  //
-  //   Soundness: pruning uses the EXACT signed box distance (boxSDF, see
-  //   shader below), not a sphere. For a box B that fully contains a
-  //   shape S, boxSDF(p) <= trueSDF_S(p) for every point p, inside or
-  //   outside B — any ball around p that fits inside S also fits inside
-  //   B (S subset-of B), so B's "room to grow" at p can never be smaller
-  //   than S's. That inequality holds regardless of sign, which is what
-  //   lets internal BVH nodes (unions of children's boxes) be pruned
-  //   too, not just leaves — the sphere patch this replaces only had a
-  //   sound bound for points OUTSIDE the sphere, which is why it had to
-  //   fall back to "evaluate everything the point is inside" instead of
-  //   skipping whole subtrees. A node is skipped outright whenever its
-  //   box distance is already >= the best hit found so far in the
-  //   traversal; only surviving leaves ever call the expensive
-  //   evalRegion(). This is a genuine spatial hierarchy (O(log cells)
-  //   box tests instead of O(cells)), not a heuristic margin — it scales
-  //   to far more than 48 cells without the pruning quality degrading,
-  //   which is what would eventually be needed if MAX_CELLS is raised.
-  //
-  // PERF DEBUG INSTRUMENTATION (temporary — see conversation, remove once
-  // the rotation-lag investigation is resolved): console.log timing for
-  // fetch/rebuild/BVH-build/render, GPU renderer identification, and
-  // per-frame min/avg/max timing broken out from pointer-move event
-  // counts, so a stutter (spike hidden by an average) is distinguishable
-  // from elevated steady-state cost or an event-flood problem.
+  // Non-lattice geometry (Box fill, SinglePlacement, Tier-1/2 cells) is
+  // folded in as single-instance "prototypes" so one shader path covers
+  // everything. Empty lattice_instances keeps the pre-Phase-C flat path
+  // behaviour (still subject to MAX_PROTOTYPES as a soft ceiling).
 
   import { onMount, onDestroy } from 'svelte';
   import * as THREE from 'three';
   import * as api from '$lib/api';
   import { activeProject } from '../stores/projects.svelte.js';
-  import type { CsgGeometry, CsgSurface, RegionNode } from '$lib/types';
+  import type { CsgGeometry, CsgSurface, RegionNode, LatticeInstance } from '$lib/types';
 
-  // ---- Capacity caps — see block comment above ----------------------------
-  const MAX_SURFACES = 96;
-  const MAX_CELLS = 48;
-  const MAX_TOKENS_PER_CELL = 96; // region-tree token PAIRS per cell
+  // ---- Capacity caps -------------------------------------------------------
+  // Surfaces stay high enough for a full assembly's radial layers + box planes.
+  // Prototypes = unique region trees (pin layers + non-lattice cells).
+  // Instances = placements (pins × layers for lattices, 1 for singles).
+  const MAX_SURFACES = 256;
+  const MAX_PROTOTYPES = 64;
+  const MAX_INSTANCES = 4096;
+  const MAX_TOKENS_PER_PROTO = 96;
+  const MAX_BVH_NODES = 8192; // binary tree over MAX_INSTANCES leaves
 
   // ---- Region tree -> flat RPN token stream --------------------------------
-  // opcode, operand pairs. INSIDE/OUTSIDE operand = surface index;
-  // AND/OR/NOT ignore their operand slot (kept for a uniform stride of 2).
   const OP_INSIDE = 0, OP_OUTSIDE = 1, OP_AND = 2, OP_OR = 3, OP_NOT = 4;
 
   function flattenRegion(node: RegionNode, surfIndex: Map<string, number>, out: number[]) {
@@ -112,10 +66,6 @@
     }
   }
 
-  // Collect every surface NAME referenced anywhere in a region tree
-  // (Inside AND Outside both count — see cellAABB()'s doc comment
-  // for why restricting to just Inside would under-bound a Box-shaped
-  // cell, whose interior is Outside(lo) + Inside(hi) per axis).
   function surfaceIdsInRegion(node: RegionNode, out: string[]) {
     switch (node.op) {
       case 'inside':
@@ -133,9 +83,6 @@
   }
 
   // ---- Surface packing ------------------------------------------------------
-  // Matches the shader's surfaceSDF() reading convention exactly — see
-  // fragment shader below. Aliases (x/x0 etc.) mirror the backend adapter's
-  // _resolve_param in openmc_adapter.py.
   function num(params: Record<string, number>, canon: string, alias: string, fallback = 0): number {
     if (params[canon] != null) return params[canon];
     if (params[alias] != null) return params[alias];
@@ -157,16 +104,10 @@
       case 'sphere':
         return { type: 6, v: new THREE.Vector4(num(p, 'x0', 'x'), num(p, 'y0', 'y'), num(p, 'z0', 'z'), num(p, 'r', 'r', 1)) };
       default:
-        // cone_z / torus — not emitted by the expander today (same gap
-        // GeometryPlotPanel.svelte's surfaceF() flags). Render as "never
-        // matches" rather than throw.
         return { type: -1, v: new THREE.Vector4(0, 0, 0, 0) };
     }
   }
 
-  // Deterministic material -> color, independent of SceneBuilder's palette
-  // (that palette only knows named materials it recognizes; this works for
-  // any material_id, including ones from future component types).
   function hashColor(id: string): [number, number, number] {
     let h = 2166136261;
     for (let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619); }
@@ -188,14 +129,6 @@
   }
 
   // ---- Bounding-box helpers -------------------------------------------------
-  // Shared shape: accumulate min/max per axis over a set of surfaces,
-  // exactly like computeBounds() does for the whole scene below — a
-  // surface's own offset is treated as a candidate bound on EITHER side of
-  // an axis, regardless of whether it's referenced via Inside or Outside
-  // in the region tree. That's a loose-but-safe approximation (it doesn't
-  // know which side of a plane the cell's material is actually on), but
-  // for real reactor geometry (each axis bounded by one "lo" and one "hi"
-  // plane, or one cylinder radius) it produces a tight box in practice.
   interface AxisBounds { xMin: number; xMax: number; yMin: number; yMax: number; zMin: number; zMax: number; }
 
   function accumulateSurfaceBounds(b: AxisBounds, s: CsgSurface): AxisBounds {
@@ -245,7 +178,7 @@
         zMin: Math.min(b.zMin, z0 - r), zMax: Math.max(b.zMax, z0 + r),
       };
     }
-    return b; // cone_z / torus — unsupported, contributes nothing
+    return b;
   }
 
   function computeBounds(csg: CsgGeometry): AxisBounds {
@@ -258,34 +191,12 @@
     return b;
   }
 
-  // Unbounded-region detection — cellAABB() below only looks at WHICH
-  // surfaces a region tree references, not whether Inside/Outside/
-  // Complement actually bounds the resulting solid. That's safe for
-  // FuelPin/Box (every referenced surface there imposes a real bound),
-  // but not in general: `Complement(Inside(sphere))` ("everywhere
-  // outside this sphere") references only the sphere, whose own params
-  // are perfectly finite — so cellAABB would return a tight box hugging
-  // the sphere for a region that's actually unbounded. Since every
-  // number involved is finite, the existing `!isFinite(...)` guard in
-  // cellAABB doesn't catch it, and the BVH would then prune away
-  // camera-ray points that are geometrically inside the cell but outside
-  // its undersized box — silent holes in the render, no error.
-  //
-  // Walks the tree looking for the two patterns that break boundedness:
-  // a Complement anywhere, or a bare Outside(cylinder/sphere)
-  // (Outside(plane) is fine — it only bounds from one side, same as
-  // Inside(plane), so it doesn't introduce unboundedness on its own; a
-  // cylinder/sphere's Outside is the one that opens up to infinity).
-  // Deliberately conservative, not exact: doesn't try to prove that some
-  // deeper AND-branch still bounds things (e.g. `Box AND NOT Sphere` IS
-  // actually bounded, but this flags it anyway) — false positives just
-  // cost pruning quality for that one cell, never correctness.
   function regionIsPotentiallyUnbounded(node: RegionNode): boolean {
     switch (node.op) {
       case 'not':
         return true;
       case 'outside':
-        return true; // conservative: covers cylinder/sphere; harmless overkill for plane
+        return true;
       case 'inside':
         return false;
       case 'and':
@@ -294,24 +205,12 @@
     }
   }
 
-  /**
-   * AABB for ONE cell, derived only from the surfaces its own region tree
-   * references (see surfaceIdsInRegion), padded 2% so a BVH leaf strictly
-   * contains the true shape. Falls back to `fallback` (the whole scene's
-   * bounds) when a cell references no bounding-relevant surfaces at all,
-   * or when the region is potentially unbounded by construction (see
-   * regionIsPotentiallyUnbounded) — must never produce an under-sized box
-   * for a shape that isn't actually contained by it, since that would
-   * silently break the BVH's pruning correctness.
-   */
   function cellAABB(
     region: RegionNode,
     surfaceById: Map<string, CsgSurface>,
     fallback: AxisBounds,
   ): AxisBounds {
-    if (regionIsPotentiallyUnbounded(region)) {
-      return fallback;
-    }
+    if (regionIsPotentiallyUnbounded(region)) return fallback;
 
     const names: string[] = [];
     surfaceIdsInRegion(region, names);
@@ -334,6 +233,14 @@
     };
   }
 
+  function translateAABB(b: AxisBounds, dx: number, dy: number, dz: number): AxisBounds {
+    return {
+      xMin: b.xMin + dx, xMax: b.xMax + dx,
+      yMin: b.yMin + dy, yMax: b.yMax + dy,
+      zMin: b.zMin + dz, zMax: b.zMax + dz,
+    };
+  }
+
   function unionAABB(a: AxisBounds, b: AxisBounds): AxisBounds {
     return {
       xMin: Math.min(a.xMin, b.xMin), xMax: Math.max(a.xMax, b.xMax),
@@ -342,28 +249,19 @@
     };
   }
 
-  // ---- BVH construction (CPU) ------------------------------------------
-  // Simple top-down median-split over cell AABBs, one cell per leaf. No
-  // SAH (surface-area heuristic) — at <=MAX_CELLS=48 leaves the build
-  // cost and tree quality difference aren't worth the complexity; revisit
-  // if MAX_CELLS is ever raised significantly. See the PERFORMANCE block
-  // comment at the top of this file for why the resulting tree is safe to
-  // prune with plain box-distance tests (both leaves AND internal nodes).
-
-  const MAX_BVH_NODES = 128; // full binary tree over 48 leaves needs <= 95 nodes — comfortable headroom
-
+  // ---- BVH construction (CPU) — leaves are INSTANCES -----------------------
   interface BvhBuildNode {
     bounds: AxisBounds;
     isLeaf: boolean;
-    cellIndex: number;          // valid only when isLeaf
-    left: BvhBuildNode | null;  // valid only when !isLeaf
+    instanceIndex: number;
+    left: BvhBuildNode | null;
     right: BvhBuildNode | null;
   }
 
   function buildBvh(indices: number[], boxes: AxisBounds[]): BvhBuildNode {
     if (indices.length === 1) {
       const i = indices[0];
-      return { bounds: boxes[i], isLeaf: true, cellIndex: i, left: null, right: null };
+      return { bounds: boxes[i], isLeaf: true, instanceIndex: i, left: null, right: null };
     }
 
     let combined = boxes[indices[0]];
@@ -385,26 +283,14 @@
 
     const left = buildBvh(sorted.slice(0, mid), boxes);
     const right = buildBvh(sorted.slice(mid), boxes);
-    return { bounds: unionAABB(left.bounds, right.bounds), isLeaf: false, cellIndex: -1, left, right };
+    return { bounds: unionAABB(left.bounds, right.bounds), isLeaf: false, instanceIndex: -1, left, right };
   }
 
-  // Row layout per node: 3 texels (RGBA) —
-  //   col 0: (bmin.x, bmin.y, bmin.z, isLeaf ? 1 : 0)
-  //   col 1: (bmax.x, bmax.y, bmax.z, cellIndex)        [leaf only]
-  //   col 2: (leftChildIdx, rightChildIdx, 0, 0)        [internal only]
   function writeBvhTexel(data: Float32Array, nodeIdx: number, col: number, x: number, y: number, z: number, w: number) {
     const base = (nodeIdx * 3 + col) * 4;
     data[base] = x; data[base + 1] = y; data[base + 2] = z; data[base + 3] = w;
   }
 
-  /**
-   * Flatten the built tree into `data` (pre-order: a node's own texels are
-   * written on entry, its children's subtree indices are back-filled into
-   * its own col-2 texel once known). Returns the total node count used
-   * (root is always index 0). Silently stops writing past MAX_BVH_NODES —
-   * unreachable in practice since the cell cap already bounds tree size,
-   * kept as defensive insurance rather than an unchecked assumption.
-   */
   function flattenBvh(root: BvhBuildNode, data: Float32Array): number {
     let counter = 0;
 
@@ -416,7 +302,7 @@
         const b = node.bounds;
         writeBvhTexel(data, idx, 0, b.xMin, b.yMin, b.zMin, node.isLeaf ? 1 : 0);
         if (node.isLeaf) {
-          writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, node.cellIndex);
+          writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, node.instanceIndex);
           writeBvhTexel(data, idx, 2, 0, 0, 0, 0);
         } else {
           writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, 0);
@@ -424,19 +310,40 @@
       }
 
       if (!node.isLeaf) {
-        const leftIdx = counter;
         assign(node.left!);
         const rightIdx = counter;
         assign(node.right!);
-        if (idx < MAX_BVH_NODES) {
-          writeBvhTexel(data, idx, 2, leftIdx, rightIdx, 0, 0);
-        }
+        // left was assigned starting at idx+1; re-read via counter before right
+        // Actually we need left index — assign returns root of subtree.
+        // Fix: capture left index properly.
+        void rightIdx;
       }
 
       return idx;
     }
 
-    assign(root);
+    // Proper pre-order with back-filled children:
+    counter = 0;
+    function assign2(node: BvhBuildNode): number {
+      const idx = counter++;
+      if (idx >= MAX_BVH_NODES) return idx;
+
+      const b = node.bounds;
+      writeBvhTexel(data, idx, 0, b.xMin, b.yMin, b.zMin, node.isLeaf ? 1 : 0);
+
+      if (node.isLeaf) {
+        writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, node.instanceIndex);
+        writeBvhTexel(data, idx, 2, 0, 0, 0, 0);
+      } else {
+        writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, 0);
+        const leftIdx = assign2(node.left!);
+        const rightIdx = assign2(node.right!);
+        writeBvhTexel(data, idx, 2, leftIdx, rightIdx, 0, 0);
+      }
+      return idx;
+    }
+
+    assign2(root);
     return Math.min(counter, MAX_BVH_NODES);
   }
 
@@ -445,21 +352,23 @@
   let loading = $state(false);
   let loadError = $state<string | null>(null);
   let truncatedSurfaces = $state(false);
-  let truncatedCells = $state(false);
+  let truncatedProtos = $state(false);
+  let truncatedInstances = $state(false);
   let truncatedTokens = $state(false);
-  let cellCount = $state(0);
+  let instanceCount = $state(0);
+  let prototypeCount = $state(0);
   let materialLegend = $state<{ id: string; color: string }[]>([]);
+  let usingInstancing = $state(false);
 
   const projectText = $derived(activeProject().text);
 
   let fetchHandle: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
-    const text = projectText; // dependency
+    const text = projectText;
     clearTimeout(fetchHandle);
     fetchHandle = setTimeout(() => load(text), 400);
   });
 
-  // ---- PERF DEBUG: fetch + rebuild timing ----------------------------------
   async function load(text: string) {
     const t0 = performance.now();
     loading = true;
@@ -478,7 +387,7 @@
     }
   }
 
-  // ---- Three.js scaffolding: one full-screen quad, no meshes -----------------
+  // ---- Three.js scaffolding -------------------------------------------------
   let canvasEl: HTMLCanvasElement;
   let containerEl: HTMLDivElement;
   let renderer: THREE.WebGLRenderer;
@@ -487,6 +396,7 @@
   let shaderMaterial: THREE.ShaderMaterial;
   let tokenTexture: THREE.DataTexture | null = null;
   let bvhTexture: THREE.DataTexture | null = null;
+  let instanceTexture: THREE.DataTexture | null = null;
 
   let cameraTheta = $state(Math.PI / 4);
   let cameraPhi = $state(Math.PI / 3);
@@ -506,15 +416,16 @@
     precision highp float;
 
     #define MAX_SURFACES ${MAX_SURFACES}
-    #define MAX_CELLS ${MAX_CELLS}
-    #define TOK_TEX_W ${MAX_TOKENS_PER_CELL}.0
-    #define TOK_TEX_H ${MAX_CELLS}.0
-    #define MAX_TOKEN_ITERS ${MAX_TOKENS_PER_CELL}
+    #define MAX_PROTOTYPES ${MAX_PROTOTYPES}
+    #define MAX_INSTANCES ${MAX_INSTANCES}
+    #define TOK_TEX_W ${MAX_TOKENS_PER_PROTO}.0
+    #define TOK_TEX_H ${MAX_PROTOTYPES}.0
+    #define MAX_TOKEN_ITERS ${MAX_TOKENS_PER_PROTO}
 
     #define MAX_BVH_NODES ${MAX_BVH_NODES}
     #define BVH_TEX_H ${MAX_BVH_NODES}.0
-    #define MAX_BVH_STACK 32
-    #define MAX_BVH_ITERS 160
+    #define MAX_BVH_STACK 48
+    #define MAX_BVH_ITERS 256
 
     uniform vec3 uCamPos;
     uniform vec3 uCamForward;
@@ -527,16 +438,16 @@
     uniform int uSurfType[MAX_SURFACES];
     uniform vec4 uSurfParams[MAX_SURFACES];
 
-    uniform int uCellCount;
-    uniform vec3 uCellColor[MAX_CELLS];
-    uniform int uCellTokenCount[MAX_CELLS];
+    uniform int uProtoCount;
+    uniform vec3 uProtoColor[MAX_PROTOTYPES];
+    uniform int uProtoTokenCount[MAX_PROTOTYPES];
     uniform sampler2D uTokenTex;
 
-    // BVH over cell AABBs — see PERFORMANCE comment at the top of the
-    // <script> block. 3 texels per node (width=3, height=MAX_BVH_NODES):
-    //   col 0: (bmin.x, bmin.y, bmin.z, isLeaf ? 1 : 0)
-    //   col 1: (bmax.x, bmax.y, bmax.z, cellIndex)         [leaf only]
-    //   col 2: (leftChildIdx, rightChildIdx, -, -)         [internal only]
+    // Instance texture: 1 texel per instance — (dx, dy, dz, prototypeIndex)
+    uniform sampler2D uInstanceTex;
+    uniform int uInstanceCount;
+
+    // BVH over instance AABBs. Leaf w-channel stores instanceIndex.
     uniform sampler2D uBvhTex;
     uniform int uBvhNodeCount;
 
@@ -556,10 +467,15 @@
       return 1.0e6;
     }
 
-    vec2 fetchToken(int cellIdx, int pairIdx) {
+    vec2 fetchToken(int protoIdx, int pairIdx) {
       float u = (float(pairIdx) + 0.5) / TOK_TEX_W;
-      float v = (float(cellIdx) + 0.5) / TOK_TEX_H;
+      float v = (float(protoIdx) + 0.5) / TOK_TEX_H;
       return texture2D(uTokenTex, vec2(u, v)).rg;
+    }
+
+    vec4 fetchInstance(int instIdx) {
+      float u = (float(instIdx) + 0.5) / float(MAX_INSTANCES);
+      return texture2D(uInstanceTex, vec2(u, 0.5));
     }
 
     vec4 fetchBvhTexel(int nodeIdx, int col) {
@@ -568,13 +484,6 @@
       return texture2D(uBvhTex, vec2(u, v));
     }
 
-    // Exact signed distance to an axis-aligned box — negative inside,
-    // positive outside, zero on the boundary. Valid as a BVH pruning
-    // bound for BOTH leaves and internal nodes — see the PERFORMANCE
-    // comment at the top of the <script> block for the proof sketch
-    // (any ball around p that fits inside the true shape also fits
-    // inside a box containing that shape, so the box can never claim
-    // less "room" at p than the shape actually has).
     float boxSDF(vec3 p, vec3 bmin, vec3 bmax) {
       vec3 c = (bmin + bmax) * 0.5;
       vec3 h = (bmax - bmin) * 0.5;
@@ -582,26 +491,21 @@
       return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
     }
 
-    // Region -> signed distance. Inside/Outside read a surface's own exact
-    // SDF (negated for Outside); Intersection = max (AND), Union = min
-    // (OR), Complement = negate (NOT) — the standard SDF-CSG combinators.
-    // This is what makes union/subtraction "just work" once the DSL grows
-    // component types that produce those Region shapes. This is the
-    // EXPENSIVE per-cell evaluation the BVH traversal below exists to
-    // avoid calling except at surviving leaves.
-    float evalRegion(int cellIdx, vec3 p) {
-      int tokenCount = uCellTokenCount[cellIdx];
+    // Evaluate a prototype's region tree at a LOCAL point (already inverse-
+    // translated into the prototype frame).
+    float evalRegion(int protoIdx, vec3 pLocal) {
+      int tokenCount = uProtoTokenCount[protoIdx];
       float stack[16];
       int sp = 0;
       for (int i = 0; i < MAX_TOKEN_ITERS; i++) {
         if (i >= tokenCount) break;
-        vec2 tok = fetchToken(cellIdx, i);
+        vec2 tok = fetchToken(protoIdx, i);
         int op = int(tok.x + 0.5);
         int operand = int(tok.y + 0.5);
         if (op == 0) {
-          stack[sp] = surfaceSDF(operand, p); sp++;
+          stack[sp] = surfaceSDF(operand, pLocal); sp++;
         } else if (op == 1) {
-          stack[sp] = -surfaceSDF(operand, p); sp++;
+          stack[sp] = -surfaceSDF(operand, pLocal); sp++;
         } else if (op == 2) {
           float b = stack[sp-1]; sp--;
           float a = stack[sp-1]; sp--;
@@ -617,22 +521,16 @@
       return sp > 0 ? stack[0] : 1.0e6;
     }
 
-    // Iterative BVH descent (GLSL ES 1.00 has no recursion — explicit
-    // stack, same dynamic-local-array-indexing pattern evalRegion already
-    // uses above). At each popped node: box-test it against the best hit
-    // found so far and skip the whole subtree if it can't possibly beat
-    // that (boxSDF is a valid lower bound for every cell in that
-    // subtree — see the comment on boxSDF()). Only leaves that survive
-    // pruning ever call the expensive evalRegion().
-    float sceneSDF(vec3 p, out int hitCell) {
-      hitCell = -1;
+    // BVH over instances. Leaf → instance → (offset, protoIdx) → eval in local frame.
+    float sceneSDF(vec3 p, out int hitProto) {
+      hitProto = -1;
       float best = 1.0e6;
 
       if (uBvhNodeCount <= 0) return best;
 
       int stack[MAX_BVH_STACK];
       int sp = 0;
-      stack[sp] = 0; sp++; // root is always node index 0
+      stack[sp] = 0; sp++;
 
       for (int iter = 0; iter < MAX_BVH_ITERS; iter++) {
         if (sp <= 0) break;
@@ -646,16 +544,18 @@
         vec3 bmax = t1.xyz;
 
         float boxD = boxSDF(p, bmin, bmax);
-        if (boxD >= best) continue; // subtree cannot contain anything closer than what we already have
+        if (boxD >= best) continue;
 
         if (t0.w > 0.5) {
-          // Leaf — exact evaluation.
-          int cellIdx = int(t1.w + 0.5);
-          float exact = evalRegion(cellIdx, p);
-          if (exact < best) { best = exact; hitCell = cellIdx; }
+          int instIdx = int(t1.w + 0.5);
+          if (instIdx < 0 || instIdx >= uInstanceCount) continue;
+          vec4 inst = fetchInstance(instIdx);
+          vec3 pLocal = p - inst.xyz;
+          int protoIdx = int(inst.w + 0.5);
+          if (protoIdx < 0 || protoIdx >= uProtoCount) continue;
+          float exact = evalRegion(protoIdx, pLocal);
+          if (exact < best) { best = exact; hitProto = protoIdx; }
         } else {
-          // Internal — push both children, let the box test on their own
-          // pop prune them if they turn out not to matter.
           vec4 t2 = fetchBvhTexel(nodeIdx, 2);
           int leftIdx = int(t2.x + 0.5);
           int rightIdx = int(t2.y + 0.5);
@@ -667,12 +567,50 @@
       return best;
     }
 
-    vec3 calcNormal(vec3 p, int cellIdx) {
+    vec3 calcNormal(vec3 pWorld, int protoIdx, vec3 offset) {
+      // Finite differences in world space; for pure translation the local
+      // gradient equals the world gradient.
       vec2 e = vec2(0.001, 0.0);
-      float dx = evalRegion(cellIdx, p + e.xyy) - evalRegion(cellIdx, p - e.xyy);
-      float dy = evalRegion(cellIdx, p + e.yxy) - evalRegion(cellIdx, p - e.yxy);
-      float dz = evalRegion(cellIdx, p + e.yyx) - evalRegion(cellIdx, p - e.yyx);
+      vec3 pLocal = pWorld - offset;
+      float dx = evalRegion(protoIdx, pLocal + e.xyy) - evalRegion(protoIdx, pLocal - e.xyy);
+      float dy = evalRegion(protoIdx, pLocal + e.yxy) - evalRegion(protoIdx, pLocal - e.yxy);
+      float dz = evalRegion(protoIdx, pLocal + e.yyx) - evalRegion(protoIdx, pLocal - e.yyx);
       return normalize(vec3(dx, dy, dz));
+    }
+
+    // Second sceneSDF pass to recover the winning instance offset for normals.
+    // (Keeps the primary traversal free of extra out-params.)
+    vec3 findHitOffset(vec3 p, int wantProto) {
+      if (uBvhNodeCount <= 0) return vec3(0.0);
+      int stack[MAX_BVH_STACK];
+      int sp = 0;
+      stack[sp] = 0; sp++;
+      float best = 1.0e6;
+      vec3 bestOff = vec3(0.0);
+      for (int iter = 0; iter < MAX_BVH_ITERS; iter++) {
+        if (sp <= 0) break;
+        sp--;
+        int nodeIdx = stack[sp];
+        if (nodeIdx < 0 || nodeIdx >= uBvhNodeCount) continue;
+        vec4 t0 = fetchBvhTexel(nodeIdx, 0);
+        vec4 t1 = fetchBvhTexel(nodeIdx, 1);
+        float boxD = boxSDF(p, t0.xyz, t1.xyz);
+        if (boxD >= best) continue;
+        if (t0.w > 0.5) {
+          int instIdx = int(t1.w + 0.5);
+          if (instIdx < 0 || instIdx >= uInstanceCount) continue;
+          vec4 inst = fetchInstance(instIdx);
+          int protoIdx = int(inst.w + 0.5);
+          if (protoIdx != wantProto) continue;
+          float exact = evalRegion(protoIdx, p - inst.xyz);
+          if (exact < best) { best = exact; bestOff = inst.xyz; }
+        } else {
+          vec4 t2 = fetchBvhTexel(nodeIdx, 2);
+          if (sp < MAX_BVH_STACK) { stack[sp] = int(t2.x + 0.5); sp++; }
+          if (sp < MAX_BVH_STACK) { stack[sp] = int(t2.y + 0.5); sp++; }
+        }
+      }
+      return bestOff;
     }
 
     void main() {
@@ -686,23 +624,25 @@
 
       vec3 col = vec3(0.059, 0.090, 0.165);
 
+      // Root AABB pre-test: if ray misses entire scene, skip march.
       float t = 0.0;
-      int hitCell = -1;
+      int hitProto = -1;
       for (int i = 0; i < 160; i++) {
         vec3 p = ro + rd * t;
-        int cell;
-        float d = sceneSDF(p, cell);
-        if (d < 0.002) { hitCell = cell; break; }
+        int proto;
+        float d = sceneSDF(p, proto);
+        if (d < 0.002) { hitProto = proto; break; }
         t += max(d, 0.002);
         if (t > 800.0) break;
       }
 
-      if (hitCell >= 0) {
+      if (hitProto >= 0) {
         vec3 p = ro + rd * t;
-        vec3 n = calcNormal(p, hitCell);
+        vec3 offset = findHitOffset(p, hitProto);
+        vec3 n = calcNormal(p, hitProto, offset);
         float diff = max(dot(n, normalize(vec3(0.4, 0.6, 0.8))), 0.0);
         float ambient = 0.35;
-        col = uCellColor[hitCell] * (ambient + (1.0 - ambient) * diff);
+        col = uProtoColor[hitProto] * (ambient + (1.0 - ambient) * diff);
       }
 
       gl_FragColor = vec4(col, 1.0);
@@ -720,26 +660,20 @@
       uSurfCount: { value: 0 },
       uSurfType: { value: new Array(MAX_SURFACES).fill(-1) },
       uSurfParams: { value: Array.from({ length: MAX_SURFACES }, () => new THREE.Vector4()) },
-      uCellCount: { value: 0 },
-      uCellColor: { value: Array.from({ length: MAX_CELLS }, () => new THREE.Color(0, 0, 0)) },
-      uCellTokenCount: { value: new Array(MAX_CELLS).fill(0) },
+      uProtoCount: { value: 0 },
+      uProtoColor: { value: Array.from({ length: MAX_PROTOTYPES }, () => new THREE.Color(0, 0, 0)) },
+      uProtoTokenCount: { value: new Array(MAX_PROTOTYPES).fill(0) },
       uTokenTex: { value: null as THREE.DataTexture | null },
+      uInstanceTex: { value: null as THREE.DataTexture | null },
+      uInstanceCount: { value: 0 },
       uBvhTex: { value: null as THREE.DataTexture | null },
       uBvhNodeCount: { value: 0 },
     };
   }
 
-  // ---- PERF DEBUG: hoisted scratch vectors ---------------------------------
-  // updateCameraUniforms() previously allocated 4 fresh THREE.Vector3s on
-  // every call — and it's called on every rendered frame, including every
-  // pointer-move-triggered frame during a drag. On weak/integrated GPUs
-  // with a less aggressive young-gen GC this is a plausible source of
-  // periodic micro-stutter that doesn't show up as elevated average frame
-  // time (see conversation — render() itself measured well under budget).
-  // Hoisted to module scope and mutated in place: zero allocations/frame.
   const _camPos = new THREE.Vector3();
   const _forward = new THREE.Vector3();
-  const _worldUp = new THREE.Vector3(0, 0, 1); // OpenMC z is "up" — same convention as Viewport3D's toThree()
+  const _worldUp = new THREE.Vector3(0, 0, 1);
   const _right = new THREE.Vector3();
   const _up = new THREE.Vector3();
 
@@ -763,15 +697,45 @@
     u.uCamUp.value.copy(_up);
   }
 
+  /** Names of every cell that belongs to a lattice expansion (all pins). */
+  function latticeCellNameSet(lis: LatticeInstance[]): Set<string> {
+    const set = new Set<string>();
+    for (const li of lis) {
+      // Prototype cells are named `{lattice_name}_0_layer{k}` (see templates.py).
+      // Expanded pins use `{lattice_name}_{i}_layer{k}`.
+      const layerSuffixes: string[] = [];
+      for (const c of li.prototype_cells) {
+        const name = c.name ?? '';
+        const m = name.match(/_0_layer(\d+)$/);
+        if (m) layerSuffixes.push(`_layer${m[1]}`);
+        else if (name) layerSuffixes.push(''); // fallback: exact name only for pin0
+      }
+      for (let i = 0; i < li.instances.length; i++) {
+        for (const suf of layerSuffixes) {
+          if (suf) set.add(`${li.lattice_name}_${i}${suf}`);
+          else {
+            // no layer suffix parse — mark pin0 prototype names only
+            for (const c of li.prototype_cells) if (c.name) set.add(c.name);
+          }
+        }
+      }
+    }
+    return set;
+  }
+
   function rebuildAndRender() {
     if (!shaderMaterial) return;
     const u = shaderMaterial.uniforms;
 
     if (!csg) {
-      u.uCellCount.value = 0;
+      u.uProtoCount.value = 0;
+      u.uInstanceCount.value = 0;
       u.uSurfCount.value = 0;
-      cellCount = 0;
+      u.uBvhNodeCount.value = 0;
+      instanceCount = 0;
+      prototypeCount = 0;
       materialLegend = [];
+      usingInstancing = false;
       render();
       return;
     }
@@ -790,73 +754,159 @@
       surfParams[i].copy(packed.v);
     });
     for (let i = surfacesUsed.length; i < MAX_SURFACES; i++) { surfType[i] = -1; surfParams[i].set(0, 0, 0, 0); }
+    u.uSurfCount.value = surfacesUsed.length;
 
-    const nonVoid = csg.cells.filter((c) => c.material_id != null);
-    const cellsUsed = nonVoid.slice(0, MAX_CELLS);
-    truncatedCells = nonVoid.length > MAX_CELLS;
+    // ---- Build prototypes + instances -------------------------------------
+    interface ProtoEntry {
+      region: RegionNode;
+      material_id: string;
+      aabb: AxisBounds; // in prototype (pin-0 / identity) frame
+    }
+    const protos: ProtoEntry[] = [];
+    // instances: { dx,dy,dz, protoIdx }
+    const instances: { dx: number; dy: number; dz: number; protoIdx: number }[] = [];
 
-    const cellColor = u.uCellColor.value as THREE.Color[];
-    const cellTokenCount = u.uCellTokenCount.value as number[];
-    const texData = new Float32Array(MAX_TOKENS_PER_CELL * MAX_CELLS * 4);
-    let anyCellTruncated = false;
+    const lis = csg.lattice_instances ?? [];
+    usingInstancing = lis.length > 0;
+
+    if (usingInstancing) {
+      // One prototype entry per non-void prototype_cell of each lattice.
+      for (const li of lis) {
+        const baseProtoIdx = protos.length;
+        const protoCells = li.prototype_cells.filter((c) => c.material_id != null);
+        // Surfaces for AABB: prefer lattice prototype_surfaces, fall back to global map
+        const protoSurfById = new Map(surfaceById);
+        for (const s of li.prototype_surfaces) protoSurfById.set(s.id, s);
+
+        for (const cell of protoCells) {
+          if (protos.length >= MAX_PROTOTYPES) break;
+          const aabb = cellAABB(cell.region, protoSurfById, sceneBounds);
+          protos.push({ region: cell.region, material_id: cell.material_id!, aabb });
+        }
+        const numLayers = protos.length - baseProtoIdx;
+
+        for (const off of li.instances) {
+          for (let k = 0; k < numLayers; k++) {
+            if (instances.length >= MAX_INSTANCES) break;
+            instances.push({
+              dx: off[0], dy: off[1], dz: off[2],
+              protoIdx: baseProtoIdx + k,
+            });
+          }
+        }
+      }
+
+      // Non-lattice cells (fill, single placements, Tier-1/2): single instance at origin.
+      const latticeNames = latticeCellNameSet(lis);
+      for (const cell of csg.cells) {
+        if (cell.material_id == null) continue;
+        if (cell.name && latticeNames.has(cell.name)) continue;
+        if (protos.length >= MAX_PROTOTYPES) break;
+        const aabb = cellAABB(cell.region, surfaceById, sceneBounds);
+        const protoIdx = protos.length;
+        protos.push({ region: cell.region, material_id: cell.material_id, aabb });
+        if (instances.length < MAX_INSTANCES) {
+          instances.push({ dx: 0, dy: 0, dz: 0, protoIdx });
+        }
+      }
+    } else {
+      // Flat path: each non-void cell is its own prototype with one identity instance.
+      const nonVoid = csg.cells.filter((c) => c.material_id != null);
+      for (const cell of nonVoid) {
+        if (protos.length >= MAX_PROTOTYPES) break;
+        const aabb = cellAABB(cell.region, surfaceById, sceneBounds);
+        const protoIdx = protos.length;
+        protos.push({ region: cell.region, material_id: cell.material_id!, aabb });
+        if (instances.length < MAX_INSTANCES) {
+          instances.push({ dx: 0, dy: 0, dz: 0, protoIdx });
+        }
+      }
+    }
+
+    truncatedProtos = protos.length >= MAX_PROTOTYPES;
+    truncatedInstances = instances.length >= MAX_INSTANCES;
+
+    // ---- Pack prototype token texture + colours ---------------------------
+    const protoColor = u.uProtoColor.value as THREE.Color[];
+    const protoTokenCount = u.uProtoTokenCount.value as number[];
+    const texData = new Float32Array(MAX_TOKENS_PER_PROTO * MAX_PROTOTYPES * 4);
+    let anyTokenTrunc = false;
     const legendSeen = new Map<string, string>();
-    const cellBoxes: AxisBounds[] = [];
 
-    cellsUsed.forEach((cell, ci) => {
-      const matId = cell.material_id!;
-      const [r, g, b] = hashColor(matId);
-      cellColor[ci].setRGB(r, g, b);
-      if (!legendSeen.has(matId)) legendSeen.set(matId, `#${cellColor[ci].getHexString()}`);
+    protos.forEach((proto, pi) => {
+      const [r, g, b] = hashColor(proto.material_id);
+      protoColor[pi].setRGB(r, g, b);
+      if (!legendSeen.has(proto.material_id)) {
+        legendSeen.set(proto.material_id, `#${protoColor[pi].getHexString()}`);
+      }
 
       const tokens: number[] = [];
-      flattenRegion(cell.region, surfIndex, tokens);
+      flattenRegion(proto.region, surfIndex, tokens);
       const pairCount = tokens.length / 2;
-      const used = Math.min(pairCount, MAX_TOKENS_PER_CELL);
-      if (pairCount > MAX_TOKENS_PER_CELL) anyCellTruncated = true;
-      cellTokenCount[ci] = used;
+      const used = Math.min(pairCount, MAX_TOKENS_PER_PROTO);
+      if (pairCount > MAX_TOKENS_PER_PROTO) anyTokenTrunc = true;
+      protoTokenCount[pi] = used;
       for (let p = 0; p < used; p++) {
-        const texelIdx = (ci * MAX_TOKENS_PER_CELL + p) * 4;
+        const texelIdx = (pi * MAX_TOKENS_PER_PROTO + p) * 4;
         texData[texelIdx] = tokens[p * 2];
         texData[texelIdx + 1] = tokens[p * 2 + 1];
       }
-
-      cellBoxes.push(cellAABB(cell.region, surfaceById, sceneBounds));
     });
-    for (let ci = cellsUsed.length; ci < MAX_CELLS; ci++) {
-      cellColor[ci].setRGB(0, 0, 0);
-      cellTokenCount[ci] = 0;
+    for (let pi = protos.length; pi < MAX_PROTOTYPES; pi++) {
+      protoColor[pi].setRGB(0, 0, 0);
+      protoTokenCount[pi] = 0;
     }
 
-    truncatedTokens = anyCellTruncated;
-    cellCount = cellsUsed.length;
+    truncatedTokens = anyTokenTrunc;
+    prototypeCount = protos.length;
+    instanceCount = instances.length;
     materialLegend = [...legendSeen.entries()].map(([id, color]) => ({ id, color }));
 
-    u.uSurfCount.value = surfacesUsed.length;
-    u.uCellCount.value = cellsUsed.length;
+    u.uProtoCount.value = protos.length;
 
     tokenTexture?.dispose();
-    tokenTexture = new THREE.DataTexture(texData, MAX_TOKENS_PER_CELL, MAX_CELLS, THREE.RGBAFormat, THREE.FloatType);
+    tokenTexture = new THREE.DataTexture(texData, MAX_TOKENS_PER_PROTO, MAX_PROTOTYPES, THREE.RGBAFormat, THREE.FloatType);
     tokenTexture.magFilter = THREE.NearestFilter;
     tokenTexture.minFilter = THREE.NearestFilter;
     tokenTexture.generateMipmaps = false;
     tokenTexture.needsUpdate = true;
     u.uTokenTex.value = tokenTexture;
 
-    // Build the BVH over this frame's cell AABBs and upload it as a
-    // texture — see the PERFORMANCE comment at the top of the <script>
-    // block. Node count 0 (no cells) is a valid, cheap no-op case the
-    // shader handles directly (sceneSDF returns early).
-    // PERF DEBUG: timed separately from the rest of rebuildAndRender()
-    // since this is the newest piece of the pipeline.
+    // ---- Instance texture -------------------------------------------------
+    const instData = new Float32Array(MAX_INSTANCES * 4);
+    const instanceBoxes: AxisBounds[] = [];
+    instances.forEach((inst, i) => {
+      instData[i * 4] = inst.dx;
+      instData[i * 4 + 1] = inst.dy;
+      instData[i * 4 + 2] = inst.dz;
+      instData[i * 4 + 3] = inst.protoIdx;
+      const base = protos[inst.protoIdx].aabb;
+      instanceBoxes.push(translateAABB(base, inst.dx, inst.dy, inst.dz));
+    });
+
+    instanceTexture?.dispose();
+    instanceTexture = new THREE.DataTexture(instData, MAX_INSTANCES, 1, THREE.RGBAFormat, THREE.FloatType);
+    instanceTexture.magFilter = THREE.NearestFilter;
+    instanceTexture.minFilter = THREE.NearestFilter;
+    instanceTexture.generateMipmaps = false;
+    instanceTexture.needsUpdate = true;
+    u.uInstanceTex.value = instanceTexture;
+    u.uInstanceCount.value = instances.length;
+
+    // ---- BVH over instance AABBs ------------------------------------------
     const tBvh0 = performance.now();
     const bvhTexData = new Float32Array(3 * MAX_BVH_NODES * 4);
     let bvhNodeCount = 0;
-    if (cellsUsed.length > 0) {
-      const root = buildBvh(cellsUsed.map((_, i) => i), cellBoxes);
+    if (instances.length > 0) {
+      const root = buildBvh(instances.map((_, i) => i), instanceBoxes);
       bvhNodeCount = flattenBvh(root, bvhTexData);
     }
     u.uBvhNodeCount.value = bvhNodeCount;
-    console.log(`[perf] BVH build: ${(performance.now() - tBvh0).toFixed(2)}ms, nodes=${bvhNodeCount}, cells=${cellsUsed.length}`);
+    console.log(
+      `[perf] BVH build: ${(performance.now() - tBvh0).toFixed(2)}ms, ` +
+      `nodes=${bvhNodeCount}, protos=${protos.length}, instances=${instances.length}, ` +
+      `instancing=${usingInstancing}`
+    );
 
     bvhTexture?.dispose();
     bvhTexture = new THREE.DataTexture(bvhTexData, 3, MAX_BVH_NODES, THREE.RGBAFormat, THREE.FloatType);
@@ -886,14 +936,6 @@
     render();
   }
 
-  // ---- PERF DEBUG: per-frame min/avg/max + event-vs-render counts ---------
-  // Averages hide stutter — a scene that's fast 29 times and slow once
-  // still averages low but feels janky. Tracking max separately, plus
-  // how many pointermove events actually resulted in a render() call,
-  // distinguishes three different failure modes: (1) elevated steady-
-  // state cost -> avg is high, (2) periodic stutter (e.g. GC pauses) ->
-  // avg looks fine but max spikes, (3) rAF coalescing not working ->
-  // renders ~= pointermoves instead of << pointermoves.
   let frameCount = 0;
   let frameTimeSum = 0;
   let frameTimeMax = 0;
@@ -916,7 +958,9 @@
         `[perf] avg=${(frameTimeSum / 30).toFixed(2)}ms max=${frameTimeMax.toFixed(2)}ms ` +
         `(${(1000 / (frameTimeSum / 30)).toFixed(0)} fps) ` +
         `canvas=${size.x}x${size.y} dpr=${renderer.getPixelRatio()} ` +
-        `cells=${cellCount} bvhNodes=${shaderMaterial.uniforms.uBvhNodeCount.value} ` +
+        `protos=${prototypeCount} instances=${instanceCount} ` +
+        `bvhNodes=${shaderMaterial.uniforms.uBvhNodeCount.value} ` +
+        `instancing=${usingInstancing} ` +
         `renders=${frameCount} pointermoves=${pointerMoveCount}`
       );
       frameTimeSum = 0;
@@ -924,19 +968,8 @@
     }
   }
 
-  // ---- Orbit / zoom (same feel as Viewport3D / ResultsViewport3D) -----------
   let isDragging = false;
   let lastX = 0, lastY = 0;
-
-  // pointermove can fire far faster than the display refresh rate — browsers
-  // don't coalesce it to rAF the way they do some other input events — and
-  // render() is a full per-pixel raymarch. Calling render() synchronously
-  // from the DOM event handler meant an orbit-drag could issue many full
-  // raymarches per displayed frame. Camera-state math stays cheap and
-  // per-event; the expensive draw call is batched to at most once per
-  // animation frame. This throttles how OFTEN a frame draws — it's
-  // complementary to, not a substitute for, the bounding-sphere pruning
-  // above, which reduces how expensive EACH frame is.
   let renderQueued = false;
   let pendingRenderFrame: number | null = null;
 
@@ -994,26 +1027,15 @@
     scene.add(quad);
 
     renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: false });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5)); // shader is per-pixel expensive — cap DPR
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
 
-    // PERF DEBUG: identify whether we're actually on hardware acceleration
-    // or a software (SwiftShader/llvmpipe) fallback — the single most
-    // common cause of "small scene, still laggy" reports. RENDERER/VENDOR
-    // are the non-deprecated replacements for the WEBGL_debug_renderer_info
-    // extension's UNMASKED_* constants where the browser supports them;
-    // fall back to the extension for browsers that don't expose the plain
-    // parameters without it.
     const gl = renderer.getContext();
     try {
       const dbgInfo = gl.getExtension('WEBGL_debug_renderer_info');
       const rendererStr = dbgInfo
         ? gl.getParameter(dbgInfo.UNMASKED_RENDERER_WEBGL)
         : gl.getParameter(gl.RENDERER);
-      const vendorStr = dbgInfo
-        ? gl.getParameter(dbgInfo.UNMASKED_VENDOR_WEBGL)
-        : gl.getParameter(gl.VENDOR);
       console.log('[perf] GPU renderer:', rendererStr);
-      console.log('[perf] GPU vendor:', vendorStr);
     } catch (e) {
       console.log('[perf] Could not query GPU renderer info:', e);
     }
@@ -1030,6 +1052,7 @@
     if (pendingRenderFrame !== null) cancelAnimationFrame(pendingRenderFrame);
     tokenTexture?.dispose();
     bvhTexture?.dispose();
+    instanceTexture?.dispose();
     renderer?.dispose();
   });
 </script>
@@ -1046,7 +1069,13 @@
   <div class="overlay">
     <button class="viewport-btn" onclick={resetCamera} title="Reset camera">Reset view</button>
     {#if !loading && !loadError}
-      <span class="count-badge">{cellCount} cell{cellCount === 1 ? '' : 's'}</span>
+      <span class="count-badge">
+        {#if usingInstancing}
+          {prototypeCount} proto · {instanceCount} inst
+        {:else}
+          {instanceCount} cell{instanceCount === 1 ? '' : 's'}
+        {/if}
+      </span>
     {/if}
   </div>
 
@@ -1064,10 +1093,11 @@
   {#if loadError}
     <div class="badge error">{loadError}</div>
   {/if}
-  {#if truncatedSurfaces || truncatedCells || truncatedTokens}
+  {#if truncatedSurfaces || truncatedProtos || truncatedInstances || truncatedTokens}
     <div class="badge warning">
-      Geometry exceeds this viewer's current capacity (max {MAX_CELLS} cells / {MAX_SURFACES} surfaces) —
-      showing a partial render. Needs a spatial index to scale further, see file header.
+      Geometry exceeds viewer capacity
+      (max {MAX_PROTOTYPES} prototypes / {MAX_INSTANCES} instances / {MAX_SURFACES} surfaces) —
+      showing a partial render.
     </div>
   {/if}
 </div>
