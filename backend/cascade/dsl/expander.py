@@ -1,4 +1,4 @@
-"""Geometry expander — multi-Box + BooleanPlacement + Box.role; soft warnings.
+"""Geometry expander — n-ary Union, Box offset, boundary force, Box.role.
 
 Full documented version: project artifacts/expander.py.
 """
@@ -110,31 +110,49 @@ def _expand_shape_at_origin(schema: BaseComponentSchema, name: str, schemas: dic
         raise TypeError(f"'{name}' is a FuelPin, which cannot be used as a boolean composite operand.")
     if isinstance(schema, BoxSchema):
         (surfaces, label_map) = _expand_box_surfaces(schema, ctx)
+        ox = float(getattr(schema, 'x', 0.0) or 0.0)
+        oy = float(getattr(schema, 'y', 0.0) or 0.0)
+        oz = float(getattr(schema, 'z', 0.0) or 0.0)
+        if ox != 0.0 or oy != 0.0 or oz != 0.0:
+            (translated, id_map) = _translate(surfaces, ox, oy, oz, ctx)
+            surfaces = [o for o in translated if isinstance(o, Surface)]
+            label_map = {k: id_map[v] for (k, v) in label_map.items()}
         region: Region = Intersection([Outside(label_map['xlo']), Inside(label_map['xhi']), Outside(label_map['ylo']), Inside(label_map['yhi']), Outside(label_map['bot']), Inside(label_map['top'])])
         return (surfaces, region)
     if primitives.is_primitive(schema):
         (surfaces, region) = primitives.expand_primitive(ctx, schema, name)
+        bt = getattr(schema, 'boundary_type', None)
+        if bt is not None and bt != BoundaryType.NONE:
+            surfaces = [Surface(id=s.id, type_=s.type_, params=s.params, boundary_type=BoundaryType.NONE) for s in surfaces]
         return (surfaces, region)
     if isinstance(schema, _BOOLEAN_COMPOSITE_TYPES):
         if name in _visiting:
             chain = ' -> '.join((*_visiting, name))
             raise ValueError(f'Circular reference detected while resolving boolean composite operands: {chain}.')
         next_visiting = _visiting | {name}
-        a_schema = schemas.get(schema.a)
-        if a_schema is None:
-            raise ValueError(f"'{name}' operand 'a' references undefined template/primitive '{schema.a}'.")
-        b_schema = schemas.get(schema.b)
-        if b_schema is None:
-            raise ValueError(f"'{name}' operand 'b' references undefined template/primitive '{schema.b}'.")
-        (a_surfaces, a_region) = _expand_shape_at_origin(a_schema, schema.a, schemas, ctx, next_visiting)
-        (b_surfaces, b_region) = _expand_shape_at_origin(b_schema, schema.b, schemas, ctx, next_visiting)
-        surfaces = a_surfaces + b_surfaces
-        if isinstance(schema, UnionSchema):
-            region = Union([a_region, b_region])
-        elif isinstance(schema, SubtractionSchema):
-            region = Intersection([a_region, Complement(b_region)])
+        if isinstance(schema, UnionSchema) and hasattr(schema, 'operand_names'):
+            op_names = schema.operand_names()
         else:
-            region = Intersection([a_region, b_region])
+            op_names = [schema.a, schema.b]
+        surfaces = []
+        regions = []
+        for op_name in op_names:
+            op_schema = schemas.get(op_name)
+            if op_schema is None:
+                raise ValueError(f"'{name}' operand references undefined template/primitive '{op_name}'.")
+            (s_surfs, s_region) = _expand_shape_at_origin(op_schema, op_name, schemas, ctx, next_visiting)
+            surfaces.extend(s_surfs)
+            regions.append(s_region)
+        if isinstance(schema, UnionSchema):
+            region = regions[0] if len(regions) == 1 else Union(regions)
+        elif isinstance(schema, SubtractionSchema):
+            region = regions[0]
+            for r in regions[1:]:
+                region = Intersection([region, Complement(r)])
+        else:
+            region = regions[0]
+            for r in regions[1:]:
+                region = Intersection([region, r])
         return (surfaces, region)
     raise TypeError(f"'{name}' (type {type(schema).__name__}) cannot be used as a boolean composite operand.")
 
@@ -323,11 +341,7 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
                 pos = schema.position()
                 (translated, id_map) = _translate(surfaces, pos[0], pos[1], pos[2], ctx)
                 tlabels = {k: id_map[v] for (k, v) in labels.items()}
-                region = Intersection([
-                    Outside(tlabels['xlo']), Inside(tlabels['xhi']),
-                    Outside(tlabels['ylo']), Inside(tlabels['yhi']),
-                    Outside(tlabels['bot']), Inside(tlabels['top']),
-                ])
+                region = Intersection([Outside(tlabels['xlo']), Inside(tlabels['xhi']), Outside(tlabels['ylo']), Inside(tlabels['yhi']), Outside(tlabels['bot']), Inside(tlabels['top'])])
                 cell = Cell(id=ctx.fresh_id('c'), region=region, material_id=tpl.material, name=name)
                 all_objects.extend([o for o in translated if isinstance(o, Surface)])
                 all_objects.append(cell)
