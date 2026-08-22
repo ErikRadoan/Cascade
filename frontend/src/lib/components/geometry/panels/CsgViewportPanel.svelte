@@ -8,7 +8,17 @@
   import * as THREE from 'three';
   import * as api from '$lib/api';
   import { activeProject } from '../stores/projects.svelte.js';
+  // Same store ObjectPanel writes — keys are `${projectId}:${placementName}`
+  // inside isVisible/toggleVisibility. Must match ObjectPanel's import path.
+  import { isVisible, visibility } from '../stores/visibility.svelte.js';
+  import { baseGroupName } from '../csgCellGrouping';
   import type { CsgGeometry, CsgSurface, RegionNode, LatticeInstance } from '$lib/types';
+
+  /** Placement key for visibility — same grouping as ObjectPanel rows. */
+  function visibilityKey(name: string | null | undefined): string | null {
+    if (!name) return null;
+    return baseGroupName(name);
+  }
 
   const MAX_SURFACES = 256;
   const MAX_PROTOTYPES = 64;
@@ -269,6 +279,16 @@
     const text = projectText;
     clearTimeout(fetchHandle);
     fetchHandle = setTimeout(() => load(text), 400);
+  });
+
+  // Re-pack protos/instances when an Objects-panel eye toggle flips.
+  // Touch every key so deep $state mutations invalidate this effect
+  // (reading only the object ref can miss property writes in some runes setups).
+  $effect(() => {
+    for (const k of Object.keys(visibility)) void visibility[k];
+    // Also re-run when the map gains its first hide (keys go from 0 → 1).
+    void Object.keys(visibility).length;
+    if (shaderMaterial && csg) rebuildAndRender();
   });
 
   async function load(text: string) {
@@ -578,12 +598,20 @@
           }
         }
       }
-      // Prefer pin when it is nearer or within epsilon (shared axial plane).
-      if (pinProto >= 0 && bestPin <= bestFill + 0.02) {
+      // Pin-vs-fill on shared axial planes:
+      // - Looking down (rd.z < 0): pin wins near-ties so the top face shows
+      //   pin cross-sections (assembly map view).
+      // - Looking up or sideways: fill wins near-ties so the bottom/sides stay
+      //   a solid wall (otherwise the floor disappears and cladding shows through).
+      // Strict nearer pin always wins regardless of view direction.
+      if (pinProto >= 0 && (bestPin < bestFill - 0.001 || (bestPin <= bestFill + 0.02 && rd.z < -0.05))) {
         hitProto = pinProto; hitOff = pinOff; return bestPin;
       }
       if (fillProto >= 0) {
         hitProto = fillProto; hitOff = fillOff; return bestFill;
+      }
+      if (pinProto >= 0) {
+        hitProto = pinProto; hitOff = pinOff; return bestPin;
       }
       return INF;
     }
@@ -740,6 +768,9 @@
 
     if (usingInstancing) {
       for (const li of lis) {
+        // Objects-panel eye toggle is keyed by lattice placement name.
+        if (!isVisible(li.lattice_name)) continue;
+
         const baseProtoIdx = protos.length;
         const protoCells = li.prototype_cells.filter((c) => c.material_id != null);
         const protoSurfById = new Map(surfaceById);
@@ -776,6 +807,9 @@
       for (const cell of csg.cells) {
         if (cell.material_id == null) continue;
         if (cell.name && latticeNames.has(cell.name)) continue;
+        // Hide Box / fill / SinglePlacement cells when their placement is toggled off.
+        const key = visibilityKey(cell.name);
+        if (key && !isVisible(key)) continue;
         if (protos.length >= MAX_PROTOTYPES) break;
         // Phase D fill scaling: moderator fill = box ∩ Outside(every pin).
         // Outside(pin) is redundant under opaque nearest-hit (pin protos own
@@ -797,6 +831,8 @@
       }
     } else {
       for (const cell of csg.cells.filter((c) => c.material_id != null)) {
+        const key = visibilityKey(cell.name);
+        if (key && !isVisible(key)) continue;
         if (protos.length >= MAX_PROTOTYPES) break;
         const protoIdx = protos.length;
         protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, surfaceById, sceneBounds), isFill: false });

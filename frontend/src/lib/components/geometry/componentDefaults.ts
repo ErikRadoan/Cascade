@@ -27,31 +27,31 @@ export const TEMPLATE_DEFAULTS: Record<string, Record<string, unknown>> = {
   Sphere: {
     type: 'Sphere',
     radius: 1.0,
+    x: 0.0,
+    y: 0.0,
+    z: 0.0,
     boundary_type: 'none',
   },
-  // Union/Subtraction/Intersection reference two other templates by name
-  // (a, b — see dsl/schema/boolean.py). There's no "current template" to
-  // default them to at creation time the way SinglePlacement/lattices get
-  // a concrete templateName passed in from ObjectPanel's "place" flow —
-  // these are created blank via TemplatePanel's "+" menu instead, so a/b
-  // start empty and the user picks both operands afterward via the
-  // Parameters panel's template dropdowns (see fieldOptions.ts).
+  // Boolean composites reference two other templates by name (a, b).
+  // Created blank via TemplatePanel; user sets a/b in Parameters panel.
+  // Placeholder '_' is invalid as a real operand — validation will flag
+  // until the user picks real templates (min_length=1 on the backend).
   Union: {
     type: 'Union',
-    a: '',
-    b: '',
+    a: 'operand_a',
+    b: 'operand_b',
     material: 'H2O',
   },
   Subtraction: {
     type: 'Subtraction',
-    a: '',
-    b: '',
+    a: 'operand_a',
+    b: 'operand_b',
     material: 'H2O',
   },
   Intersection: {
     type: 'Intersection',
-    a: '',
-    b: '',
+    a: 'operand_a',
+    b: 'operand_b',
     material: 'H2O',
   },
 };

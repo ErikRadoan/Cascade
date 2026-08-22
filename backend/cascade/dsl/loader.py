@@ -6,6 +6,7 @@ import yaml
 from pydantic import ValidationError
 
 from .schema.base import BaseComponentSchema
+from .schema.boolean import IntersectionSchema, SubtractionSchema, UnionSchema
 from .schema.box import BoxSchema
 from .schema.cell import CellSchema
 from .schema.cylinder import CylinderXSchema, CylinderYSchema, CylinderZSchema
@@ -20,6 +21,11 @@ SCHEMA_MAP: dict[str, type[BaseComponentSchema]] = {
     # Templates (legacy sugar — expand to Tier-1/2 objects internally)
     "FuelPin":         FuelPinSchema,
     "Box":             BoxSchema,
+    # Boolean composites — place via SinglePlacement; operands a/b are
+    # other template names (Box, Sphere, nested Union/Subtraction/…).
+    "Union":           UnionSchema,
+    "Subtraction":     SubtractionSchema,
+    "Intersection":    IntersectionSchema,
     # Placements
     "SinglePlacement": SinglePlacementSchema,
     "SquareLattice":   SquareLatticeSchema,
