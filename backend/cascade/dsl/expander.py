@@ -1,4 +1,4 @@
-"""Geometry expander — multi-Box + BooleanPlacement; soft warnings.
+"""Geometry expander — multi-Box + BooleanPlacement + Box.role; soft warnings.
 
 Full documented version: project artifacts/expander.py.
 """
@@ -300,6 +300,8 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
         tpl = templates_by_name.get(schema.template)
         if not isinstance(tpl, BoxSchema):
             continue
+        if getattr(tpl, 'role', 'universe') != 'universe':
+            continue
         prev_bot, prev_top = ctx.axial_bot_id, ctx.axial_top_id
         (placed_surfaces, translated_labels) = _place_box(tpl, schema.position(), ctx)
         all_objects.extend(placed_surfaces)
@@ -315,6 +317,20 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
             if tpl is None:
                 raise ValueError(f"SinglePlacement '{name}' references undefined template '{schema.template}'.")
             if isinstance(tpl, BoxSchema):
+                if getattr(tpl, 'role', 'universe') == 'universe':
+                    continue
+                (surfaces, labels) = _expand_box_surfaces(tpl, ctx)
+                pos = schema.position()
+                (translated, id_map) = _translate(surfaces, pos[0], pos[1], pos[2], ctx)
+                tlabels = {k: id_map[v] for (k, v) in labels.items()}
+                region = Intersection([
+                    Outside(tlabels['xlo']), Inside(tlabels['xhi']),
+                    Outside(tlabels['ylo']), Inside(tlabels['yhi']),
+                    Outside(tlabels['bot']), Inside(tlabels['top']),
+                ])
+                cell = Cell(id=ctx.fresh_id('c'), region=region, material_id=tpl.material, name=name)
+                all_objects.extend([o for o in translated if isinstance(o, Surface)])
+                all_objects.append(cell)
                 continue
             if templates.is_composite_template(tpl):
                 (surfaces, cells) = templates.expand_template(ctx, tpl, name, schema.position())
