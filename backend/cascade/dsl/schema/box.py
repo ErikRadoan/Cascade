@@ -1,13 +1,13 @@
 """Box schema — a rectangular cuboid template.
 
-Position comes from SinglePlacement. z_size replaces z_min/z_max because the
-template describes shape, not location.
+Position for scene placement comes from SinglePlacement. Optional x/y/z are
+used only when the Box is a *boolean composite operand* (local offset relative
+to the composite origin).
 
 role:
   universe — outer / moderator box: registers axial bounds for FuelPins and
-             builds a fill cell (box interior minus pin outermost surfaces).
-  solid    — ordinary solid region with the box material; does not provide
-             axial bounds and does not produce a fill cell.
+             builds a fill cell.
+  solid    — ordinary solid region; no axial registration, no fill cell.
 """
 
 from __future__ import annotations
@@ -21,17 +21,17 @@ from .base import BaseComponentSchema
 
 
 class BoxSchema(BaseComponentSchema):
-    """Rectangular cuboid template — shape, material, boundary, and role."""
+    """Rectangular cuboid template — shape, material, boundary, role, local offset."""
 
     x_size: float = Field(default=1.26, gt=0,
-        description="Full width in X (cm). Box spans -x_size/2 to +x_size/2 relative to placement position.")
+        description="Full width in X (cm).")
     y_size: float = Field(default=1.26, gt=0,
-        description="Full width in Y (cm). Box spans -y_size/2 to +y_size/2 relative to placement position.")
+        description="Full width in Y (cm).")
     z_size: float = Field(default=365.76, gt=0,
-        description="Full height in Z (cm). Box spans 0 to z_size relative to placement z position.")
+        description="Full height in Z (cm).")
 
     material: str = Field(default="H2O",
-        description="Material ID for the box region (fill for universe, solid body for solid).")
+        description="Material ID for the box region.")
 
     boundary_type: BoundaryType = Field(default=BoundaryType.REFLECTIVE,
         description="Boundary condition on all six faces.")
@@ -43,6 +43,11 @@ class BoxSchema(BaseComponentSchema):
             "solid: independent solid box (no axial registration, no fill cell)."
         ),
     )
+
+    # Local offset when used as a boolean operand (template Union/etc.).
+    x: float = Field(default=0.0, description="Local X offset when used as a boolean operand.")
+    y: float = Field(default=0.0, description="Local Y offset when used as a boolean operand.")
+    z: float = Field(default=0.0, description="Local Z offset when used as a boolean operand.")
 
     model_config = {"frozen": True}
 
