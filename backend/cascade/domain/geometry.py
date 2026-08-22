@@ -177,19 +177,6 @@ class Cell:
         }
 
 
-# ---------------------------------------------------------------------------
-# Lattice instancing (CSG_VIEWER_SCALING_PLAN.md Phase C / Phase D)
-#
-# Phase C (inner_offsets empty):
-#   prototype = one pin template; instances = pin offsets relative to pin 0.
-#
-# Phase D (inner_offsets non-empty) — nested instancing:
-#   prototype = one pin template;
-#   inner_offsets = pin offsets within an assembly (relative to assembly pin 0);
-#   instances = assembly offsets within the core (relative to assembly 0).
-#   World placement = instances[i] + inner_offsets[j].
-# ---------------------------------------------------------------------------
-
 @dataclass(slots=True)
 class LatticeInstance:
     """One lattice placement's shared prototype + relative instance offsets.
@@ -202,19 +189,24 @@ class LatticeInstance:
     prototype_surfaces: list[Surface] = field(default_factory=list)
     prototype_cells: list[Cell] = field(default_factory=list)
     instances: list[tuple[float, float, float]] = field(default_factory=list)
-    # Phase D — empty for single-level (Phase C) lattices.
     inner_offsets: list[tuple[float, float, float]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class CascadeGeometry:
-    """Complete geometry: surfaces + cells."""
+    """Complete geometry: surfaces + cells.
+
+    ``warnings`` holds soft expansion messages (e.g. FuelPin without Box
+    axial bounds) that must not fail the editor CSG path — consumers may
+    show them in a warnings UI.
+    """
     id: str
     name: str
     surfaces: list[Surface] = field(default_factory=list)
     cells: list[Cell] = field(default_factory=list)
     param_values: dict[str, float] = field(default_factory=dict)
     lattice_instances: list[LatticeInstance] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -223,4 +215,5 @@ class CascadeGeometry:
             "surfaces": [surface.to_dict() for surface in self.surfaces],
             "cells": [cell.to_dict() for cell in self.cells],
             "param_values": self.param_values,
+            "warnings": list(self.warnings),
         }
