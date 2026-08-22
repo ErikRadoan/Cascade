@@ -1,44 +1,27 @@
 """Box schema — a rectangular cuboid template.
 
-Unlike the old BoundingBoxSchema, Box has no position — position comes
-from SinglePlacement. z_size replaces z_min/z_max because the template
-describes shape, not location.
+Position comes from SinglePlacement. z_size replaces z_min/z_max because the
+template describes shape, not location.
 
-A BoundingBox is now just:
-    my_box:
-      type: Box
-      ...
-
-    boundary:
-      type: SinglePlacement
-      template: my_box
-      position: [0, 0, 0]
+role:
+  universe — outer / moderator box: registers axial bounds for FuelPins and
+             builds a fill cell (box interior minus pin outermost surfaces).
+  solid    — ordinary solid region with the box material; does not provide
+             axial bounds and does not produce a fill cell.
 """
 
 from __future__ import annotations
 
-from pydantic import Field, model_validator
+from typing import Literal
+
+from pydantic import Field
 
 from ...domain.geometry import BoundaryType
 from .base import BaseComponentSchema
 
 
 class BoxSchema(BaseComponentSchema):
-    """Rectangular cuboid template — defines shape and boundary condition.
-
-    All dimensions in centimeters. Origin of the box is its geometric
-    centre in X and Y, and its bottom face in Z — consistent with how
-    SinglePlacement applies the position offset.
-
-    Example:
-        my_box:
-          type: Box
-          x_size: 1.26
-          y_size: 1.26
-          z_size: 365.76
-          material: H2O
-          boundary_type: reflective
-    """
+    """Rectangular cuboid template — shape, material, boundary, and role."""
 
     x_size: float = Field(default=1.26, gt=0,
         description="Full width in X (cm). Box spans -x_size/2 to +x_size/2 relative to placement position.")
@@ -48,10 +31,18 @@ class BoxSchema(BaseComponentSchema):
         description="Full height in Z (cm). Box spans 0 to z_size relative to placement z position.")
 
     material: str = Field(default="H2O",
-        description="Fill material ID for the region inside box but outside inner geometry.")
+        description="Material ID for the box region (fill for universe, solid body for solid).")
 
     boundary_type: BoundaryType = Field(default=BoundaryType.REFLECTIVE,
         description="Boundary condition on all six faces.")
+
+    role: Literal["universe", "solid"] = Field(
+        default="universe",
+        description=(
+            "universe: outer box providing FuelPin axial bounds and a moderator fill cell. "
+            "solid: independent solid box (no axial registration, no fill cell)."
+        ),
+    )
 
     model_config = {"frozen": True}
 
@@ -60,3 +51,6 @@ class BoxSchema(BaseComponentSchema):
 
     def half_y(self) -> float:
         return self.y_size / 2.0
+
+    def is_universe(self) -> bool:
+        return self.role == "universe"
