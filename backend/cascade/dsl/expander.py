@@ -1,6 +1,6 @@
-"""Geometry expander — BooleanPlacement-enabled (docstrings stripped for transport).
+"""Geometry expander — multi-Box + BooleanPlacement (docs stripped for transport).
 
-Full documented version: see repo history or project artifacts/expander.py.
+Full documented version: artifacts/expander.py in the project workspace.
 """
 
 from __future__ import annotations
@@ -84,7 +84,7 @@ def _expand_box_surfaces(schema: BoxSchema, ctx: Context) -> tuple[list[Surface]
     label_map = {'xlo': s_xlo.id, 'xhi': s_xhi.id, 'ylo': s_ylo.id, 'yhi': s_yhi.id, 'bot': s_bot.id, 'top': s_top.id}
     return ([s_xlo, s_xhi, s_ylo, s_yhi, s_bot, s_top], label_map)
 
-def _place_box(schema: BoxSchema, position: tuple[float, float, float], ctx: Context) -> list[Surface | Cell]:
+def _place_box(schema: BoxSchema, position: tuple[float, float, float], ctx: Context):
     (dx, dy, dz) = position
     (box_surfaces, label_map) = _expand_box_surfaces(schema, ctx)
     translated: list[Surface] = []
@@ -137,7 +137,7 @@ def _expand_shape_at_origin(schema: BaseComponentSchema, name: str, schemas: dic
         return (surfaces, region)
     raise TypeError(f"'{name}' (type {type(schema).__name__}) cannot be used as a boolean composite operand.")
 
-def _place_boolean_composite(schema: UnionSchema | SubtractionSchema | IntersectionSchema, template_name: str, position: tuple[float, float, float], ctx: Context, schemas: dict[str, BaseComponentSchema], cell_name: str) -> list[Surface | Cell]:
+def _place_boolean_composite(schema, template_name: str, position: tuple[float, float, float], ctx: Context, schemas: dict[str, BaseComponentSchema], cell_name: str) -> list:
     (dx, dy, dz) = position
     (local_surfaces, local_region) = _expand_shape_at_origin(schema, template_name, schemas, ctx)
     (translated_objects, id_map) = _translate(local_surfaces, dx, dy, dz, ctx)
@@ -169,7 +169,7 @@ def _cells_to_combined_region(cells: list[Cell]) -> Region | None:
         return regions[0]
     return Union(regions)
 
-def _expand_single_placement_objects(schema: SinglePlacementSchema, name: str, templates_by_name: dict[str, BaseComponentSchema], schemas: dict[str, BaseComponentSchema], ctx: Context, extra_offset: tuple[float, float, float]=(0.0, 0.0, 0.0)) -> list[Surface | Cell]:
+def _expand_single_placement_objects(schema: SinglePlacementSchema, name: str, templates_by_name: dict, schemas: dict, ctx: Context, extra_offset: tuple[float, float, float]=(0.0, 0.0, 0.0)) -> list:
     tpl = templates_by_name.get(schema.template)
     if tpl is None:
         raise ValueError(f"SinglePlacement '{name}' references undefined template '{schema.template}'.")
@@ -190,13 +190,13 @@ def _expand_single_placement_objects(schema: SinglePlacementSchema, name: str, t
         return _place_boolean_composite(tpl, schema.template, pos, ctx, schemas, cell_name=name)
     raise TypeError(f"SinglePlacement '{name}' (template type {type(tpl).__name__}) cannot be a BooleanPlacement child.")
 
-def _place_boolean_placement(schema: BooleanPlacementSchema, name: str, placements: dict[str, BaseComponentSchema], templates_by_name: dict[str, BaseComponentSchema], schemas: dict[str, BaseComponentSchema], ctx: Context, _visiting: frozenset[str]=frozenset()) -> list[Surface | Cell]:
+def _place_boolean_placement(schema: BooleanPlacementSchema, name: str, placements: dict, templates_by_name: dict, schemas: dict, ctx: Context, _visiting: frozenset[str]=frozenset()) -> list:
     if name in _visiting:
         chain = ' -> '.join((*_visiting, name))
         raise ValueError(f'Circular BooleanPlacement reference: {chain}.')
     next_visiting = _visiting | {name}
     residual = (schema.x, schema.y, schema.z)
-    child_results: list[tuple[list[Surface], list[Cell]]] = []
+    child_results: list = []
     for child_name in schema.children:
         child = placements.get(child_name)
         if child is None:
@@ -214,22 +214,22 @@ def _place_boolean_placement(schema: BooleanPlacementSchema, name: str, placemen
             cells = [o for o in objs if isinstance(o, Cell)]
             child_results.append((surfaces, cells))
         elif isinstance(child, (SquareLatticeSchema, HexLatticeSchema)):
-            raise TypeError(f"BooleanPlacement '{name}': lattice child '{child_name}' is not supported in v1. Use SinglePlacement children for now.")
+            raise TypeError(f"BooleanPlacement '{name}': lattice child '{child_name}' is not supported in v1.")
         else:
             raise TypeError(f"BooleanPlacement '{name}': child '{child_name}' has unsupported type {type(child).__name__}.")
     if not child_results:
         return []
     mat_filter = set(schema.materials) if schema.materials else None
     if schema.op == 'union':
-        out: list[Surface | Cell] = []
+        out: list = []
         for (surfaces, cells) in child_results:
             out.extend(surfaces)
             for c in cells:
                 if mat_filter is None or c.material_id in mat_filter:
                     out.append(Cell(id=c.id, region=c.region, material_id=c.material_id, name=name if c.name is None else f'{name}_{c.name}'))
         return out
-    all_surfaces: list[Surface] = []
-    child_regions: list[Region] = []
+    all_surfaces: list = []
+    child_regions: list = []
     pick_material: str | None = None
     for (surfaces, cells) in child_results:
         all_surfaces.extend(surfaces)
@@ -251,7 +251,7 @@ def _place_boolean_placement(schema: BooleanPlacementSchema, name: str, placemen
 
 def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, float] | None=None, geom_name: str='cascade_geometry') -> CascadeGeometry:
     ctx = Context(param_values=param_values or {})
-    all_objects: list[Surface | Cell] = []
+    all_objects: list = []
     primitive_name_to_id: dict[str, str] = {}
     cell_schemas: dict[str, CellSchema] = {}
     legacy_schemas: dict[str, BaseComponentSchema] = {}
@@ -282,13 +282,12 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
             continue
         for child in bschema.children:
             if child in parent_of:
-                raise ValueError(f"Placement '{child}' is listed as a child of both '{parent_of[child]}' and '{bname}'. A placement may belong to at most one BooleanPlacement (tree, not DAG).")
+                raise ValueError(f"Placement '{child}' is listed as a child of both '{parent_of[child]}' and '{bname}'.")
             parent_of[child] = bname
             owned_by_boolean.add(child)
-    box_schema: BoxSchema | None = None
-    box_translated_labels: dict[str, str] | None = None
-    box_placement_name: str | None = None
-    lattice_schemas: dict[str, SquareLatticeSchema | HexLatticeSchema] = {n: s for (n, s) in placements.items() if isinstance(s, (SquareLatticeSchema, HexLatticeSchema))}
+    # Multiple Box placements allowed. First Box owns FuelPin axial bounds.
+    box_placements: list[tuple[str, BoxSchema, dict[str, str]]] = []
+    lattice_schemas = {n: s for (n, s) in placements.items() if isinstance(s, (SquareLatticeSchema, HexLatticeSchema))}
     nested_template_lattices: set[str] = set()
     for (_n, _s) in lattice_schemas.items():
         if _s.template in lattice_schemas:
@@ -301,13 +300,13 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
         tpl = templates_by_name.get(schema.template)
         if not isinstance(tpl, BoxSchema):
             continue
-        if box_schema is not None:
-            raise ValueError('Only one Box placement is supported per geometry. Use a single Box that encompasses all inner geometry.')
+        prev_bot, prev_top = ctx.axial_bot_id, ctx.axial_top_id
         (placed_surfaces, translated_labels) = _place_box(tpl, schema.position(), ctx)
         all_objects.extend(placed_surfaces)
-        box_schema = tpl
-        box_translated_labels = translated_labels
-        box_placement_name = name
+        if box_placements:
+            ctx.axial_bot_id = prev_bot
+            ctx.axial_top_id = prev_top
+        box_placements.append((name, tpl, translated_labels))
     for (name, schema) in placements.items():
         if name in owned_by_boolean:
             continue
@@ -333,14 +332,14 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
             if name in nested_template_lattices:
                 continue
             _dispatch_lattice(ctx, schema, name, templates_by_name, lattice_schemas, all_objects)
-    if box_schema is not None and box_translated_labels is not None:
-        fill_cell = _build_fill_cell(box_schema, box_translated_labels, ctx, cell_name=box_placement_name or f'fill_{box_schema.material}')
+    for bname, bschema, blabels in box_placements:
+        fill_cell = _build_fill_cell(bschema, blabels, ctx, cell_name=bname or f'fill_{bschema.material}')
         all_objects.append(fill_cell)
     surfaces = [obj for obj in all_objects if isinstance(obj, Surface)]
     cells = [obj for obj in all_objects if isinstance(obj, Cell)]
     return CascadeGeometry(id=str(uuid.uuid4()), name=geom_name, surfaces=surfaces, cells=cells, param_values=ctx.param_values, lattice_instances=ctx.lattice_instances)
 
-def _dispatch_lattice(ctx: Context, schema: SquareLatticeSchema | HexLatticeSchema, name: str, templates_by_name: dict[str, BaseComponentSchema], lattice_schemas: dict[str, SquareLatticeSchema | HexLatticeSchema], all_objects: list[Surface | Cell]) -> None:
+def _dispatch_lattice(ctx, schema, name, templates_by_name, lattice_schemas, all_objects):
     tpl_name = schema.template
     if tpl_name in lattice_schemas:
         inner = lattice_schemas[tpl_name]
@@ -348,7 +347,7 @@ def _dispatch_lattice(ctx: Context, schema: SquareLatticeSchema | HexLatticeSche
         if pin_tpl is None:
             raise ValueError(f"Nested lattice '{name}' -> '{tpl_name}' references undefined pin template '{inner.template}'.")
         if not templates.is_composite_template(pin_tpl):
-            raise TypeError(f"Nested lattice '{name}': inner template '{inner.template}' type '{type(pin_tpl).__name__}' not supported.")
+            raise TypeError(f"Nested lattice '{name}': inner template not supported.")
         _expand_nested_lattice(ctx, pin_tpl, inner.template, name, schema.pin_positions(), inner.pin_positions(), all_objects)
         return
     tpl = templates_by_name.get(tpl_name)
@@ -357,15 +356,15 @@ def _dispatch_lattice(ctx: Context, schema: SquareLatticeSchema | HexLatticeSche
     if templates.is_composite_template(tpl):
         _expand_lattice_with_instancing(ctx, tpl, tpl_name, name, schema.pin_positions(), all_objects)
     else:
-        raise TypeError(f"Lattice '{name}': template type '{type(tpl).__name__}' not supported in lattices yet.")
+        raise TypeError(f"Lattice '{name}': template type not supported in lattices yet.")
 
-def _expand_lattice_with_instancing(ctx: Context, tpl: BaseComponentSchema, prototype_key: str, lattice_name: str, positions: list[tuple[float, float, float]], all_objects: list[Surface | Cell]) -> None:
+def _expand_lattice_with_instancing(ctx, tpl, prototype_key, lattice_name, positions, all_objects):
     if not positions:
         return
     origin = positions[0]
-    prototype_surfaces: list[Surface] | None = None
-    prototype_cells: list[Cell] | None = None
-    instances: list[tuple[float, float, float]] = []
+    prototype_surfaces = None
+    prototype_cells = None
+    instances = []
     for (i, pos) in enumerate(positions):
         (surfaces, cells) = templates.expand_template(ctx, tpl, f'{lattice_name}_{i}', pos)
         all_objects.extend(surfaces)
@@ -376,15 +375,15 @@ def _expand_lattice_with_instancing(ctx: Context, tpl: BaseComponentSchema, prot
         instances.append((pos[0] - origin[0], pos[1] - origin[1], pos[2] - origin[2]))
     ctx.lattice_instances.append(LatticeInstance(lattice_name=lattice_name, prototype_key=prototype_key, prototype_surfaces=prototype_surfaces or [], prototype_cells=prototype_cells or [], instances=instances, inner_offsets=[]))
 
-def _expand_nested_lattice(ctx: Context, pin_tpl: BaseComponentSchema, pin_template_key: str, outer_name: str, outer_positions: list[tuple[float, float, float]], inner_positions: list[tuple[float, float, float]], all_objects: list[Surface | Cell]) -> None:
+def _expand_nested_lattice(ctx, pin_tpl, pin_template_key, outer_name, outer_positions, inner_positions, all_objects):
     if not outer_positions or not inner_positions:
         return
     inner_origin = inner_positions[0]
-    inner_rel: list[tuple[float, float, float]] = [(p[0] - inner_origin[0], p[1] - inner_origin[1], p[2] - inner_origin[2]) for p in inner_positions]
+    inner_rel = [(p[0] - inner_origin[0], p[1] - inner_origin[1], p[2] - inner_origin[2]) for p in inner_positions]
     outer_origin = outer_positions[0]
-    outer_rel: list[tuple[float, float, float]] = [(p[0] - outer_origin[0], p[1] - outer_origin[1], p[2] - outer_origin[2]) for p in outer_positions]
-    prototype_surfaces: list[Surface] | None = None
-    prototype_cells: list[Cell] | None = None
+    outer_rel = [(p[0] - outer_origin[0], p[1] - outer_origin[1], p[2] - outer_origin[2]) for p in outer_positions]
+    prototype_surfaces = None
+    prototype_cells = None
     for (ai, apos) in enumerate(outer_positions):
         for (pi, prel) in enumerate(inner_rel):
             world = (apos[0] + prel[0], apos[1] + prel[1], apos[2] + prel[2])
