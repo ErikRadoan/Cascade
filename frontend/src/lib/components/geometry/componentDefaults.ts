@@ -32,28 +32,10 @@ export const TEMPLATE_DEFAULTS: Record<string, Record<string, unknown>> = {
     z: 0.0,
     boundary_type: 'none',
   },
-  // Boolean composites (templates) reference two other templates by name (a, b).
-  // Created blank via TemplatePanel; user sets a/b in Parameters panel.
-  // Placeholder values are invalid as real operands — validation will flag
-  // until the user picks real templates (min_length=1 on the backend).
-  Union: {
-    type: 'Union',
-    a: 'operand_a',
-    b: 'operand_b',
-    material: 'H2O',
-  },
-  Subtraction: {
-    type: 'Subtraction',
-    a: 'operand_a',
-    b: 'operand_b',
-    material: 'H2O',
-  },
-  Intersection: {
-    type: 'Intersection',
-    a: 'operand_a',
-    b: 'operand_b',
-    material: 'H2O',
-  },
+  // Template-level Union/Subtraction/Intersection are no longer offered in
+  // the Templates panel — use BooleanPlacement from the Objects panel
+  // (multi-select → Union / Subtract / Intersect). Schema remains registered
+  // on the backend for existing YAML compatibility.
 };
 
 export const PLACEMENT_DEFAULTS: Record<string, (templateName: string) => Record<string, unknown>> = {
@@ -92,14 +74,13 @@ export const PLACEMENT_DEFAULTS: Record<string, (templateName: string) => Record
    * returned object's `children` field after creation.
    *
    * materials: [] means "all materials present in the children".
-   * The Parameters panel should compute the available material set from the
-   * children and present a multi-select; the stored list is the user's choice.
+   * The Parameters panel computes the available set from the children.
    */
   BooleanPlacement: (_templateName: string) => ({
     type: 'BooleanPlacement',
     op: 'union',
-    children: [] as string[], // caller must set ≥2 placement names
-    materials: [] as string[], // empty = all materials from children
+    children: [] as string[],
+    materials: [] as string[],
     x: 0.0,
     y: 0.0,
     z: 0.0,
