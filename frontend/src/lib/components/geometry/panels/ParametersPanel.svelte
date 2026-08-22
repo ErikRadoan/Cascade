@@ -6,27 +6,25 @@
   //
   // This is a thin, schema-agnostic editor: it renders one input per
   // top-level field found in the parsed block for the selected item.
-  // It does not know about FuelPin/Box/SinglePlacement specifically —
-  // that keeps it correct as new schema types are added on the backend
-  // without needing frontend changes.
+  // Special case: BooleanPlacement.materials is a multi-select over the
+  // materials reachable from the children (empty = all).
 
   import { activeProject, setGeometryText } from '../stores/projects.svelte.js';
   import { geometrySelection } from '../stores/selection.svelte.js';
   import yaml from '../yamlParseHelper';
   import {dump} from 'js-yaml';
   import PanelHeader from '../dock/PanelHeader.svelte';
-  import { resolveFieldOptions } from '../fieldOptions';
+  import { resolveFieldOptions, materialsFromPlacement } from '../fieldOptions';
   import SweepToggle from '../SweepToggle.svelte';
   import MaterialSearchSelect from '../MaterialSearchSelect.svelte';
 
   interface FieldEntry {
     key: string;
-    value: string | number | boolean;
-    kind: 'string' | 'number' | 'boolean';
+    value: string | number | boolean | string[];
+    kind: 'string' | 'number' | 'boolean' | 'string[]';
     options: string[] | null;
   }
 
-  // Parse the full document and extract the block for the selected item
   let parsedDoc = $derived((): Record<string, Record<string, unknown>> | null => {
     const raw = yaml.parse(activeProject().text);
     if (!raw || typeof raw !== 'object') return null;
@@ -45,23 +43,33 @@
     const doc = parsedDoc();
     if (!block || !doc) return [];
     const compType = (block.type as string) ?? '';
+    const sel = geometrySelection.selectedItem;
 
     return Object.entries(block)
-      .filter(([k]) => k !== 'type') // type is shown separately, not editable here
+      .filter(([k]) => k !== 'type')
       .map(([key, value]) => {
         let kind: FieldEntry['kind'] = 'string';
-        if (typeof value === 'number') kind = 'number';
+        if (Array.isArray(value)) kind = 'string[]';
+        else if (typeof value === 'number') kind = 'number';
         else if (typeof value === 'boolean') kind = 'boolean';
 
-        // sweep(...) expressions must stay free text regardless of
-        // whether the field normally has a dropdown — you can't select
-        // a sweep range from a fixed option list.
         const isSweep = typeof value === 'string' && value.trim().startsWith('sweep(');
-        const options = isSweep
+        let options: string[] | null = isSweep
           ? null
           : resolveFieldOptions(compType, key, doc as Record<string, { type?: string }>);
 
-        return { key, value: value as string | number | boolean, kind, options };
+        // BooleanPlacement.materials: options = materials from children
+        if (compType === 'BooleanPlacement' && key === 'materials' && sel) {
+          const fromChildren = materialsFromPlacement(sel.name, doc);
+          options = fromChildren.length > 0 ? fromChildren : options;
+        }
+
+        return {
+          key,
+          value: value as string | number | boolean | string[],
+          kind,
+          options,
+        };
       });
   });
 
@@ -70,26 +78,18 @@
     return (block?.type as string) ?? null;
   });
 
-  // Whether the current field value is a sweep(...) expression —
-  // these render as text so the user can edit the expression directly
-  // rather than losing it to a numeric input or dropdown.
   function isSweepExpression(value: unknown): boolean {
     return typeof value === 'string' && value.trim().startsWith('sweep(');
   }
 
-  // Display-only: "material_id" -> "material id". The raw key is still
-  // used for the input's id/name and for writing back to the YAML.
   function formatLabel(key: string): string {
     return key.replace(/_/g, ' ');
   }
 
-  // Fields where the user picked "Custom..." in a dropdown — render as
-  // free text instead, so a material/template not in the static option
-  // list is never unreachable. Keyed by field key, reset on selection change.
   let customFields = $state<Set<string>>(new Set());
 
   $effect(() => {
-    geometrySelection.selectedItem; // dependency — clear custom-entry state on reselect
+    geometrySelection.selectedItem;
     customFields = new Set();
   });
 
@@ -97,22 +97,39 @@
     customFields = new Set([...customFields, key]);
   }
 
-  function updateField(key: string, newValue: string | number | boolean) {
+  function updateField(key: string, newValue: string | number | boolean | string[]) {
     const doc = parsedDoc();
     const sel = geometrySelection.selectedItem;
     if (!doc || !sel || !doc[sel.name]) return;
 
     doc[sel.name][key] = newValue;
-
-    // Re-serialize the whole document back to YAML.
-    // This rewrites formatting/comments — acceptable tradeoff for now
-    // since the form is the primary editing surface, not raw text edits.
     const newText = dump(doc, { indent: 2, lineWidth: -1 });
-
-    // Route through the shared handler so validation + scene refresh
-    // actually fire. Mutating the project text directly here was the bug —
-    // nothing was listening for that mutation.
     setGeometryText(newText);
+  }
+
+  function toggleMaterial(field: FieldEntry, mat: string, checked: boolean) {
+    const current = Array.isArray(field.value) ? [...field.value] : [];
+    // Empty list means "all" — first explicit toggle starts from full options
+    let next: string[];
+    if (current.length === 0 && field.options && field.options.length > 0) {
+      next = checked
+        ? [mat]
+        : field.options.filter((m) => m !== mat);
+    } else if (checked) {
+      next = current.includes(mat) ? current : [...current, mat];
+    } else {
+      next = current.filter((m) => m !== mat);
+    }
+    // If user re-selected everything, store [] (= all)
+    if (field.options && next.length === field.options.length) {
+      next = [];
+    }
+    updateField(field.key, next);
+  }
+
+  function isMaterialChecked(field: FieldEntry, mat: string): boolean {
+    if (!Array.isArray(field.value) || field.value.length === 0) return true; // empty = all
+    return field.value.includes(mat);
   }
 
   function onInputChange(field: FieldEntry, e: Event) {
@@ -140,18 +157,11 @@
     updateField(field.key, value);
   }
 
-  // Sweep handlers — applying writes a sweep(...) string into the field,
-  // exactly like any other value. The expander/sweep.py backend treats
-  // it identically whether it came from this UI or hand-typed YAML.
   function onApplySweep(field: FieldEntry, expression: string) {
     updateField(field.key, expression);
   }
 
   function onClearSweep(field: FieldEntry) {
-    // Restore a sensible plain value: the field's default-ish fallback.
-    // We don't have the schema default here, so fall back to a neutral
-    // value per kind — the user will almost always immediately edit it
-    // anyway since removing a sweep implies they want a specific value.
     if (field.kind === 'number') {
       updateField(field.key, 0);
     } else if (field.options && field.options.length > 0) {
@@ -186,10 +196,30 @@
               {#if isSweepExpression(field.value)}
                 <span class="sweep-badge">sweep</span>
               {/if}
+              {#if field.kind === 'string[]' && Array.isArray(field.value) && field.value.length === 0}
+                <span class="sweep-badge">all</span>
+              {/if}
             </label>
 
             <div class="field-input-row">
-              {#if field.kind !== 'boolean'}
+              {#if field.kind === 'string[]'}
+                <div class="material-multi" id="field-{field.key}">
+                  {#if !field.options || field.options.length === 0}
+                    <span class="multi-empty">No materials found on children</span>
+                  {:else}
+                    {#each field.options as mat}
+                      <label class="multi-item">
+                        <input
+                          type="checkbox"
+                          checked={isMaterialChecked(field, mat)}
+                          onchange={(e) => toggleMaterial(field, mat, (e.target as HTMLInputElement).checked)}
+                        />
+                        <span>{mat}</span>
+                      </label>
+                    {/each}
+                  {/if}
+                </div>
+              {:else if field.kind !== 'boolean'}
                 <SweepToggle
                   fieldKey={field.key}
                   isActive={isSweepExpression(field.value)}
@@ -208,12 +238,12 @@
                   checked={field.value as boolean}
                   onchange={(e) => onInputChange(field, e)}
                 />
-              {:else if field.key.includes('material') && !isSweepExpression(field.value)}
+              {:else if field.kind !== 'string[]' && field.key.includes('material') && !isSweepExpression(field.value)}
                 <MaterialSearchSelect
                   value={String(field.value)}
                   onChange={(id) => updateField(field.key, id)}
                 />
-              {:else if isSweepExpression(field.value)}
+              {:else if field.kind !== 'string[]' && isSweepExpression(field.value)}
                 <input
                   id="field-{field.key}"
                   type="text"
@@ -221,7 +251,7 @@
                   value={field.value}
                   onchange={(e) => onInputChange(field, e)}
                 />
-              {:else if field.options && !customFields.has(field.key)}
+              {:else if field.kind !== 'string[]' && field.options && !customFields.has(field.key)}
                 <div class="select-wrap">
                   <select
                     id="field-{field.key}"
@@ -247,7 +277,7 @@
                   value={field.value}
                   onchange={(e) => onInputChange(field, e)}
                 />
-              {:else}
+              {:else if field.kind !== 'string[]'}
                 <input
                   id="field-{field.key}"
                   type="text"
@@ -424,5 +454,29 @@
     width: 16px;
     height: 16px;
     accent-color: var(--color-accent);
+  }
+
+  .material-multi {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+    flex: 1;
+    padding: 2px 0;
+  }
+
+  .multi-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-text);
+    cursor: pointer;
+  }
+
+  .multi-empty {
+    font-size: 11px;
+    color: var(--color-subtext);
+    opacity: 0.7;
   }
 </style>

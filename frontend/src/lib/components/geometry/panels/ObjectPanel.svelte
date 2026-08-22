@@ -43,16 +43,36 @@
     return raw as Record<string, { type?: string; children?: string[] }>;
   });
 
+  const PLACEMENT_TYPE_SET = new Set([
+    'SinglePlacement',
+    'SquareLattice',
+    'HexLattice',
+    'BooleanPlacement',
+  ]);
+
+  /**
+   * Object list is driven primarily by the YAML document so the hierarchy
+   * remains selectable even when CSG expansion fails. Cell counts come from
+   * CSG data when available.
+   */
   let groups = $derived((): Group[] => {
     const cells = csgState.data?.cells ?? [];
     const doc = parsedDoc();
     const map = new Map<string, Group>();
 
+    // 1. Every placement defined in YAML (works even when CSG errors)
+    if (doc) {
+      for (const [name, block] of Object.entries(doc)) {
+        if (!block?.type || !PLACEMENT_TYPE_SET.has(block.type)) continue;
+        map.set(name, { name, count: 0, type: block.type });
+      }
+    }
+
+    // 2. Fold CSG cells into counts / add any leftover Cell-only names
     for (const cell of cells) {
       if (cell.material_id == null) continue;
       const rawName = cell.name ?? cell.id;
       const groupName = baseGroupName(rawName);
-
       const existing = map.get(groupName);
       if (existing) {
         existing.count++;
@@ -63,15 +83,6 @@
         count: 1,
         type:  doc?.[groupName]?.type ?? 'Cell',
       });
-    }
-
-    // Also show BooleanPlacement nodes that may not yet have expanded cells
-    if (doc) {
-      for (const [name, block] of Object.entries(doc)) {
-        if (block?.type === 'BooleanPlacement' && !map.has(name)) {
-          map.set(name, { name, count: 0, type: 'BooleanPlacement' });
-        }
-      }
     }
 
     return [...map.values()];
@@ -163,6 +174,8 @@
     const updated = { ...doc };
     for (const n of names) {
       delete updated[n];
+      // If a BooleanPlacement listed this as a child, leave the reference —
+      // expander will raise a clear error until the user fixes it.
     }
     const newText = dump(updated, { indent: 2, lineWidth: -1 });
 
@@ -221,10 +234,11 @@
   {/if}
 
   <div class="panel-body">
-    {#if csgState.loading && !csgState.data}
+    {#if csgState.error}
+      <p class="error-banner" title={csgState.error}>{csgState.error}</p>
+    {/if}
+    {#if csgState.loading && !csgState.data && groups().length === 0}
       <p class="empty-hint">Loading…</p>
-    {:else if csgState.error}
-      <p class="empty-hint error">{csgState.error}</p>
     {:else if groups().length === 0}
       <p class="empty-hint">No objects placed yet.<br>Add a SinglePlacement, lattice, or a Cell.</p>
     {:else}
@@ -387,6 +401,18 @@
   }
 
   .empty-hint.error { color: #f87171; opacity: 1; }
+
+  .error-banner {
+    font-size: 10px;
+    color: #f87171;
+    background: rgba(248, 113, 113, 0.08);
+    border-bottom: 1px solid rgba(248, 113, 113, 0.25);
+    padding: 6px 10px;
+    line-height: 1.4;
+    max-height: 4.2em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   .object-row {
     display: flex;
