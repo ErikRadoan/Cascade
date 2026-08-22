@@ -91,6 +91,7 @@ export function materialsFromPlacement(
 export const FIELD_OPTIONS: Record<string, FieldOptions> = {
   'Box.material':              KNOWN_MATERIALS,
   'Box.boundary_type':         BOUNDARY_TYPES,
+  'Box.role':                  ['universe', 'solid'],
   'FuelPin.pellet_material':   KNOWN_MATERIALS,
   'FuelPin.gap_material':      KNOWN_MATERIALS,
   'FuelPin.clad_material':     KNOWN_MATERIALS,
