@@ -1,6 +1,6 @@
-"""Geometry expander — multi-Box + BooleanPlacement (docs stripped for transport).
+"""Geometry expander — multi-Box + BooleanPlacement; soft warnings.
 
-Full documented version: artifacts/expander.py in the project workspace.
+Full documented version: project artifacts/expander.py.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ class Context:
     axial_bot_id: str | None = field(default=None)
     axial_top_id: str | None = field(default=None)
     lattice_instances: list[LatticeInstance] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     _counter: int = field(default=0, init=False, repr=False)
 
     def fresh_id(self, prefix: str='s') -> str:
@@ -285,7 +286,6 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
                 raise ValueError(f"Placement '{child}' is listed as a child of both '{parent_of[child]}' and '{bname}'.")
             parent_of[child] = bname
             owned_by_boolean.add(child)
-    # Multiple Box placements allowed. First Box owns FuelPin axial bounds.
     box_placements: list[tuple[str, BoxSchema, dict[str, str]]] = []
     lattice_schemas = {n: s for (n, s) in placements.items() if isinstance(s, (SquareLatticeSchema, HexLatticeSchema))}
     nested_template_lattices: set[str] = set()
@@ -337,7 +337,7 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
         all_objects.append(fill_cell)
     surfaces = [obj for obj in all_objects if isinstance(obj, Surface)]
     cells = [obj for obj in all_objects if isinstance(obj, Cell)]
-    return CascadeGeometry(id=str(uuid.uuid4()), name=geom_name, surfaces=surfaces, cells=cells, param_values=ctx.param_values, lattice_instances=ctx.lattice_instances)
+    return CascadeGeometry(id=str(uuid.uuid4()), name=geom_name, surfaces=surfaces, cells=cells, param_values=ctx.param_values, lattice_instances=ctx.lattice_instances, warnings=ctx.warnings)
 
 def _dispatch_lattice(ctx, schema, name, templates_by_name, lattice_schemas, all_objects):
     tpl_name = schema.template
