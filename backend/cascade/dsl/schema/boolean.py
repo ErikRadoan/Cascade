@@ -1,129 +1,61 @@
 """Boolean composite templates and BooleanPlacement hierarchy nodes.
 
-Two complementary mechanisms:
+Template booleans (Union / Subtraction / Intersection) author shapes at the
+origin. BooleanPlacement composes already-placed objects in the scene graph.
 
-1. **Template booleans** (`Union` / `Subtraction` / `Intersection`)
-   Author a reusable shape at the origin. Operands `a` / `b` are other
-   *template* names. Place the result later with SinglePlacement.
-
-2. **BooleanPlacement** (new)
-   Scene-graph composition of already-placed objects. Select two (or more)
-   placements in the Objects tab → create a BooleanPlacement parent that
-   owns them. Positions live on the children; the boolean accumulates
-   transforms. Works with SinglePlacement and lattice placements.
-
-YAML example (template path — unchanged)::
-
-    ball:
-      type: Sphere
-      radius: 2.0
-
-    block:
-      type: Box
-      x_size: 3.0
-      y_size: 3.0
-      z_size: 3.0
-      material: H2O
-
-    ball_minus_block:
-      type: Subtraction
-      a: ball
-      b: block
-      material: UO2
-
-    placed:
-      type: SinglePlacement
-      template: ball_minus_block
-      x: 0.0
-      y: 0.0
-      z: 0.0
-
-YAML example (BooleanPlacement path)::
-
-    left_box:
-      type: SinglePlacement
-      template: Box
-      x: -2.0
-      y: 0.0
-      z: 0.0
-
-    right_sphere:
-      type: SinglePlacement
-      template: Sphere
-      x: 2.0
-      y: 0.0
-      z: 0.0
-
-    combined:
-      type: BooleanPlacement
-      op: union
-      children: [left_box, right_sphere]
-      # materials: []          # empty = all materials from children (default)
-      # materials: [H2O, UO2]  # restrict the operation / result to these
-      x: 0.0
-      y: 0.0
-      z: 0.0
-
-Semantics (OpenMC / CSG region trees):
-
-- Union         → a ∪ b
-- Intersection  → a ∩ b
-- Subtraction   → a \\ b  (a ∩ ¬b)   (first child is the kept body)
-
-Materials
----------
-`materials` is a filter over the materials present in the child placements.
-
-- Empty list (default) → operate on / keep *all* materials found in the
-  children. The UI should populate the available set from the union of
-  every material ID reachable from the children.
-- Non-empty list → only those materials participate in the boolean (or
-  are assigned to the resulting solid region). Exact filtering semantics
-  are applied in the expander (see BOOLEAN_PLACEMENTS.md).
-
-Valid children for BooleanPlacement: SinglePlacement, SquareLattice,
-HexLattice, and nested BooleanPlacement. FuelPin is allowed only when it
-appears as a lattice template (the lattice expands to cells); a bare
-FuelPin SinglePlacement is rejected by the expander with a clear error
-because it is multi-cell.
-
-Registered in loader.SCHEMA_MAP as ``Union``, ``Subtraction``,
-``Intersection``, and ``BooleanPlacement``.
+Union supports both binary ``a``/``b`` and n-ary ``items`` for flat multi-way
+unions without intermediate named nodes.
 """
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .base import BaseComponentSchema
 
 
 class _BooleanSchemaBase(BaseComponentSchema):
-    """Shared fields for all binary boolean *templates*."""
+    """Shared fields for binary boolean templates (Subtraction / Intersection)."""
 
-    a: str = Field(
-        ...,
-        min_length=1,
-        description="YAML key of the left-hand operand template.",
-    )
-    b: str = Field(
-        ...,
-        min_length=1,
-        description="YAML key of the right-hand operand template.",
-    )
-    material: str = Field(
-        default="H2O",
-        description="Material ID assigned to the resulting solid cell.",
-    )
+    a: str = Field(..., min_length=1, description="YAML key of the left-hand operand template.")
+    b: str = Field(..., min_length=1, description="YAML key of the right-hand operand template.")
+    material: str = Field(default="H2O", description="Material ID assigned to the resulting solid cell.")
     model_config = {"frozen": True}
 
 
-class UnionSchema(_BooleanSchemaBase):
-    """Solid is the union of operands a and b (a ∪ b)."""
+class UnionSchema(BaseComponentSchema):
+    """Solid is the union of operands.
 
-    pass
+    Prefer ``items`` for 2+ shapes (flat n-ary). Legacy ``a``/``b`` still works.
+    Only the outermost material is used; intermediate materials are ignored.
+    """
+
+    a: str | None = Field(default=None, description="Legacy left operand (use items instead).")
+    b: str | None = Field(default=None, description="Legacy right operand (use items instead).")
+    items: list[str] = Field(
+        default_factory=list,
+        description="N-ary operand template names (≥2). Preferred over a/b.",
+    )
+    material: str = Field(default="H2O", description="Material ID for the resulting solid cell.")
+    model_config = {"frozen": True}
+
+    @model_validator(mode="after")
+    def require_operands(self) -> UnionSchema:
+        if len(self.items) >= 2:
+            return self
+        if self.a and self.b:
+            return self
+        raise ValueError(
+            "Union requires either items: [name, ...] with ≥2 entries, "
+            "or both a and b set."
+        )
+
+    def operand_names(self) -> list[str]:
+        if len(self.items) >= 2:
+            return list(self.items)
+        return [self.a or "", self.b or ""]
 
 
 class SubtractionSchema(_BooleanSchemaBase):
@@ -139,17 +71,7 @@ class IntersectionSchema(_BooleanSchemaBase):
 
 
 class BooleanPlacementSchema(BaseComponentSchema):
-    """Hierarchy node that combines already-placed objects with a boolean op.
-
-    Children keep their own transforms. The expander walks the tree,
-    accumulates parent→child transforms, and emits a single CSG region
-    (or a set of cells when materials are heterogeneous).
-
-    This is the interactive path: select placements in the Objects tab
-    and create a BooleanPlacement parent. Distinct from the template
-    booleans (Union/Subtraction/Intersection) which author shapes at the
-    origin for later placement.
-    """
+    """Hierarchy node that combines already-placed objects with a boolean op."""
 
     op: Literal["union", "subtraction", "intersection"] = Field(
         ...,
@@ -159,8 +81,7 @@ class BooleanPlacementSchema(BaseComponentSchema):
         ...,
         min_length=2,
         description=(
-            "YAML keys of the child placements (SinglePlacement, Lattice, "
-            "or nested BooleanPlacement). Order matters for subtraction: "
+            "YAML keys of the child placements. Order matters for subtraction: "
             "first child is the kept body."
         ),
     )
@@ -168,13 +89,9 @@ class BooleanPlacementSchema(BaseComponentSchema):
         default_factory=list,
         description=(
             "Materials this boolean applies to / keeps. "
-            "Empty list (default) means all materials present in the children. "
-            "UI should derive the available set from the union of child materials "
-            "and let the user multi-select a subset."
+            "Empty list (default) means all materials present in the children."
         ),
     )
-    # Residual transform of the composite itself (usually left at origin;
-    # children already carry the interesting positions).
     x: float = Field(default=0.0, description="X translation of the composite.")
     y: float = Field(default=0.0, description="Y translation of the composite.")
     z: float = Field(default=0.0, description="Z translation of the composite.")
