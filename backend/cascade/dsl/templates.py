@@ -3,58 +3,27 @@
 A composite ("macro") template describes a multi-material object: one
 placement of it expands into MULTIPLE Tier-1-shaped surfaces AND MULTIPLE
 Tier-2 cells (one cell per material layer) — e.g. FuelPin's pellet/gap/
-clad layers. This is different from a Tier-1 primitive (dsl/primitives.py),
-which is always exactly one surface and never carries a material itself.
-It's also different from a Tier-2 Cell (dsl/schema/cell.py), which is a
-single region/material pair authored directly by the user — a composite
-template is a *generator* of several such cells from a small set of
-convenience parameters (pellet_radius, gap_thickness, ...).
+clad layers.
 
-This module owns:
-    - the CompositeTemplateExpander protocol (plan §3.3)
-    - TEMPLATE_REGISTRY, mapping schema class -> CompositeTemplateExpander
-      instance (plan §3.4)
-    - the FuelPin implementation, moved here near-verbatim from the
-      pre-Phase-C expander.py (_expand_fuel_pin_radial/_build_fuel_pin_cells/
-      _place_fuel_pin) — geometry output is byte-for-byte unchanged; only
-      the code's address changed.
-
-Deviation from the plan's literal protocol signature (documented, not an
-oversight): §3.3's sketch omits a `schema` parameter — the same gap Phase A's
-PrimitiveExpander sketch had (see primitives.py's docstring), and for the
-same reason: without the specific schema instance, an expander has no way
-to read pellet_radius/gap_thickness/etc. `schema` is added here exactly as
-it was added to PrimitiveExpander in Phase A.
-
-Box is deliberately NOT registered here — see "The Box axial-sharing
-problem" in geometry-restructuring-plan.md §6. Box's fill cell must
-exclude every fuel pin's outermost surface, but pins are placed AFTER the
-Box (so pins can borrow the Box's z-planes as their own axial bounds) —
-the fill cell literally cannot be computed until every pin placement has
-run, which is incompatible with this protocol's single
-"return everything for this instance, right now" call shape. Per the
-plan's own recommendation (option a), this stays one narrow,
-explicitly-named exception in expander.py's dispatch loop (Box is expanded
-first via `_place_box`, and its fill cell is built last via
-`_build_fill_cell`, once `ctx.outermost_surfaces` is complete) rather than
-forcing every future template through a more complex two-phase protocol
-for the sake of accommodating one user of it.
+FuelPin axial bounds: ideally shared from a placed Box via
+ctx.axial_bot_id / ctx.axial_top_id. When no Box is present yet (common
+while editing), we synthesize local z-planes from pellet_height so the
+editor CSG path keeps working, and record a warning on ctx.warnings.
 """
 
 from __future__ import annotations
 
 from typing import Protocol
 
-from ..domain.geometry import Cell, Inside, Intersection, Outside, Surface, SurfaceType
+from ..domain.geometry import (
+    BoundaryType, Cell, Inside, Intersection, Outside, Surface, SurfaceType,
+)
 from .primitives import ExpansionContext, translate_params
 from .schema.base import BaseComponentSchema
 from .schema.fuel_pin import FuelPinSchema
 
 
 class CompositeTemplateExpander(Protocol):
-    """Implemented once per composite ("macro") template schema type
-    (geometry-restructuring-plan.md §3.3)."""
-
     def expand_template(
         self,
         ctx: ExpansionContext,
@@ -62,35 +31,14 @@ class CompositeTemplateExpander(Protocol):
         name: str,
         position: tuple[float, float, float],
     ) -> tuple[list[Surface], list[Cell]]:
-        """Return ALL surfaces and ALL cells (one per material layer) for
-        ONE instance of this template at `position`.
-
-        Used for both SinglePlacement (called once) and lattice instancing
-        (called once per pin position) — the caller is responsible for
-        computing `name` appropriately for each case (a bare placement
-        name for SinglePlacement, `f"{name}_{i}"` per pin for a lattice),
-        exactly as before this refactor.
-
-        A composite template is never used as a Tier-2 region operand —
-        unlike a Tier-1 primitive, it has no single Surface.id a Cell could
-        reference; that's why FuelPin cannot appear as a Union/Subtraction/
-        Intersection operand (dsl/schema/boolean.py) and expander.py raises
-        a clear error if it's referenced that way.
-        """
         ...
 
-
-# ---------------------------------------------------------------------------
-# FuelPin
-# ---------------------------------------------------------------------------
 
 def _expand_fuel_pin_radial(
     schema: FuelPinSchema,
     ctx: ExpansionContext,
 ) -> tuple[list[Surface], str | None]:
-    """Radial (cylinder) surfaces only, at the origin — NO axial planes;
-    axial bounds are contributed solely by the placed Box (see module
-    docstring and the v3 note this preserves from pre-Phase-C expander.py)."""
+    """Radial (cylinder) surfaces only, at the origin — NO axial planes."""
     surfaces: list[Surface] = []
     layer_surfaces: list[Surface] = []
 
@@ -131,12 +79,17 @@ def _build_fuel_pin_cells(
     return cells
 
 
+def _warn(ctx: ExpansionContext, message: str) -> None:
+    """Append a soft warning if the expansion context supports it."""
+    warnings = getattr(ctx, "warnings", None)
+    if isinstance(warnings, list) and message not in warnings:
+        warnings.append(message)
+
+
 class _FuelPinTemplateExpander:
-    """FuelPin needs the placement Box's axial (z) planes, shared via
-    `ctx.axial_bot_id`/`ctx.axial_top_id` on the expander's Context. This
-    is the one piece of cross-template state any CompositeTemplateExpander
-    is allowed to *read*; only the Box exception (expander.py) is allowed
-    to *populate* it — see module docstring."""
+    """FuelPin needs axial (z) planes. Prefer Box-shared bounds from ctx;
+    otherwise synthesize local planes from pellet_height so the editor
+    does not hard-fail (warning only)."""
 
     def expand_template(
         self,
@@ -145,13 +98,6 @@ class _FuelPinTemplateExpander:
         name: str,
         position: tuple[float, float, float],
     ) -> tuple[list[Surface], list[Cell]]:
-        if not ctx.has_axial_bounds():
-            raise RuntimeError(
-                "Cannot place a FuelPin without axial bounds. "
-                "Place a Box (via SinglePlacement) before placing fuel pins. "
-                "The Box provides the z-plane surfaces shared by all pins."
-            )
-
         dx, dy, dz = position
 
         radial_surfaces, outermost_id = _expand_fuel_pin_radial(schema, ctx)
@@ -171,25 +117,52 @@ class _FuelPinTemplateExpander:
         if outermost_id:
             new_outermost = id_map.get(outermost_id)
             if new_outermost:
-                ctx.outermost_surfaces.append(new_outermost)
+                outermost_list = getattr(ctx, "outermost_surfaces", None)
+                if isinstance(outermost_list, list):
+                    outermost_list.append(new_outermost)
 
-        translated_layer_ids = [id_map[s.id] for s in radial_surfaces]
+        # Axial bounds: Box-shared preferred; local fallback for editor UX
+        has_axial = getattr(ctx, "has_axial_bounds", None)
+        use_shared = callable(has_axial) and has_axial()
+        extra_surfaces: list[Surface] = []
+
+        if use_shared:
+            bot_id = ctx.axial_bot_id  # type: ignore[attr-defined]
+            top_id = ctx.axial_top_id  # type: ignore[attr-defined]
+        else:
+            # Local z-planes from pellet_height, shifted by placement z
+            bot = Surface(
+                id=ctx.fresh_id("s"),
+                type_=SurfaceType.PLANE_Z,
+                params={"z": float(dz)},
+                boundary_type=BoundaryType.NONE,
+            )
+            top = Surface(
+                id=ctx.fresh_id("s"),
+                type_=SurfaceType.PLANE_Z,
+                params={"z": float(dz) + float(schema.pellet_height)},
+                boundary_type=BoundaryType.NONE,
+            )
+            extra_surfaces.extend([bot, top])
+            bot_id, top_id = bot.id, top.id
+            _warn(
+                ctx,
+                "FuelPin placed without a Box for shared axial bounds; "
+                "using each pin's pellet_height for local z-planes (preview only). "
+                "Add a Box via SinglePlacement for production geometry.",
+            )
+
         cells = _build_fuel_pin_cells(
             schema=            schema,
-            layer_surface_ids= translated_layer_ids,
-            bot_id=            ctx.axial_bot_id,
-            top_id=            ctx.axial_top_id,
+            layer_surface_ids= [id_map[s.id] for s in radial_surfaces],
+            bot_id=            bot_id,
+            top_id=            top_id,
             ctx=               ctx,
             cell_name_prefix=  name,
         )
 
-        return translated_surfaces, cells
+        return translated_surfaces + extra_surfaces, cells
 
-
-# ---------------------------------------------------------------------------
-# Registry — schema class -> expander instance (plan §3.4). Box is
-# deliberately absent — see module docstring.
-# ---------------------------------------------------------------------------
 
 TEMPLATE_REGISTRY: dict[type[BaseComponentSchema], CompositeTemplateExpander] = {
     FuelPinSchema: _FuelPinTemplateExpander(),
@@ -197,7 +170,6 @@ TEMPLATE_REGISTRY: dict[type[BaseComponentSchema], CompositeTemplateExpander] = 
 
 
 def is_composite_template(schema: BaseComponentSchema) -> bool:
-    """True if `schema`'s exact type is a registered composite template."""
     return type(schema) in TEMPLATE_REGISTRY
 
 
@@ -207,13 +179,6 @@ def expand_template(
     name: str,
     position: tuple[float, float, float],
 ) -> tuple[list[Surface], list[Cell]]:
-    """Dispatch to the registered expander for `schema`'s type.
-
-    Raises:
-        TypeError: if schema's type isn't registered (including Box,
-        which is intentionally never registered here — see module
-        docstring; callers must special-case Box before reaching this).
-    """
     expander = TEMPLATE_REGISTRY.get(type(schema))
     if expander is None:
         raise TypeError(
