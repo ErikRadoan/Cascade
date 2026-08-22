@@ -23,6 +23,7 @@ export const TEMPLATE_DEFAULTS: Record<string, Record<string, unknown>> = {
     z_size: 365.76,
     material: 'H2O',
     boundary_type: 'reflective',
+    role: 'universe',
   },
   Sphere: {
     type: 'Sphere',
