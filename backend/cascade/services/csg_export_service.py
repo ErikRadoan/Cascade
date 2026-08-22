@@ -1,15 +1,8 @@
 """CSG export — serializes a CascadeGeometry into the flat surfaces+cells+
-region-tree JSON shape the frontend's CSG viewers (2D slice plot, 3D
-raymarcher) consume.
+region-tree JSON shape the frontend's CSG viewers consume.
 
-Shared by:
-    - api/jobs.py's GET /jobs/{job_id}/csg      (a submitted job's geometry)
-    - api/geometry.py's POST /geometry/csg       (the live editor's YAML)
-
-CSG_VIEWER_SCALING_PLAN.md Phase C/D: also serializes `lattice_instances`
-(prototype + per-instance offsets, and Phase D `inner_offsets` for nested
-lattices) alongside the existing flat `surfaces`/`cells` lists.
-Additive only — clients that ignore lattice_instances are unchanged.
+Also includes ``warnings`` (soft expansion messages) so the editor can
+show them without treating the geometry as failed.
 """
 from __future__ import annotations
 
@@ -59,9 +52,9 @@ def geometry_to_csg_dict(geom: CascadeGeometry) -> dict:
                     for c in li.prototype_cells
                 ],
                 "instances": [list(p) for p in li.instances],
-                # Phase D — empty list for single-level lattices
                 "inner_offsets": [list(p) for p in li.inner_offsets],
             }
             for li in geom.lattice_instances
         ],
+        "warnings": list(getattr(geom, "warnings", None) or []),
     }
