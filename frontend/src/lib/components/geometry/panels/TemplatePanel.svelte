@@ -1,6 +1,7 @@
 <script lang="ts">
   // TemplatePanel — shows template definitions as thumbnail cards.
-  // The "+" button now actually creates a new template block in the YAML.
+  // Template-level Union/Subtraction/Intersection are no longer offered here;
+  // use Objects multi-select → BooleanPlacement instead.
 
   import { activeProject, setGeometryText } from '../stores/projects.svelte.js';
   import { geometrySelection } from '../stores/selection.svelte.js';
@@ -15,7 +16,15 @@
     type: string;
   }
 
-  const PLACEMENT_TYPES = new Set(['SinglePlacement', 'SquareLattice', 'HexLattice']);
+  const NON_TEMPLATE_TYPES = new Set([
+    'SinglePlacement',
+    'SquareLattice',
+    'HexLattice',
+    'BooleanPlacement',
+  ]);
+
+  // Legacy template booleans — still loadable from YAML but not creatable here
+  const HIDDEN_TEMPLATE_TYPES = new Set(['Union', 'Subtraction', 'Intersection']);
 
   let parsedDoc = $derived((): Record<string, { type?: string }> | null => {
     const raw = yaml.parse(activeProject().text);
@@ -27,12 +36,17 @@
     const doc = parsedDoc();
     if (!doc) return [];
     return Object.entries(doc)
-      .filter(([, v]) => v && typeof v === 'object' && v.type && !PLACEMENT_TYPES.has(v.type))
+      .filter(([, v]) =>
+        v && typeof v === 'object' && v.type
+        && !NON_TEMPLATE_TYPES.has(v.type)
+        && !HIDDEN_TEMPLATE_TYPES.has(v.type)
+      )
       .map(([name, v]) => ({ name, type: v.type! }));
   });
 
   function select(name: string) {
     geometrySelection.selectedItem = { kind: 'template', name };
+    geometrySelection.selectedNames = [];
   }
 
   function iconFor(type: string): string {
@@ -53,6 +67,7 @@
 
     setGeometryText(newText, { immediate: true });
     geometrySelection.selectedItem = { kind: 'template', name };
+    geometrySelection.selectedNames = [];
   }
 
   function deleteSelected() {
