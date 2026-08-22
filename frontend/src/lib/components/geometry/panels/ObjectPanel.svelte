@@ -1,20 +1,9 @@
 <script lang="ts">
   // ObjectPanel — Phase D of geometry-restructuring-plan.md.
   //
-  // Pre-Phase-D, this listed `activeProject().scene?.components` — output
-  // of the FuelPin/Box-only SceneBuilder. It now lists the shared
-  // /geometry/csg cells (via stores/csg.svelte.ts), grouped by owning
-  // placement (csgCellGrouping.baseGroupName) — the same grouping the old
-  // SceneComponent baseName-stripping did, just derived from raw cells
-  // instead of a shape-specific scene description. This is what makes the
-  // panel render arbitrary future component types (Union/Subtraction/
-  // Intersection, raw Cells) with zero new frontend code: a Cell is a
-  // Cell here regardless of what expander.py pipeline produced it.
-  //
-  // Each Box's fill cell shows as its own row (cell.name has no "_layerN"/
-  // "_N" suffix to strip, so baseGroupName is the identity function for
-  // it) — same "Boxes are the most common thing you'll want to hide"
-  // rationale the eye toggle already existed for.
+  // Lists /geometry/csg cells grouped by owning placement. Supports
+  // multi-select (ctrl/cmd-click) and BooleanPlacement creation from
+  // two or more selected placements.
 
   import { activeProject, setGeometryText } from '../stores/projects.svelte.js';
   import { geometrySelection } from '../stores/selection.svelte.js';
@@ -25,24 +14,33 @@
   import {dump} from 'js-yaml';
   import PanelHeader from '../dock/PanelHeader.svelte';
   import TypePickerMenu from '../TypePickerMenu.svelte';
-  import { PLACEMENT_DEFAULTS, PLACEMENT_TYPES, uniqueName } from '../componentDefaults';
+  import { PLACEMENT_DEFAULTS, uniqueName } from '../componentDefaults';
 
   $effect(() => {
     requestCsgRefresh(activeProject().text);
   });
 
   interface Group {
-    name: string;   // owning placement/Cell name — matches a top-level YAML key
-    count: number;  // number of raw CSG cells folded into this row
-    type: string;   // the YAML block's own `type` field, or 'Cell' as a fallback
+    name: string;
+    count: number;
+    type: string;
   }
 
-  const NON_TEMPLATE_TYPES = new Set(['SinglePlacement', 'SquareLattice', 'HexLattice']);
+  const NON_TEMPLATE_TYPES = new Set([
+    'SinglePlacement',
+    'SquareLattice',
+    'HexLattice',
+    'BooleanPlacement',
+  ]);
 
-  let parsedDoc = $derived((): Record<string, { type?: string }> | null => {
+  // Placement types offered by "Place template" — exclude BooleanPlacement
+  // (that is created via multi-select → Boolean, not from a template).
+  const PLACE_TEMPLATE_TYPES = ['SinglePlacement', 'SquareLattice', 'HexLattice'];
+
+  let parsedDoc = $derived((): Record<string, { type?: string; children?: string[] }> | null => {
     const raw = yaml.parse(activeProject().text);
     if (!raw || typeof raw !== 'object') return null;
-    return raw as Record<string, { type?: string }>;
+    return raw as Record<string, { type?: string; children?: string[] }>;
   });
 
   let groups = $derived((): Group[] => {
@@ -51,7 +49,7 @@
     const map = new Map<string, Group>();
 
     for (const cell of cells) {
-      if (cell.material_id == null) continue; // void cells aren't placeable objects
+      if (cell.material_id == null) continue;
       const rawName = cell.name ?? cell.id;
       const groupName = baseGroupName(rawName);
 
@@ -67,6 +65,15 @@
       });
     }
 
+    // Also show BooleanPlacement nodes that may not yet have expanded cells
+    if (doc) {
+      for (const [name, block] of Object.entries(doc)) {
+        if (block?.type === 'BooleanPlacement' && !map.has(name)) {
+          map.set(name, { name, count: 0, type: 'BooleanPlacement' });
+        }
+      }
+    }
+
     return [...map.values()];
   });
 
@@ -80,8 +87,24 @@
 
   let pendingTemplate = $state<string | null>(null);
 
-  function select(name: string) {
-    geometrySelection.selectedItem = { kind: 'placement', name };
+  function select(name: string, e?: MouseEvent) {
+    const multi = e && (e.ctrlKey || e.metaKey);
+    if (multi) {
+      const set = new Set(geometrySelection.selectedNames);
+      if (set.has(name)) set.delete(name);
+      else set.add(name);
+      geometrySelection.selectedNames = [...set];
+      geometrySelection.selectedItem = { kind: 'placement', name };
+    } else {
+      geometrySelection.selectedNames = [name];
+      geometrySelection.selectedItem = { kind: 'placement', name };
+    }
+  }
+
+  function isSelected(name: string): boolean {
+    return geometrySelection.selectedNames.includes(name)
+      || (geometrySelection.selectedItem?.kind === 'placement'
+          && geometrySelection.selectedItem.name === name);
   }
 
   function startCreate(templateName: string) {
@@ -99,6 +122,7 @@
 
     setGeometryText(newText, { immediate: true });
     geometrySelection.selectedItem = { kind: 'placement', name };
+    geometrySelection.selectedNames = [name];
     pendingTemplate = null;
   }
 
@@ -106,23 +130,53 @@
     pendingTemplate = null;
   }
 
+  function createBoolean(op: 'union' | 'subtraction' | 'intersection') {
+    const names = geometrySelection.selectedNames;
+    if (names.length < 2) return;
+    const doc = parsedDoc() ?? {};
+    const base = op === 'union' ? 'union' : op === 'subtraction' ? 'subtraction' : 'intersection';
+    const name = uniqueName(base, new Set(Object.keys(doc)));
+
+    const block = {
+      ...PLACEMENT_DEFAULTS.BooleanPlacement(''),
+      op,
+      children: [...names],
+      materials: [] as string[],
+    };
+    const updated = { ...doc, [name]: block };
+    const newText = dump(updated, { indent: 2, lineWidth: -1 });
+
+    setGeometryText(newText, { immediate: true });
+    geometrySelection.selectedItem = { kind: 'placement', name };
+    geometrySelection.selectedNames = [name];
+  }
+
   function deleteSelected() {
-    const sel = geometrySelection.selectedItem;
+    const names = geometrySelection.selectedNames.length > 0
+      ? geometrySelection.selectedNames
+      : (geometrySelection.selectedItem?.kind === 'placement'
+          ? [geometrySelection.selectedItem.name]
+          : []);
     const doc = parsedDoc();
-    if (!sel || sel.kind !== 'placement' || !doc || !(sel.name in doc)) return;
+    if (!doc || names.length === 0) return;
 
     const updated = { ...doc };
-    delete updated[sel.name];
+    for (const n of names) {
+      delete updated[n];
+    }
     const newText = dump(updated, { indent: 2, lineWidth: -1 });
 
     setGeometryText(newText, { immediate: true });
     geometrySelection.selectedItem = null;
+    geometrySelection.selectedNames = [];
   }
 
   function onToggleVisibility(e: MouseEvent, name: string) {
-    e.stopPropagation(); // don't also select the row
+    e.stopPropagation();
     toggleVisibility(name);
   }
+
+  let multiCount = $derived(geometrySelection.selectedNames.length);
 </script>
 
 <div class="panel">
@@ -134,9 +188,9 @@
     {/if}
     <button
       class="icon-btn"
-      title="Delete selected object"
-      aria-label="Delete selected object"
-      disabled={geometrySelection.selectedItem?.kind !== 'placement'}
+      title="Delete selected object(s)"
+      aria-label="Delete selected object(s)"
+      disabled={multiCount === 0 && geometrySelection.selectedItem?.kind !== 'placement'}
       onclick={deleteSelected}
     >
       <svg viewBox="0 0 16 16" fill="currentColor">
@@ -149,11 +203,20 @@
     <div class="create-step">
       <span>Place <strong>{pendingTemplate}</strong> as:</span>
       <div class="create-options">
-        {#each PLACEMENT_TYPES as pt}
+        {#each PLACE_TEMPLATE_TYPES as pt}
           <button class="create-option" onclick={() => finishCreate(pt)}>{pt}</button>
         {/each}
         <button class="create-cancel" onclick={cancelCreate}>Cancel</button>
       </div>
+    </div>
+  {/if}
+
+  {#if multiCount >= 2}
+    <div class="boolean-bar">
+      <span class="boolean-label">{multiCount} selected — Boolean:</span>
+      <button class="create-option" onclick={() => createBoolean('union')}>Union</button>
+      <button class="create-option" onclick={() => createBoolean('subtraction')}>Subtract</button>
+      <button class="create-option" onclick={() => createBoolean('intersection')}>Intersect</button>
     </div>
   {/if}
 
@@ -170,9 +233,9 @@
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           class="object-row"
-          class:selected={geometrySelection.selectedItem?.name === group.name && geometrySelection.selectedItem?.kind === 'placement'}
+          class:selected={isSelected(group.name)}
           class:hidden-row={!isVisible(group.name)}
-          onclick={() => select(group.name)}
+          onclick={(e) => select(group.name, e)}
         >
           <button
             class="eye-btn"
@@ -252,12 +315,23 @@
   .icon-btn:hover:not(:disabled) { color: var(--color-text); background: var(--color-bg-raised); }
   .icon-btn:disabled { opacity: 0.35; cursor: default; }
 
-  .create-step {
+  .create-step, .boolean-bar {
     padding: 8px 10px;
     background: rgba(6, 182, 212, 0.06);
     border-bottom: 1px solid var(--color-border);
     font-size: 11px;
     color: var(--color-subtext);
+  }
+
+  .boolean-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .boolean-label {
+    margin-right: 4px;
   }
 
   .create-step strong {
