@@ -9,20 +9,10 @@
 
 export type FieldOptions = string[] | ((doc: Record<string, { type?: string }>) => string[]);
 
-// 'none' included alongside the backend's BoundaryType enum (see
-// domain/geometry.py) — Sphere defaults to it (an ordinary interior
-// shape has no boundary condition of its own), and it's a legitimate
-// choice for Box too, so it's shared rather than duplicated per type.
 const BOUNDARY_TYPES = ['reflective', 'vacuum', 'periodic', 'none'];
 const HEX_ORIENTATIONS = ['pointy_top', 'flat_top'];
 const BOOLEAN_OPS = ['union', 'subtraction', 'intersection'];
 
-// Common material IDs pre-seeded on the backend (api/materials.py).
-// This list is a UI convenience only — the backend remains the source
-// of truth and will reject unknown material IDs at submit time. Until
-// materials get their own GET /materials list wired into this panel,
-// this static list covers the common case and the field still accepts
-// free text for anything not listed (see "custom..." handling below).
 const KNOWN_MATERIALS = ['UO2', 'He', 'Zr4', 'H2O', 'B4C', 'SS316'];
 
 const NON_TEMPLATE_TYPES = new Set([
@@ -32,14 +22,19 @@ const NON_TEMPLATE_TYPES = new Set([
   'BooleanPlacement',
 ]);
 
-/** Resolver for the `template` field — lists every template defined in the doc. */
+const MATERIAL_KEYS = [
+  'material',
+  'pellet_material',
+  'gap_material',
+  'clad_material',
+];
+
 function templateOptions(doc: Record<string, { type?: string }>): string[] {
   return Object.entries(doc)
     .filter(([, v]) => v && typeof v === 'object' && v.type && !NON_TEMPLATE_TYPES.has(v.type))
     .map(([name]) => name);
 }
 
-/** Placement names that can be children of a BooleanPlacement. */
 function placementOptions(doc: Record<string, { type?: string }>): string[] {
   return Object.entries(doc)
     .filter(([, v]) => v && typeof v === 'object' && v.type && (
@@ -51,7 +46,48 @@ function placementOptions(doc: Record<string, { type?: string }>): string[] {
     .map(([name]) => name);
 }
 
-// Key format: "<ComponentType>.<fieldName>"
+/**
+ * Collect material IDs reachable from a placement name by walking its
+ * template (or nested BooleanPlacement children). Used to populate the
+ * BooleanPlacement.materials multi-select.
+ */
+export function materialsFromPlacement(
+  name: string,
+  doc: Record<string, Record<string, unknown>>,
+  seen: Set<string> = new Set(),
+): string[] {
+  if (seen.has(name)) return [];
+  seen.add(name);
+  const block = doc[name];
+  if (!block || typeof block !== 'object') return [];
+
+  const type = block.type as string | undefined;
+  const out = new Set<string>();
+
+  if (type === 'BooleanPlacement') {
+    const children = (block.children as string[] | undefined) ?? [];
+    for (const c of children) {
+      for (const m of materialsFromPlacement(c, doc, seen)) out.add(m);
+    }
+    return [...out];
+  }
+
+  if (type === 'SinglePlacement' || type === 'SquareLattice' || type === 'HexLattice') {
+    const tplName = block.template as string | undefined;
+    if (tplName) {
+      for (const m of materialsFromPlacement(tplName, doc, seen)) out.add(m);
+    }
+    return [...out];
+  }
+
+  // Template / primitive: gather any *material* fields
+  for (const key of MATERIAL_KEYS) {
+    const v = block[key];
+    if (typeof v === 'string' && v.length > 0) out.add(v);
+  }
+  return [...out];
+}
+
 export const FIELD_OPTIONS: Record<string, FieldOptions> = {
   'Box.material':              KNOWN_MATERIALS,
   'Box.boundary_type':         BOUNDARY_TYPES,
@@ -64,15 +100,6 @@ export const FIELD_OPTIONS: Record<string, FieldOptions> = {
   'SquareLattice.template':    templateOptions,
   'HexLattice.template':       templateOptions,
   'HexLattice.orientation':    HEX_ORIENTATIONS,
-  // Union/Subtraction/Intersection's `a`/`b` reference any OTHER template
-  // by name (dsl/schema/boolean.py) — reuses the same templateOptions
-  // resolver SinglePlacement/lattices use for their `template` field.
-  // This deliberately does NOT filter out FuelPin here even though the
-  // backend rejects it as an operand (expander.py's
-  // _expand_shape_at_origin raises a clear TypeError) — the dropdown
-  // stays a simple "pick any template" list, same as everywhere else in
-  // this file, and the backend's validation error is what surfaces the
-  // FuelPin-specific constraint to the user.
   'Union.a':                   templateOptions,
   'Union.b':                   templateOptions,
   'Union.material':            KNOWN_MATERIALS,
@@ -82,14 +109,12 @@ export const FIELD_OPTIONS: Record<string, FieldOptions> = {
   'Intersection.a':            templateOptions,
   'Intersection.b':            templateOptions,
   'Intersection.material':     KNOWN_MATERIALS,
-  // BooleanPlacement — hierarchy over already-placed objects
   'BooleanPlacement.op':       BOOLEAN_OPS,
-  // children is a list; Parameters panel may use placementOptions for add-child
   'BooleanPlacement.children': placementOptions,
+  // materials options resolved dynamically in ParametersPanel from children
   'BooleanPlacement.materials': KNOWN_MATERIALS,
 };
 
-/** Resolve the dropdown options for a field, or null if it should stay a free input. */
 export function resolveFieldOptions(
   componentType: string,
   fieldKey: string,
