@@ -129,10 +129,43 @@
     }
   }
 
+  // Curated palette — keep in sync with scene_builder_service._MATERIAL_COLORS
+  // so CSG viewport matches ResultsViewport3D / GeometryPlotPanel.
+  const MATERIAL_COLORS: Record<string, string> = {
+    'UO2': '#E8703A', 'UO2_3.5pct': '#E8703A', 'UO2_4pct': '#D4612E',
+    'ThO2': '#C8A882', 'UC': '#B06030',
+    'He': '#D0EEF8', 'He4': '#D0EEF8', 'Air': '#E8F4F8',
+    'Zr4': '#8BAFC0', 'Zircaloy': '#8BAFC0', 'Zircaloy-4': '#8BAFC0',
+    'SS304': '#A0A8B0', 'SS316': '#9098A8', 'Steel': '#909090',
+    'Al': '#C8D0D8',
+    'H2O': '#4A90D9', 'Water': '#4A90D9', 'D2O': '#3A7AC0',
+    'Na': '#F0C040', 'LiFBeF2': '#90D0A0', 'FLiBe': '#90D0A0',
+    'B4C': '#303030', 'Hafnium': '#606878', 'Hf': '#606878',
+    'AgInCd': '#788090', 'Gd2O3': '#A08060',
+    'Graphite': '#505050', 'Be': '#B0C8B0', 'Pb': '#787870',
+    'void': '#101020', 'Void': '#101020',
+  };
+
+  function hexToRgb01(hex: string): [number, number, number] {
+    const h = hex.replace('#', '');
+    const n = parseInt(h.length === 3 ? h.split('').map((c) => c + c).join('') : h, 16);
+    return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+  }
+
   function hashColor(id: string): [number, number, number] {
     let h = 2166136261;
     for (let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619); }
     return hslToRgb(((h >>> 0) % 360) / 360, 0.55, 0.55);
+  }
+
+  function resolveMaterialColor(id: string): [number, number, number] {
+    const curated = MATERIAL_COLORS[id];
+    if (curated) return hexToRgb01(curated);
+    const lower = id.toLowerCase();
+    for (const [k, v] of Object.entries(MATERIAL_COLORS)) {
+      if (k.toLowerCase() === lower) return hexToRgb01(v);
+    }
+    return hashColor(id);
   }
   function hslToRgb(h: number, s: number, l: number): [number, number, number] {
     const c = (1 - Math.abs(2 * l - 1)) * s;
@@ -178,17 +211,12 @@
   function computeBounds(csg: CsgGeometry): AxisBounds {
     let b: AxisBounds = { xMin: Infinity, xMax: -Infinity, yMin: Infinity, yMax: -Infinity, zMin: Infinity, zMax: -Infinity };
     for (const s of csg.surfaces) b = accumulateSurfaceBounds(b, s);
-    if (!isFinite(b.xMin)) return { xMin: -5, xMax: 5, yMin: -5, yMax: 5, zMin: -5, zMax: 5 };
-    if (!isFinite(b.zMin)) b = { ...b, zMin: -5, zMax: 5 };
+    // Per-axis fallback — a missing plane_y must not leave yMin/yMax at ±Infinity
+    // (that breaks cameraDistance and the shader root AABB).
+    if (!isFinite(b.xMin) || !isFinite(b.xMax)) { b.xMin = -5; b.xMax = 5; }
+    if (!isFinite(b.yMin) || !isFinite(b.yMax)) { b.yMin = -5; b.yMax = 5; }
+    if (!isFinite(b.zMin) || !isFinite(b.zMax)) { b.zMin = -5; b.zMax = 5; }
     return b;
-  }
-
-  function regionIsPotentiallyUnbounded(node: RegionNode): boolean {
-    switch (node.op) {
-      case 'not': case 'outside': return true;
-      case 'inside': return false;
-      case 'and': case 'or': return node.items.some(regionIsPotentiallyUnbounded);
-    }
   }
 
   function cellAABB(region: RegionNode, surfaceById: Map<string, CsgSurface>, fallback: AxisBounds): AxisBounds {
@@ -239,7 +267,7 @@
     data[base] = x; data[base + 1] = y; data[base + 2] = z; data[base + 3] = w;
   }
 
-  function flattenBvh(root: BvhBuildNode, data: Float32Array): number {
+  function flattenBvh(root: BvhBuildNode, data: Float32Array): { count: number; truncated: boolean } {
     let counter = 0;
     function assign(node: BvhBuildNode): number {
       const idx = counter++;
@@ -258,7 +286,7 @@
       return idx;
     }
     assign(root);
-    return Math.min(counter, MAX_BVH_NODES);
+    return { count: Math.min(counter, MAX_BVH_NODES), truncated: counter > MAX_BVH_NODES };
   }
 
   let csg = $state<CsgGeometry | null>(null);
@@ -268,6 +296,7 @@
   let truncatedProtos = $state(false);
   let truncatedInstances = $state(false);
   let truncatedTokens = $state(false);
+  let truncatedBvh = $state(false);
   let instanceCount = $state(0);
   let prototypeCount = $state(0);
   let materialLegend = $state<{ id: string; color: string }[]>([]);
@@ -598,14 +627,23 @@
           }
         }
       }
-      // Pin-vs-fill on shared axial planes:
-      // - Looking down (rd.z < 0): pin wins near-ties so the top face shows
-      //   pin cross-sections (assembly map view).
-      // - Looking up or sideways: fill wins near-ties so the bottom/sides stay
-      //   a solid wall (otherwise the floor disappears and cladding shows through).
-      // Strict nearer pin always wins regardless of view direction.
-      if (pinProto >= 0 && (bestPin < bestFill - 0.001 || (bestPin <= bestFill + 0.02 && rd.z < -0.05))) {
-        hitProto = pinProto; hitOff = pinOff; return bestPin;
+      // Pin-vs-fill priority:
+      // - Strictly nearer hit always wins.
+      // - Near-ties: prefer pin only when looking steeply down (top-face map
+      //   view). Side/oblique views (even with mild downward tilt) prefer fill
+      //   so vertical box walls stay solid instead of showing pin material.
+      if (pinProto >= 0 && fillProto >= 0) {
+        if (bestPin < bestFill - 0.002) {
+          hitProto = pinProto; hitOff = pinOff; return bestPin;
+        }
+        if (bestFill < bestPin - 0.002) {
+          hitProto = fillProto; hitOff = fillOff; return bestFill;
+        }
+        // Near-tie — require steep downward look (rd.z ≈ -1)
+        if (rd.z < -0.65) {
+          hitProto = pinProto; hitOff = pinOff; return bestPin;
+        }
+        hitProto = fillProto; hitOff = fillOff; return bestFill;
       }
       if (fillProto >= 0) {
         hitProto = fillProto; hitOff = fillOff; return bestFill;
@@ -733,8 +771,13 @@
     if (!shaderMaterial) return;
     const u = shaderMaterial.uniforms;
     if (!csg) {
+      tokenTexture?.dispose(); tokenTexture = null;
+      instanceTexture?.dispose(); instanceTexture = null;
+      bvhTexture?.dispose(); bvhTexture = null;
+      u.uTokenTex.value = null; u.uInstanceTex.value = null; u.uBvhTex.value = null;
       u.uProtoCount.value = 0; u.uInstanceCount.value = 0; u.uSurfCount.value = 0; u.uBvhNodeCount.value = 0;
       instanceCount = 0; prototypeCount = 0; materialLegend = []; usingInstancing = false;
+      truncatedSurfaces = truncatedProtos = truncatedInstances = truncatedTokens = truncatedBvh = false;
       render(); return;
     }
     const surfacesUsed = csg.surfaces.slice(0, MAX_SURFACES);
@@ -850,7 +893,7 @@
     let anyTokenTrunc = false;
     const legendSeen = new Map<string, string>();
     protos.forEach((proto, pi) => {
-      const [r, g, b] = hashColor(proto.material_id);
+      const [r, g, b] = resolveMaterialColor(proto.material_id);
       protoColor[pi].setRGB(r, g, b);
       if (!legendSeen.has(proto.material_id)) legendSeen.set(proto.material_id, `#${protoColor[pi].getHexString()}`);
       protoIsFill[pi] = proto.isFill ? 1 : 0;
@@ -892,7 +935,12 @@
     const tBvh0 = performance.now();
     const bvhTexData = new Float32Array(3 * MAX_BVH_NODES * 4);
     let bvhNodeCount = 0;
-    if (instances.length > 0) bvhNodeCount = flattenBvh(buildBvh(instances.map((_, i) => i), instanceBoxes), bvhTexData);
+    truncatedBvh = false;
+    if (instances.length > 0) {
+      const flat = flattenBvh(buildBvh(instances.map((_, i) => i), instanceBoxes), bvhTexData);
+      bvhNodeCount = flat.count;
+      truncatedBvh = flat.truncated;
+    }
     u.uBvhNodeCount.value = bvhNodeCount;
     console.log(`[perf] BVH build: ${(performance.now() - tBvh0).toFixed(2)}ms, nodes=${bvhNodeCount}, protos=${protos.length}, instances=${instances.length}, instancing=${usingInstancing}`);
 
@@ -967,10 +1015,8 @@
     scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), shaderMaterial));
     renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: false });
     renderer.setPixelRatio(IDLE_DPR);
-    // Surface shader compile/link failures (often from oversized uniform arrays)
+    // Force one compile pass and log diagnostics
     const gl = renderer.getContext();
-    const prog = (renderer as any).properties?.get?.(shaderMaterial)?.program;
-    // Force one compile pass and log errors
     renderer.compile(scene, camera);
     try {
       const matProg = (renderer as any).properties?.get?.(shaderMaterial)?.program;
@@ -1008,7 +1054,7 @@
   {/if}
   {#if loading}<div class="badge">Loading CSG…</div>{/if}
   {#if loadError}<div class="badge error">{loadError}</div>{/if}
-  {#if truncatedSurfaces || truncatedProtos || truncatedInstances || truncatedTokens}
+  {#if truncatedSurfaces || truncatedProtos || truncatedInstances || truncatedTokens || truncatedBvh}
     <div class="badge warning">Geometry exceeds viewer capacity (max {MAX_PROTOTYPES} prototypes / {MAX_INSTANCES} instances) — partial render.</div>
   {/if}
 </div>

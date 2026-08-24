@@ -82,6 +82,55 @@
     setGeometryText(newText, { immediate: true });
     geometrySelection.selectedItem = null;
   }
+
+  // ---- Rename ----
+  let renaming = $state<string | null>(null);
+  let renameDraft = $state('');
+
+  function startRename(name: string, e?: MouseEvent) {
+    e?.stopPropagation();
+    renaming = name;
+    renameDraft = name;
+  }
+
+  function commitRename() {
+    const oldName = renaming;
+    const newName = renameDraft.trim();
+    renaming = null;
+    if (!oldName || !newName || newName === oldName) return;
+    const doc = parsedDoc();
+    if (!doc || !(oldName in doc)) return;
+    if (newName in doc) return;
+
+    const updated: Record<string, { type?: string; [k: string]: unknown }> = {};
+    for (const [k, v] of Object.entries(doc)) {
+      const key = k === oldName ? newName : k;
+      const block = { ...(v as object) } as Record<string, unknown>;
+      if (typeof block.template === 'string' && block.template === oldName) {
+        block.template = newName;
+      }
+      if (Array.isArray(block.children)) {
+        block.children = (block.children as string[]).map((c) => (c === oldName ? newName : c));
+      }
+      if (typeof block.a === 'string' && block.a === oldName) block.a = newName;
+      if (typeof block.b === 'string' && block.b === oldName) block.b = newName;
+      updated[key] = block as { type?: string };
+    }
+
+    const newText = dump(updated, { indent: 2, lineWidth: -1 });
+    setGeometryText(newText, { immediate: true });
+    geometrySelection.selectedItem = { kind: 'template', name: newName };
+  }
+
+  function onRenameKey(e: KeyboardEvent) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commitRename();
+    } else if (e.key === 'Escape') {
+      renaming = null;
+    }
+  }
+
 </script>
 
 <div class="panel">
@@ -130,7 +179,22 @@
                 </svg>
               {/if}
             </div>
-            <span class="template-name">{tpl.name}</span>
+            {#if renaming === tpl.name}
+              <input
+                class="rename-input"
+                bind:value={renameDraft}
+                onkeydown={onRenameKey}
+                onblur={commitRename}
+                onclick={(e) => e.stopPropagation()}
+                autofocus
+              />
+            {:else}
+              <span
+                class="template-name"
+                ondblclick={(e) => startRename(tpl.name, e)}
+                title="Double-click to rename"
+              >{tpl.name}</span>
+            {/if}
             <span class="template-type">{tpl.type}</span>
           </div>
         {/each}
@@ -243,4 +307,17 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
+
+  .rename-input {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    background: var(--color-bg);
+    border: 1px solid var(--color-accent);
+    border-radius: 2px;
+    color: var(--color-text);
+    padding: 2px 4px;
+    width: 90%;
+    text-align: center;
+  }
+  .rename-input:focus { outline: none; }
 </style>

@@ -1,9 +1,6 @@
 <script lang="ts">
-  // ObjectPanel — Phase D of geometry-restructuring-plan.md.
-  //
-  // Lists /geometry/csg cells grouped by owning placement. Supports
-  // multi-select (ctrl/cmd-click) and BooleanPlacement creation from
-  // two or more selected placements.
+  // ObjectPanel — placements list with BooleanPlacement folder hierarchy,
+  // multi-select → Boolean ops, and inline rename (double-click name / F2).
 
   import { activeProject, setGeometryText } from '../stores/projects.svelte.js';
   import { geometrySelection } from '../stores/selection.svelte.js';
@@ -24,6 +21,9 @@
     name: string;
     count: number;
     type: string;
+    depth: number;
+    parent: string | null;
+    childNames: string[];
   }
 
   const NON_TEMPLATE_TYPES = new Set([
@@ -33,14 +33,12 @@
     'BooleanPlacement',
   ]);
 
-  // Placement types offered by "Place template" — exclude BooleanPlacement
-  // (that is created via multi-select → Boolean, not from a template).
   const PLACE_TEMPLATE_TYPES = ['SinglePlacement', 'SquareLattice', 'HexLattice'];
 
-  let parsedDoc = $derived((): Record<string, { type?: string; children?: string[] }> | null => {
+  let parsedDoc = $derived((): Record<string, Record<string, unknown>> | null => {
     const raw = yaml.parse(activeProject().text);
     if (!raw || typeof raw !== 'object') return null;
-    return raw as Record<string, { type?: string; children?: string[] }>;
+    return raw as Record<string, Record<string, unknown>>;
   });
 
   const PLACEMENT_TYPE_SET = new Set([
@@ -50,25 +48,43 @@
     'BooleanPlacement',
   ]);
 
-  /**
-   * Object list is driven primarily by the YAML document so the hierarchy
-   * remains selectable even when CSG expansion fails. Cell counts come from
-   * CSG data when available.
-   */
+  /** Parent map: childName → BooleanPlacement name */
+  let parentOf = $derived((): Map<string, string> => {
+    const doc = parsedDoc();
+    const map = new Map<string, string>();
+    if (!doc) return map;
+    for (const [name, block] of Object.entries(doc)) {
+      if (block?.type !== 'BooleanPlacement') continue;
+      const children = (block.children as string[] | undefined) ?? [];
+      for (const c of children) map.set(c, name);
+    }
+    return map;
+  });
+
   let groups = $derived((): Group[] => {
     const cells = csgState.data?.cells ?? [];
     const doc = parsedDoc();
+    const parents = parentOf();
     const map = new Map<string, Group>();
 
-    // 1. Every placement defined in YAML (works even when CSG errors)
     if (doc) {
       for (const [name, block] of Object.entries(doc)) {
-        if (!block?.type || !PLACEMENT_TYPE_SET.has(block.type)) continue;
-        map.set(name, { name, count: 0, type: block.type });
+        if (!block?.type || !PLACEMENT_TYPE_SET.has(block.type as string)) continue;
+        const children =
+          block.type === 'BooleanPlacement'
+            ? ((block.children as string[] | undefined) ?? [])
+            : [];
+        map.set(name, {
+          name,
+          count: 0,
+          type: block.type as string,
+          depth: 0,
+          parent: parents.get(name) ?? null,
+          childNames: [...children],
+        });
       }
     }
 
-    // 2. Fold CSG cells into counts / add any leftover Cell-only names
     for (const cell of cells) {
       if (cell.material_id == null) continue;
       const rawName = cell.name ?? cell.id;
@@ -79,20 +95,80 @@
         continue;
       }
       map.set(groupName, {
-        name:  groupName,
+        name: groupName,
         count: 1,
-        type:  doc?.[groupName]?.type ?? 'Cell',
+        type: (doc?.[groupName]?.type as string) ?? 'Cell',
+        depth: 0,
+        parent: parents.get(groupName) ?? null,
+        childNames: [],
       });
     }
 
+    // Assign depth from parent chain
+    for (const g of map.values()) {
+      let d = 0;
+      let p = g.parent;
+      const seen = new Set<string>();
+      while (p && !seen.has(p)) {
+        seen.add(p);
+        d++;
+        p = parents.get(p) ?? null;
+      }
+      g.depth = d;
+    }
+
     return [...map.values()];
+  });
+
+  /** Visible rows: top-level + children of expanded folders */
+  let expanded = $state<Set<string>>(new Set());
+
+  function toggleExpand(name: string, e: MouseEvent) {
+    e.stopPropagation();
+    const next = new Set(expanded);
+    if (next.has(name)) next.delete(name);
+    else next.add(name);
+    expanded = next;
+  }
+
+  let visibleGroups = $derived((): Group[] => {
+    const all = groups();
+    const byName = new Map(all.map((g) => [g.name, g]));
+    const out: Group[] = [];
+    const emitted = new Set<string>();
+
+    // Emit children immediately under their BooleanPlacement parent (folder
+    // order), not in YAML key order — otherwise children defined before the
+    // union float to the top of the list when expanded.
+    function emitChildren(parentName: string, ancestors: Set<string>) {
+      const parent = byName.get(parentName);
+      if (!parent || !expanded.has(parentName)) return;
+      for (const childName of parent.childNames) {
+        if (ancestors.has(childName) || emitted.has(childName)) continue; // cycle / dup guard
+        const child = byName.get(childName);
+        if (!child) continue;
+        emitted.add(childName);
+        out.push(child);
+        const nextAnc = new Set(ancestors);
+        nextAnc.add(childName);
+        emitChildren(childName, nextAnc);
+      }
+    }
+
+    for (const g of all) {
+      if (g.parent) continue; // nested under emitChildren
+      emitted.add(g.name);
+      out.push(g);
+      emitChildren(g.name, new Set([g.name]));
+    }
+    return out;
   });
 
   let availableTemplates = $derived((): string[] => {
     const doc = parsedDoc();
     if (!doc) return [];
     return Object.entries(doc)
-      .filter(([, v]) => v && typeof v === 'object' && v.type && !NON_TEMPLATE_TYPES.has(v.type))
+      .filter(([, v]) => v && typeof v === 'object' && v.type && !NON_TEMPLATE_TYPES.has(v.type as string))
       .map(([name]) => name);
   });
 
@@ -147,6 +223,19 @@
     const doc = parsedDoc() ?? {};
     const base = op === 'union' ? 'union' : op === 'subtraction' ? 'subtraction' : 'intersection';
     const name = uniqueName(base, new Set(Object.keys(doc)));
+    const nameSet = new Set(names);
+
+    // Detach selected items from any existing folder so nothing ends up
+    // listed under two BooleanPlacements at once.
+    const stripped: Record<string, Record<string, unknown>> = {};
+    for (const [k, v] of Object.entries(doc)) {
+      if (v?.type === 'BooleanPlacement' && Array.isArray(v.children)) {
+        const filtered = (v.children as string[]).filter((c) => !nameSet.has(c));
+        stripped[k] = filtered.length === v.children.length ? v : { ...v, children: filtered };
+      } else {
+        stripped[k] = v;
+      }
+    }
 
     const block = {
       ...PLACEMENT_DEFAULTS.BooleanPlacement(''),
@@ -154,12 +243,14 @@
       children: [...names],
       materials: [] as string[],
     };
-    const updated = { ...doc, [name]: block };
+    const updated = { ...stripped, [name]: block };
     const newText = dump(updated, { indent: 2, lineWidth: -1 });
 
     setGeometryText(newText, { immediate: true });
     geometrySelection.selectedItem = { kind: 'placement', name };
     geometrySelection.selectedNames = [name];
+    // Auto-expand the new folder
+    expanded = new Set([...expanded, name]);
   }
 
   function deleteSelected() {
@@ -171,11 +262,18 @@
     const doc = parsedDoc();
     if (!doc || names.length === 0) return;
 
-    const updated = { ...doc };
-    for (const n of names) {
-      delete updated[n];
-      // If a BooleanPlacement listed this as a child, leave the reference —
-      // expander will raise a clear error until the user fixes it.
+    const nameSet = new Set(names);
+    // Immutable rebuild — avoid mutating shared objects from the shallow {...doc} copy.
+    // Deleting a BooleanPlacement does not cascade-delete its children (they become top-level).
+    const updated: Record<string, Record<string, unknown>> = {};
+    for (const [k, v] of Object.entries(doc)) {
+      if (nameSet.has(k)) continue;
+      if (v?.type === 'BooleanPlacement' && Array.isArray(v.children)) {
+        const filtered = (v.children as string[]).filter((c) => !nameSet.has(c));
+        updated[k] = filtered.length === v.children.length ? v : { ...v, children: filtered };
+      } else {
+        updated[k] = v;
+      }
     }
     const newText = dump(updated, { indent: 2, lineWidth: -1 });
 
@@ -187,6 +285,72 @@
   function onToggleVisibility(e: MouseEvent, name: string) {
     e.stopPropagation();
     toggleVisibility(name);
+  }
+
+  // ---- Rename ----
+  let renaming = $state<string | null>(null);
+  let renameDraft = $state('');
+
+  function startRename(name: string, e?: MouseEvent) {
+    e?.stopPropagation();
+    renaming = name;
+    renameDraft = name;
+  }
+
+  function commitRename() {
+    const oldName = renaming;
+    const newName = renameDraft.trim();
+    renaming = null;
+    if (!oldName || !newName || newName === oldName) return;
+
+    const doc = parsedDoc();
+    if (!doc || !(oldName in doc)) return;
+    if (newName in doc) return; // collision — ignore
+
+    const updated: Record<string, Record<string, unknown>> = {};
+    for (const [k, v] of Object.entries(doc)) {
+      const key = k === oldName ? newName : k;
+      const block = { ...v };
+      // Update references
+      if (typeof block.template === 'string' && block.template === oldName) {
+        block.template = newName;
+      }
+      if (Array.isArray(block.children)) {
+        block.children = (block.children as string[]).map((c) => (c === oldName ? newName : c));
+      }
+      if (typeof block.a === 'string' && block.a === oldName) block.a = newName;
+      if (typeof block.b === 'string' && block.b === oldName) block.b = newName;
+      updated[key] = block;
+    }
+
+    const newText = dump(updated, { indent: 2, lineWidth: -1 });
+    setGeometryText(newText, { immediate: true });
+    geometrySelection.selectedItem = { kind: 'placement', name: newName };
+    geometrySelection.selectedNames = geometrySelection.selectedNames.map((n) =>
+      n === oldName ? newName : n,
+    );
+    if (expanded.has(oldName)) {
+      const next = new Set(expanded);
+      next.delete(oldName);
+      next.add(newName);
+      expanded = next;
+    }
+  }
+
+  function onRenameKey(e: KeyboardEvent) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commitRename();
+    } else if (e.key === 'Escape') {
+      renaming = null;
+    }
+  }
+
+  function onRowKey(e: KeyboardEvent, name: string) {
+    if (e.key === 'F2') {
+      e.preventDefault();
+      startRename(name);
+    }
   }
 
   let multiCount = $derived(geometrySelection.selectedNames.length);
@@ -242,15 +406,35 @@
     {:else if groups().length === 0}
       <p class="empty-hint">No objects placed yet.<br>Add a SinglePlacement, lattice, or a Cell.</p>
     {:else}
-      {#each groups() as group}
+      {#each visibleGroups() as group (group.name)}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
           class="object-row"
           class:selected={isSelected(group.name)}
           class:hidden-row={!isVisible(group.name)}
+          class:is-child={group.depth > 0}
+          style="padding-left: {10 + group.depth * 14}px"
           onclick={(e) => select(group.name, e)}
+          onkeydown={(e) => onRowKey(e, group.name)}
+          tabindex="0"
         >
+          {#if group.type === 'BooleanPlacement' && group.childNames.length > 0}
+            <button
+              class="chevron-btn"
+              class:open={expanded.has(group.name)}
+              title={expanded.has(group.name) ? 'Collapse' : 'Expand'}
+              aria-label={expanded.has(group.name) ? 'Collapse' : 'Expand'}
+              onclick={(e) => toggleExpand(group.name, e)}
+            >
+              <svg viewBox="0 0 16 16" fill="currentColor">
+                <path d="M6.22 4.22a.75.75 0 011.06 0l3.25 3.25a.75.75 0 010 1.06l-3.25 3.25a.75.75 0 01-1.06-1.06L8.94 8 6.22 5.28a.75.75 0 010-1.06z"/>
+              </svg>
+            </button>
+          {:else}
+            <span class="chevron-spacer"></span>
+          {/if}
+
           <button
             class="eye-btn"
             title={isVisible(group.name) ? 'Hide in preview' : 'Show in preview'}
@@ -270,14 +454,30 @@
 
           <span class="type-dot" style="background: var(--color-accent)"></span>
 
-          <span class="object-name">
-            {group.name}
-            {#if group.count > 1}
-              <span class="object-count">({group.count})</span>
-            {/if}
-          </span>
+          {#if renaming === group.name}
+            <input
+              class="rename-input"
+              bind:value={renameDraft}
+              onkeydown={onRenameKey}
+              onblur={commitRename}
+              onclick={(e) => e.stopPropagation()}
+              autofocus
+            />
+          {:else}
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <span
+              class="object-name"
+              ondblclick={(e) => startRename(group.name, e)}
+              title="Double-click or F2 to rename"
+            >
+              {group.name}
+              {#if group.count > 1}
+                <span class="object-count">({group.count})</span>
+              {/if}
+            </span>
+          {/if}
 
-          <span class="object-type">{group.type}</span>
+          <span class="object-type">{group.type === 'BooleanPlacement' ? 'folder' : group.type}</span>
         </div>
       {/each}
     {/if}
@@ -344,9 +544,7 @@
     gap: 6px;
   }
 
-  .boolean-label {
-    margin-right: 4px;
-  }
+  .boolean-label { margin-right: 4px; }
 
   .create-step strong {
     color: var(--color-accent-hi);
@@ -400,8 +598,6 @@
     opacity: 0.7;
   }
 
-  .empty-hint.error { color: #f87171; opacity: 1; }
-
   .error-banner {
     font-size: 10px;
     color: #f87171;
@@ -417,7 +613,7 @@
   .object-row {
     display: flex;
     align-items: center;
-    gap: 7px;
+    gap: 5px;
     padding: 5px 10px;
     cursor: pointer;
     transition: background 0.1s;
@@ -427,6 +623,32 @@
   .object-row:hover { background: var(--color-bg-raised); }
   .object-row.selected { background: rgba(6, 182, 212, 0.1); color: var(--color-accent-hi); }
   .object-row.hidden-row { opacity: 0.45; }
+  .object-row.is-child { opacity: 0.95; }
+
+  .chevron-btn {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    border: none;
+    background: transparent;
+    color: var(--color-subtext);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 2px;
+    padding: 0;
+    transition: transform 0.12s;
+  }
+  .chevron-btn svg { width: 12px; height: 12px; }
+  .chevron-btn.open { transform: rotate(90deg); }
+  .chevron-btn:hover { color: var(--color-accent-hi); background: var(--color-bg-raised); }
+
+  .chevron-spacer {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+  }
 
   .eye-btn {
     width: 18px;
@@ -461,6 +683,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--color-text);
+    min-width: 0;
   }
 
   .object-count {
@@ -477,4 +700,17 @@
     flex-shrink: 0;
     opacity: 0.7;
   }
+
+  .rename-input {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    background: var(--color-bg-raised);
+    border: 1px solid var(--color-accent);
+    border-radius: 2px;
+    color: var(--color-text);
+    padding: 2px 6px;
+  }
+  .rename-input:focus { outline: none; }
 </style>

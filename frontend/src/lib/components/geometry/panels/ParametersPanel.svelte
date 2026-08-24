@@ -170,6 +170,70 @@
       updateField(field.key, '');
     }
   }
+
+  function renameSelected(newName: string) {
+    const doc = parsedDoc();
+    const sel = geometrySelection.selectedItem;
+    if (!doc || !sel) return;
+    const oldName = sel.name;
+    const trimmed = newName.trim();
+    if (!trimmed || trimmed === oldName || trimmed in doc) return;
+
+    const updated: Record<string, Record<string, unknown>> = {};
+    for (const [k, v] of Object.entries(doc)) {
+      const key = k === oldName ? trimmed : k;
+      const block = { ...v };
+      if (typeof block.template === 'string' && block.template === oldName) {
+        block.template = trimmed;
+      }
+      if (Array.isArray(block.children)) {
+        block.children = (block.children as string[]).map((c) => (c === oldName ? trimmed : c));
+      }
+      if (typeof block.a === 'string' && block.a === oldName) block.a = trimmed;
+      if (typeof block.b === 'string' && block.b === oldName) block.b = trimmed;
+      updated[key] = block;
+    }
+    const newText = dump(updated, { indent: 2, lineWidth: -1 });
+    setGeometryText(newText, { immediate: true });
+    geometrySelection.selectedItem = { kind: sel.kind, name: trimmed };
+    if (sel.kind === 'placement') {
+      geometrySelection.selectedNames = geometrySelection.selectedNames.map((n) =>
+        n === oldName ? trimmed : n,
+      );
+    }
+  }
+
+  let editingName = $state(false);
+  let nameDraft = $state('');
+
+  function startNameEdit() {
+    const sel = geometrySelection.selectedItem;
+    if (!sel) return;
+    editingName = true;
+    nameDraft = sel.name;
+  }
+
+  function commitNameEdit() {
+    if (editingName) {
+      renameSelected(nameDraft);
+      editingName = false;
+    }
+  }
+
+  function onNameKey(e: KeyboardEvent) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commitNameEdit();
+    } else if (e.key === 'Escape') {
+      editingName = false;
+    }
+  }
+
+  $effect(() => {
+    geometrySelection.selectedItem;
+    editingName = false;
+  });
+
 </script>
 
 <div class="panel">
@@ -182,7 +246,21 @@
       <p class="empty-hint">"{geometrySelection.selectedItem.name}" not found in the current YAML.</p>
     {:else}
       <div class="selected-header">
-        <span class="selected-name">{geometrySelection.selectedItem.name}</span>
+        {#if editingName}
+          <input
+            class="name-edit-input"
+            bind:value={nameDraft}
+            onkeydown={onNameKey}
+            onblur={commitNameEdit}
+            autofocus
+          />
+        {:else}
+          <span
+            class="selected-name"
+            ondblclick={startNameEdit}
+            title="Double-click to rename"
+          >{geometrySelection.selectedItem.name}</span>
+        {/if}
         {#if componentType()}
           <span class="selected-type">{componentType()}</span>
         {/if}
@@ -478,5 +556,23 @@
     font-size: 11px;
     color: var(--color-subtext);
     opacity: 0.7;
+  }
+
+  .name-edit-input {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    background: var(--color-bg-raised);
+    border: 1px solid var(--color-accent);
+    border-radius: 2px;
+    color: var(--color-text);
+    padding: 2px 6px;
+    flex: 1;
+    min-width: 0;
+  }
+  .name-edit-input:focus { outline: none; }
+
+  .selected-name {
+    cursor: text;
   }
 </style>
