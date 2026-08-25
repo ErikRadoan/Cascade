@@ -26,6 +26,10 @@ class Context:
     axial_top_id: str | None = field(default=None)
     lattice_instances: list[LatticeInstance] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Bugfix: name -> Step-0 surface id for every Tier-1 primitive, so a
+    # primitive used as a boolean composite operand can be referenced
+    # instead of re-expanded (see _expand_shape_at_origin).
+    primitive_ids: dict[str, str] = field(default_factory=dict)
     _counter: int = field(default=0, init=False, repr=False)
 
     def fresh_id(self, prefix: str='s') -> str:
@@ -110,6 +114,13 @@ def _expand_shape_at_origin(schema: BaseComponentSchema, name: str, schemas: dic
         raise TypeError(f"'{name}' is a FuelPin, which cannot be used as a boolean composite operand.")
     if isinstance(schema, BoxSchema):
         (surfaces, label_map) = _expand_box_surfaces(schema, ctx)
+        # Bugfix: a Box used as a Subtraction/Intersection/Union operand is an
+        # interior/composite surface, never the geometry's outer boundary.
+        # _expand_box_surfaces() stamps schema.boundary_type (default
+        # REFLECTIVE) onto all six planes; left unforced, an operand Box's
+        # boundary condition leaks into OpenMC's surface model and reflects
+        # particles off what should be a transparent cavity wall.
+        surfaces = [Surface(id=s.id, type_=s.type_, params=s.params, boundary_type=BoundaryType.NONE) for s in surfaces]
         ox = float(getattr(schema, 'x', 0.0) or 0.0)
         oy = float(getattr(schema, 'y', 0.0) or 0.0)
         oz = float(getattr(schema, 'z', 0.0) or 0.0)
@@ -120,6 +131,16 @@ def _expand_shape_at_origin(schema: BaseComponentSchema, name: str, schemas: dic
         region: Region = Intersection([Outside(label_map['xlo']), Inside(label_map['xhi']), Outside(label_map['ylo']), Inside(label_map['yhi']), Outside(label_map['bot']), Inside(label_map['top'])])
         return (surfaces, region)
     if primitives.is_primitive(schema):
+        # Bugfix: this schema was already expanded once in expand()'s Step 0
+        # (every Tier-1 primitive is expanded unconditionally, regardless of
+        # whether it's placed standalone or only used as an operand here).
+        # Re-expanding it produced a second, orphaned Surface with a fresh
+        # id that no Cell ever referenced — the "2 extra cell objects" bug.
+        # Reuse the Step-0 surface id via ctx.primitive_ids instead of
+        # minting a duplicate.
+        existing_id = ctx.primitive_ids.get(name)
+        if existing_id is not None:
+            return ([], Inside(existing_id))
         (surfaces, region) = primitives.expand_primitive(ctx, schema, name)
         bt = getattr(schema, 'boundary_type', None)
         if bt is not None and bt != BoundaryType.NONE:
@@ -271,7 +292,12 @@ def _place_boolean_placement(schema: BooleanPlacementSchema, name: str, placemen
 def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, float] | None=None, geom_name: str='cascade_geometry') -> CascadeGeometry:
     ctx = Context(param_values=param_values or {})
     all_objects: list = []
-    primitive_name_to_id: dict[str, str] = {}
+    # Bugfix: this dict is now the same object as ctx.primitive_ids so that
+    # _expand_shape_at_origin() (called later, while resolving boolean
+    # composite operands) can look up a primitive's Step-0 surface id
+    # instead of re-expanding the primitive and creating a duplicate,
+    # unreferenced Surface.
+    primitive_name_to_id: dict[str, str] = ctx.primitive_ids
     cell_schemas: dict[str, CellSchema] = {}
     legacy_schemas: dict[str, BaseComponentSchema] = {}
     for (name, schema) in schemas.items():
