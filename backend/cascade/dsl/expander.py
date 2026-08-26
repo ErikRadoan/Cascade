@@ -364,6 +364,14 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
                 if getattr(tpl, 'role', 'universe') == 'universe':
                     continue
                 (surfaces, labels) = _expand_box_surfaces(tpl, ctx)
+                # Bugfix: a role="solid" Box placed standalone (not a
+                # boolean-composite operand, not the universe box) is still
+                # interior geometry, never the geometry's outer boundary.
+                # Same leak already fixed in _expand_shape_at_origin() for
+                # boolean-composite operands — force NONE here too so this
+                # schema's boundary_type (default REFLECTIVE) doesn't
+                # reflect particles off an interior wall in the OpenMC export.
+                surfaces = [Surface(id=s.id, type_=s.type_, params=s.params, boundary_type=BoundaryType.NONE) for s in surfaces]
                 pos = schema.position()
                 (translated, id_map) = _translate(surfaces, pos[0], pos[1], pos[2], ctx)
                 tlabels = {k: id_map[v] for (k, v) in labels.items()}
