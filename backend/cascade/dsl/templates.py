@@ -116,41 +116,69 @@ class _FuelPinTemplateExpander:
 
         if outermost_id:
             new_outermost = id_map.get(outermost_id)
-            if new_outermost:
-                outermost_list = getattr(ctx, "outermost_surfaces", None)
-                if isinstance(outermost_list, list):
-                    outermost_list.append(new_outermost)
+        else:
+            new_outermost = None
 
-        # Axial bounds: Box-shared preferred; local fallback for editor UX
+        # Axial bounds: bottom is Box-shared when available (so pins in the
+        # same box snap to a common floor); local fallback for editor UX
+        # when no Box exists yet. The TOP is always derived from the pin's
+        # own pellet_height — it must never be silently replaced by the
+        # Box's top surface, or pellet_height becomes meaningless the moment
+        # a Box is present (bug: growing/shrinking the Box used to grow or
+        # shrink every pin inside it, since both ends were the Box's own
+        # surfaces).
         has_axial = getattr(ctx, "has_axial_bounds", None)
         use_shared = callable(has_axial) and has_axial()
         extra_surfaces: list[Surface] = []
 
         if use_shared:
             bot_id = ctx.axial_bot_id  # type: ignore[attr-defined]
-            top_id = ctx.axial_top_id  # type: ignore[attr-defined]
         else:
-            # Local z-planes from pellet_height, shifted by placement z
+            # Local bottom plane from placement z.
             bot = Surface(
                 id=ctx.fresh_id("s"),
                 type_=SurfaceType.PLANE_Z,
                 params={"z": float(dz)},
                 boundary_type=BoundaryType.NONE,
             )
-            top = Surface(
-                id=ctx.fresh_id("s"),
-                type_=SurfaceType.PLANE_Z,
-                params={"z": float(dz) + float(schema.pellet_height)},
-                boundary_type=BoundaryType.NONE,
-            )
-            extra_surfaces.extend([bot, top])
-            bot_id, top_id = bot.id, top.id
+            extra_surfaces.append(bot)
+            bot_id = bot.id
             _warn(
                 ctx,
                 "FuelPin placed without a Box for shared axial bounds; "
                 "using each pin's pellet_height for local z-planes (preview only). "
                 "Add a Box via SinglePlacement for production geometry.",
             )
+
+        # Top is always synthesized from pellet_height, regardless of
+        # whether a Box is present, so pin height stays independent of Box
+        # height.
+        top = Surface(
+            id=ctx.fresh_id("s"),
+            type_=SurfaceType.PLANE_Z,
+            params={"z": float(dz) + float(schema.pellet_height)},
+            boundary_type=BoundaryType.NONE,
+        )
+        extra_surfaces.append(top)
+        top_id = top.id
+
+        if new_outermost:
+            outermost_list = getattr(ctx, "outermost_surfaces", None)
+            if isinstance(outermost_list, list):
+                outermost_list.append(new_outermost)
+            # Bugfix: the Box's fill/moderator cell used to exclude this
+            # radial surface as an infinite-height cylinder (see
+            # _build_fill_cell), which only ever looked right because pins
+            # used to be forced to the Box's full height. Track the pin's
+            # *actual* finite axial extent too, so the moderator can be
+            # excluded only where the pin's solid volume actually is —
+            # otherwise a pin shorter than its Box leaves an unfilled,
+            # pin-shaped void from the pin's top straight through the
+            # Box's ceiling.
+            extents_list = getattr(ctx, "outermost_pin_extents", None)
+            if isinstance(extents_list, list):
+                extents_list.append((new_outermost, bot_id, top_id))
+
 
         cells = _build_fuel_pin_cells(
             schema=            schema,

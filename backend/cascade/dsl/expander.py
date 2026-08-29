@@ -22,6 +22,12 @@ from .schema.single_placement import SinglePlacementSchema
 class Context:
     param_values: dict[str, float] = field(default_factory=dict)
     outermost_surfaces: list[str] = field(default_factory=list)
+    # Bugfix: (radial_id, bot_id, top_id) for every FuelPin placed inside a
+    # Box, so the Box's fill/moderator cell can exclude exactly each pin's
+    # *finite* solid volume — not an infinite-height cylinder. Kept alongside
+    # outermost_surfaces (still populated, in case anything else reads it)
+    # rather than replacing it.
+    outermost_pin_extents: list[tuple[str, str, str]] = field(default_factory=list)
     axial_bot_id: str | None = field(default=None)
     axial_top_id: str | None = field(default=None)
     lattice_instances: list[LatticeInstance] = field(default_factory=list)
@@ -105,7 +111,32 @@ def _place_box(schema: BoxSchema, position: tuple[float, float, float], ctx: Con
 
 def _build_fill_cell(schema: BoxSchema, translated_labels: dict[str, str], ctx: Context, cell_name: str) -> Cell:
     box_interior = [Outside(translated_labels['xlo']), Inside(translated_labels['xhi']), Outside(translated_labels['ylo']), Inside(translated_labels['yhi']), Outside(translated_labels['bot']), Inside(translated_labels['top'])]
-    outer_exclusions = [Outside(sid) for sid in ctx.outermost_surfaces]
+    # Bugfix: this used to exclude Outside(radial_cylinder) alone, which is
+    # an infinite-height cylindrical cutout — it has no idea where the pin's
+    # own top/bottom are. As long as every pin spanned the box's *full*
+    # height (the old pellet_height bug), that was invisible: the pin's own
+    # material always filled the excluded column anyway. Now that a pin can
+    # be shorter than its Box, the space above a short pin was neither
+    # claimed by the pin (too short) nor refilled by the moderator (still
+    # excluded there, since the cylinder has no cap) — a void the exact
+    # shape of the pin, open straight through the Box's top face.
+    # Fix: exclude each pin's *finite* solid volume via De Morgan's law.
+    # NOT(Inside(cyl) AND Outside(bot) AND Inside(top))
+    #   = Outside(cyl) OR Inside(bot) OR Outside(top)
+    # i.e. "not radially inside the pin, OR below the pin's floor, OR above
+    # the pin's own ceiling" — so the moderator correctly fills back in
+    # above (and below) a pin shorter than its Box.
+    outer_exclusions: list[Region] = []
+    extents = getattr(ctx, 'outermost_pin_extents', None) or []
+    covered_radial_ids = {radial_id for (radial_id, _bot, _top) in extents}
+    for radial_id, bot_id, top_id in extents:
+        outer_exclusions.append(Union([Outside(radial_id), Inside(bot_id), Outside(top_id)]))
+    # Fallback for any radial id that (for whatever reason) never got a
+    # tracked extent — keeps prior infinite-cylinder behavior rather than
+    # silently dropping the exclusion.
+    for sid in ctx.outermost_surfaces:
+        if sid not in covered_radial_ids:
+            outer_exclusions.append(Outside(sid))
     return Cell(id=ctx.fresh_id('c'), region=Intersection(box_interior + outer_exclusions), material_id=schema.material, name=cell_name)
 _BOOLEAN_COMPOSITE_TYPES = (UnionSchema, SubtractionSchema, IntersectionSchema)
 

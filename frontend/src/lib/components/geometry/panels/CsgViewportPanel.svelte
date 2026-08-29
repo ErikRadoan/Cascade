@@ -87,10 +87,26 @@
         return { op: 'and', items };
       }
       case 'or': {
+        // Bugfix: unlike 'and' (where dropping a non-plane item only
+        // *widens* the region — safe, since pin-vs-fill priority in the
+        // shader still resolves visibility), dropping a disjunct from an
+        // 'or' *narrows* it. The per-pin fill exclusion is now
+        // Outside(cyl) OR Inside(bot) OR Outside(top) (De Morgan complement
+        // of the pin's finite solid volume). Stripping the non-plane
+        // Outside(cyl) term here used to leave `Inside(bot) OR
+        // Outside(top)` behind — "outside the pin's axial band" with no
+        // radial scoping at all — which, ANDed into the fill cell, wiped
+        // out the moderator across the *entire* box footprint at that
+        // height (not just at each pin), for every pin in the lattice.
+        // An 'or' is only safe to keep if *every* branch survives; if any
+        // branch is non-plane, drop the whole thing (falls back to the
+        // pre-instancing behavior of just not scoping this exclusion at
+        // all under lattices, same as before De Morgan).
         const items: RegionNode[] = [];
         for (const it of node.items) {
           const k = planeOnlyRegion(it, surfaceById);
-          if (k) items.push(k);
+          if (!k) return null;
+          items.push(k);
         }
         if (items.length === 0) return null;
         if (items.length === 1) return items[0];
@@ -301,6 +317,20 @@
   let prototypeCount = $state(0);
   let materialLegend = $state<{ id: string; color: string }[]>([]);
   let usingInstancing = $state(false);
+
+  // --- Bug-repro debug logging (back-wall disappearance investigation) ---
+  // Toggle with the "Debug walls" button in the panel footer. When on,
+  // every time the drag ends we print:
+  //   <cam position and rotation>: world-space camera pos + theta/phi/dist
+  //     + the forward/right/up basis actually sent to the shader
+  //   <walls of a box displayed>: for every box-shaped (isFill) instance,
+  //     which of its 6 axis-aligned faces geometrically face the camera
+  //     (expected to be visible) vs. a readback of the framebuffer at a
+  //     grid of sample points, so a mismatch (face expected visible but
+  //     the sampled pixel is background color) points straight at the bug.
+  let debugWalls = $state(false);
+  interface DebugBoxEntry { name: string; aabb: AxisBounds; color: string; }
+  let lastDebugBoxes: DebugBoxEntry[] = [];
 
   const projectText = $derived(activeProject().text);
   let fetchHandle: ReturnType<typeof setTimeout> | undefined;
@@ -515,15 +545,52 @@
         else if (op == 1) {
           // Outside = complement of inside interval, clipped to ray domain
           vec2 inn = surfaceInterval(operand, ro, rd);
-          // Complement in t: (-inf, tEnter) U (tExit, +inf) — take the nearer forward piece
-          // Represent as single interval is lossy; use two-slot approximation:
-          // For solid modeling CSG with bounded cells, complement of a bounded solid
-          // is handled via De Morgan at higher tree levels. For a leaf Outside(S),
-          // interval is complement of surfaceInterval.
-          if (inn.x > inn.y) { stack[sp++] = vec2(NEG_INF, INF); }
-          else {
-            // Prefer the front complement segment that can be hit from outside
-            stack[sp++] = vec2(inn.y, INF); // outside beyond exit (common for cladding Outside(inner))
+          int st = uSurfType[operand];
+          if (st == 0 || st == 1 || st == 2) {
+            // Planes: surfaceInterval always returns an exact unbounded
+            // half-line, either (-INF, th) or (th, INF), depending on the
+            // sign of the ray direction along that axis. The complement is
+            // therefore *exactly* the other half-line — swap, don't guess.
+            // (Previously this always assumed the (-INF, th) case and
+            // returned (th, INF), which is wrong whenever the ray travels
+            // in the negative direction along that axis — e.g. looking at
+            // a box wall from the far side along -x/-y/-z. That produced a
+            // bogus (INF, INF) token which usually got masked by the
+            // tHit-fallback-to-tStart safety net below, but wasn't always:
+            // fix it properly instead of relying on the net.)
+            if (inn.x <= NEG_INF + 1.0) { stack[sp++] = vec2(inn.y, INF); }
+            else if (inn.y >= INF - 1.0) { stack[sp++] = vec2(NEG_INF, inn.x); }
+            else { stack[sp++] = vec2(NEG_INF, INF); } // total miss → outside everywhere
+          } else if (inn.x > inn.y) {
+            stack[sp++] = vec2(NEG_INF, INF);
+          } else {
+            // Bounded shapes (cylinders/spheres): true complement is two
+            // pieces, (-INF, tEnter) U (tExit, +INF), which can't be
+            // represented as one interval. This used to guess "beyond
+            // exit" — reasoning that within one object's own concentric
+            // layers (e.g. Outside(gap_outer) AND Inside(clad_outer) for a
+            // cladding shell) the ray would already be past the inner
+            // surface by the time this token is seeded.
+            //
+            // That's backwards for the overwhelmingly common case: a fresh
+            // camera ray approaching the pin from outside for the first
+            // time. For such a ray, order along t is cladEntry < gapEntry
+            // < pelletEntry < pelletExit < gapExit < cladExit — so "beyond
+            // gap's exit" AND'ed with "inside clad" seeds the CLAD leaf at
+            // t=gapExit (deep on the far side of the shell) instead of the
+            // true near surface at cladEntry. Meanwhile pellet's own token
+            // is a plain Inside() with an exact seed at t=pelletEntry — and
+            // since pelletEntry < gapExit, pellet's (correct, but
+            // physically farther) hit comes out *nearer* than clad's/gap's
+            // (bogus, further) one, so the pellet wins the nearest-hit
+            // race and renders in front of its own cladding. (Symptom:
+            // fuel visible straight through the side of a pin, cladding
+            // only showing correctly on straight-down rays where this
+            // token never gets exercised.)
+            // Contribute no information instead of a wrong guess — the
+            // exact SDF march below still finds the true surface either
+            // way, just without the head start.
+            stack[sp++] = vec2(NEG_INF, INF);
           }
         }
         else if (op == 2) { // AND = intersection of intervals
@@ -537,9 +604,20 @@
           else stack[sp++] = vec2(min(A.x, B.x), max(A.y, B.y));
         }
         else if (op == 4) {
-          vec2 A = stack[sp-1];
-          if (A.x > A.y) stack[sp-1] = vec2(NEG_INF, INF);
-          else stack[sp-1] = vec2(A.y, INF);
+          // NOT of a compound sub-region (e.g. Subtraction(a, b) compiles to
+          // "a AND NOT(b)", where b's own tokens already form a proper
+          // bounded interval — a whole box, not just one plane). Same bug
+          // as the bounded-shape Outside() case above, just one level up:
+          // guessing "beyond b's exit" is wrong for the common case of a
+          // fresh ray hitting the outer shape (a) before ever reaching the
+          // subtracted region (b) — e.g. looking into a box with a notch
+          // cut partway into it ("incision"). The ray reaches the notch's
+          // near wall at NOT(b)'s true near piece (-INF, bEntry), but this
+          // used to seed at (bExit, INF) instead — deep on the far side of
+          // the subtracted volume — skipping the incision's visible wall
+          // entirely and reporting whatever's further along (or nothing).
+          // Contribute no information instead of a wrong guess.
+          stack[sp-1] = vec2(NEG_INF, INF);
         }
       }
       if (sp <= 0) return INF;
@@ -629,21 +707,28 @@
       }
       // Pin-vs-fill priority:
       // - Strictly nearer hit always wins.
-      // - Near-ties: prefer pin only when looking steeply down (top-face map
-      //   view). Side/oblique views (even with mild downward tilt) prefer fill
-      //   so vertical box walls stay solid instead of showing pin material.
+      // - Near-ties: pin wins. "fill" is a coarse stand-in for "everywhere
+      //   a pin doesn't exist" (lattices skip real pin-hole carving for
+      //   token-budget reasons — see planeOnlyRegion), so wherever there's
+      //   genuine ambiguity between the two, the pin's own exact geometry
+      //   is the one that should be trusted.
+      //   (This used to special-case "prefer fill unless looking steeply
+      //   down", to stop the shared top/bot plane from making every
+      //   top-down ray show fill instead of pin tops. But the same rule
+      //   was *also* hiding real cladding/gap on any pin at or beyond the
+      //   Box's edge — for a lattice wider than its Box, that's most of
+      //   the boundary row/column: the pin's clad surface sits at nearly
+      //   the same depth as the Box's own wall from most oblique angles,
+      //   so the "prefer fill" branch was firing there too, painting over
+      //   real pin material with the moderator's solid-box fill. Pin
+      //   winning unconditionally on ties fixes the top-down case *and*
+      //   this one, since it was never really about camera angle — it's
+      //   "trust the exact geometry over the approximation" either way.)
       if (pinProto >= 0 && fillProto >= 0) {
-        if (bestPin < bestFill - 0.002) {
-          hitProto = pinProto; hitOff = pinOff; return bestPin;
-        }
         if (bestFill < bestPin - 0.002) {
           hitProto = fillProto; hitOff = fillOff; return bestFill;
         }
-        // Near-tie — require steep downward look (rd.z ≈ -1)
-        if (rd.z < -0.65) {
-          hitProto = pinProto; hitOff = pinOff; return bestPin;
-        }
-        hitProto = fillProto; hitOff = fillOff; return bestFill;
+        hitProto = pinProto; hitOff = pinOff; return bestPin;
       }
       if (fillProto >= 0) {
         hitProto = fillProto; hitOff = fillOff; return bestFill;
@@ -737,6 +822,78 @@
     u.uCamUp.value.copy(_up);
   }
 
+  // Prints:
+  //   <cam position and rotation> — world-space cam pos, theta/phi/distance,
+  //     and the forward/right/up basis actually uploaded to the shader
+  //   <walls of a box displayed> — per box, which of the 6 axis-aligned
+  //     faces geometrically face the camera ("expected") vs. what a probe
+  //     grid of framebuffer pixels actually shows (background color vs.
+  //     that box's material color). A face marked expected=true whose
+  //     nearest probe pixel reads as background is the disappearing-wall
+  //     symptom caught in the act — paste this log verbatim.
+  function logCsgDebug() {
+    if (!renderer || !canvasEl) return;
+    const camPos = _camPos.clone();
+    console.log(
+      `<cam position and rotation> pos=(${camPos.x.toFixed(2)}, ${camPos.y.toFixed(2)}, ${camPos.z.toFixed(2)}) ` +
+      `theta=${THREE.MathUtils.radToDeg(cameraTheta).toFixed(1)}deg phi=${THREE.MathUtils.radToDeg(cameraPhi).toFixed(1)}deg ` +
+      `dist=${cameraDistance.toFixed(2)} target=(${cameraTarget.x.toFixed(2)}, ${cameraTarget.y.toFixed(2)}, ${cameraTarget.z.toFixed(2)}) ` +
+      `forward=(${_forward.x.toFixed(3)}, ${_forward.y.toFixed(3)}, ${_forward.z.toFixed(3)}) ` +
+      `right=(${_right.x.toFixed(3)}, ${_right.y.toFixed(3)}, ${_right.z.toFixed(3)}) ` +
+      `up=(${_up.x.toFixed(3)}, ${_up.y.toFixed(3)}, ${_up.z.toFixed(3)})`
+    );
+
+    const w = canvasEl.width, h = canvasEl.height;
+    const gl = renderer.getContext();
+    const px = new Uint8Array(4);
+    const bgHex = (rx: number, ry: number) => {
+      // WebGL readPixels origin is bottom-left.
+      gl.readPixels(rx, h - 1 - ry, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+      return `#${px[0].toString(16).padStart(2, '0')}${px[1].toString(16).padStart(2, '0')}${px[2].toString(16).padStart(2, '0')}`;
+    };
+    const BG = '#0f1729'; // matches vec3(0.059,0.090,0.165) background in the shader
+
+    const faces: { axis: 'x' | 'y' | 'z'; sign: 1 | -1; label: string }[] = [
+      { axis: 'x', sign: 1, label: '+X' }, { axis: 'x', sign: -1, label: '-X' },
+      { axis: 'y', sign: 1, label: '+Y' }, { axis: 'y', sign: -1, label: '-Y' },
+      { axis: 'z', sign: 1, label: '+Z' }, { axis: 'z', sign: -1, label: '-Z' },
+    ];
+
+    console.log('<walls of a box displayed>');
+    for (const box of lastDebugBoxes) {
+      const cx = (box.aabb.xMin + box.aabb.xMax) / 2;
+      const cy = (box.aabb.yMin + box.aabb.yMax) / 2;
+      const cz = (box.aabb.zMin + box.aabb.zMax) / 2;
+      const toCam = new THREE.Vector3(camPos.x - cx, camPos.y - cy, camPos.z - cz).normalize();
+      const rows: string[] = [];
+      for (const f of faces) {
+        const n = new THREE.Vector3(f.axis === 'x' ? f.sign : 0, f.axis === 'y' ? f.sign : 0, f.axis === 'z' ? f.sign : 0);
+        const expected = n.dot(toCam) > 0.05; // face normal points roughly toward camera
+        if (!expected) continue;
+        // Sample near the center of that face, projected into screen space.
+        const fx = f.axis === 'x' ? (f.sign > 0 ? box.aabb.xMax : box.aabb.xMin) : cx;
+        const fy = f.axis === 'y' ? (f.sign > 0 ? box.aabb.yMax : box.aabb.yMin) : cy;
+        const fz = f.axis === 'z' ? (f.sign > 0 ? box.aabb.zMax : box.aabb.zMin) : cz;
+        const world = new THREE.Vector3(fx, fy, fz);
+        const toFace = world.clone().sub(camPos);
+        const depth = toFace.dot(_forward);
+        const ndcX = depth > 1e-6 ? toFace.dot(_right) / (depth * u_tanHalfFov() * aspectRatio()) : NaN;
+        const ndcY = depth > 1e-6 ? toFace.dot(_up) / (depth * u_tanHalfFov()) : NaN;
+        let sampled = 'off-screen';
+        if (Number.isFinite(ndcX) && Number.isFinite(ndcY) && Math.abs(ndcX) < 1 && Math.abs(ndcY) < 1) {
+          const px_ = Math.round(((ndcX + 1) / 2) * (w - 1));
+          const py_ = Math.round(((1 - ndcY) / 2) * (h - 1));
+          sampled = bgHex(px_, py_);
+        }
+        const isBackground = sampled.toLowerCase() === BG;
+        rows.push(`${f.label}: expected=visible sampled=${sampled}${isBackground ? '  <-- MISSING (reads as background)' : ''}`);
+      }
+      console.log(`  box "${box.name}" (color ${box.color}): ${rows.length ? '\n    ' + rows.join('\n    ') : '(no faces geometrically facing camera)'}`);
+    }
+  }
+  function u_tanHalfFov() { return shaderMaterial?.uniforms.uTanHalfFov.value ?? Math.tan(THREE.MathUtils.degToRad(25)); }
+  function aspectRatio() { return shaderMaterial?.uniforms.uAspect.value ?? 1; }
+
   function beginInteraction() {
     if (!renderer) return;
     renderer.setPixelRatio(INTERACT_DPR);
@@ -811,7 +968,7 @@
     for (let i = surfacesUsed.length; i < MAX_SURFACES; i++) { surfType[i] = -1; surfParams[i].set(0, 0, 0, 0); }
     u.uSurfCount.value = surfacesUsed.length;
 
-    interface ProtoEntry { region: RegionNode; material_id: string; aabb: AxisBounds; isFill?: boolean; }
+    interface ProtoEntry { region: RegionNode; material_id: string; aabb: AxisBounds; isFill?: boolean; name?: string; }
     const protos: ProtoEntry[] = [];
     const instances: { dx: number; dy: number; dz: number; protoIdx: number }[] = [];
     const lis = csg.lattice_instances ?? [];
@@ -877,6 +1034,7 @@
           material_id: cell.material_id,
           aabb: cellAABB(region, surfaceById, sceneBounds),
           isFill: true,
+          name: cell.name ?? undefined,
         });
         if (instances.length < MAX_INSTANCES) instances.push({ dx: 0, dy: 0, dz: 0, protoIdx });
       }
@@ -886,10 +1044,26 @@
         if (key && !isVisible(key)) continue;
         if (protos.length >= MAX_PROTOTYPES) break;
         const protoIdx = protos.length;
-        protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, surfaceById, sceneBounds), isFill: false });
+        protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, surfaceById, sceneBounds), isFill: false, name: cell.name ?? undefined });
         if (instances.length < MAX_INSTANCES) instances.push({ dx: 0, dy: 0, dz: 0, protoIdx });
       }
     }
+
+    // Snapshot every named proto's AABB + resolved color for the wall-debug
+    // logger (see debugWalls below). Instance offsets are folded in so this
+    // is world-space, matching what the shader actually renders.
+    lastDebugBoxes = protos
+      .map((p, pi) => {
+        const inst = instances.find((ins) => ins.protoIdx === pi);
+        const offset = inst ? { dx: inst.dx, dy: inst.dy, dz: inst.dz } : { dx: 0, dy: 0, dz: 0 };
+        const [r, g, b] = resolveMaterialColor(p.material_id);
+        return {
+          name: p.name ?? `${p.isFill ? 'fill' : 'cell'}#${pi}`,
+          color: `#${Math.round(r * 255).toString(16).padStart(2, '0')}${Math.round(g * 255).toString(16).padStart(2, '0')}${Math.round(b * 255).toString(16).padStart(2, '0')}`,
+          aabb: translateAABB(p.aabb, offset.dx, offset.dy, offset.dz),
+        };
+      })
+      .filter((b) => Number.isFinite(b.aabb.xMin) && Number.isFinite(b.aabb.xMax));
 
     truncatedProtos = protos.length >= MAX_PROTOTYPES;
     truncatedInstances = instances.length >= MAX_INSTANCES;
@@ -1002,7 +1176,15 @@
     cameraPhi = Math.max(0.05, Math.min(Math.PI - 0.05, cameraPhi - dy * 0.005));
     beginInteraction(); requestRender();
   }
-  function onPointerUp(e: PointerEvent) { isDragging = false; canvasEl.releasePointerCapture(e.pointerId); }
+  function onPointerUp(e: PointerEvent) {
+    isDragging = false;
+    canvasEl.releasePointerCapture(e.pointerId);
+    if (debugWalls) {
+      // Wait one rAF so the just-finished drag's frame is actually in the
+      // (idle-DPR) framebuffer before we read it back.
+      requestAnimationFrame(() => { render(); logCsgDebug(); });
+    }
+  }
   function onWheel(e: WheelEvent) {
     e.preventDefault();
     cameraDistance = Math.max(0.5, Math.min(500, cameraDistance * (1 + e.deltaY * 0.001)));
@@ -1051,6 +1233,12 @@
   <canvas bind:this={canvasEl} onpointerdown={onPointerDown} onpointermove={onPointerMove} onpointerup={onPointerUp} onwheel={onWheel}></canvas>
   <div class="overlay">
     <button class="viewport-btn" onclick={resetCamera} title="Reset camera">Reset view</button>
+    <button
+      class="viewport-btn"
+      class:active={debugWalls}
+      onclick={() => { debugWalls = !debugWalls; if (debugWalls) logCsgDebug(); }}
+      title="Log camera pose + expected-vs-rendered box walls to the console after every drag"
+    >Debug walls{debugWalls ? ' ●' : ''}</button>
     {#if !loading && !loadError}
       <span class="count-badge">
         {#if usingInstancing}{prototypeCount} proto · {instanceCount} inst{:else}{instanceCount} cell{instanceCount === 1 ? '' : 's'}{/if}
@@ -1074,6 +1262,7 @@
   .overlay { position: absolute; bottom: 12px; left: 12px; display: flex; align-items: center; gap: 8px; }
   .viewport-btn { background: var(--color-bg-panel); border: 1px solid var(--color-border); color: var(--color-subtext); font-size: 11px; padding: 5px 9px; border-radius: 6px; cursor: pointer; }
   .viewport-btn:hover { color: var(--color-text); border-color: var(--color-accent); }
+  .viewport-btn.active { color: var(--color-accent-hi); border-color: var(--color-accent); }
   .count-badge { font-size: 10px; font-family: var(--font-mono); color: var(--color-subtext); }
   .legend { position: absolute; top: 12px; left: 12px; display: flex; flex-direction: column; gap: 3px; background: var(--color-bg-panel); border: 1px solid var(--color-border); border-radius: 6px; padding: 6px 8px; max-height: 40%; overflow-y: auto; }
   .legend-item { display: flex; align-items: center; gap: 5px; font-size: 10px; font-family: var(--font-mono); color: var(--color-subtext); }
