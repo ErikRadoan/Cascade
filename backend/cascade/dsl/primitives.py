@@ -12,7 +12,7 @@ This module owns:
     - PRIMITIVE_REGISTRY, mapping schema class -> PrimitiveExpander instance
       (plan §3.4)
     - the concrete expander for every schema in schema/plane.py,
-      schema/sphere.py, schema/cylinder.py
+      schema/sphere.py, schema/cylinder.py, schema/cone.py, schema/torus.py
 
 Primitives self-register at import time (see PRIMITIVE_REGISTRY below)
 rather than waiting on a later registry-wiring pass — this file already
@@ -32,9 +32,11 @@ from typing import Protocol, runtime_checkable
 
 from ..domain.geometry import Inside, Region, Surface, SurfaceType
 from .schema.base import BaseComponentSchema
+from .schema.cone import ConeZSchema
 from .schema.cylinder import CylinderXSchema, CylinderYSchema, CylinderZSchema
 from .schema.plane import PlaneXSchema, PlaneYSchema, PlaneZSchema
 from .schema.sphere import SphereSchema
+from .schema.torus import TorusSchema
 
 
 @runtime_checkable
@@ -65,6 +67,10 @@ _TRANSLATE_PARAMS: dict[SurfaceType, dict[str, str]] = {
     SurfaceType.CYLINDER_X: {"y": "dy", "y0": "dy", "z": "dz", "z0": "dz"},
     SurfaceType.CYLINDER_Y: {"x": "dx", "x0": "dx", "z": "dz", "z0": "dz"},
     SurfaceType.SPHERE:     {"x": "dx", "x0": "dx", "y": "dy", "y0": "dy",
+                             "z": "dz", "z0": "dz"},
+    SurfaceType.CONE_Z:     {"x": "dx", "x0": "dx", "y": "dy", "y0": "dy",
+                             "z": "dz", "z0": "dz"},
+    SurfaceType.TORUS:      {"x": "dx", "x0": "dx", "y": "dy", "y0": "dy",
                              "z": "dz", "z0": "dz"},
 }
 
@@ -175,6 +181,37 @@ class _CylinderZExpander:
         return [s], Inside(s.id)
 
 
+class _ConeZExpander:
+    def expand_primitive(self, ctx: ExpansionContext, schema: ConeZSchema, name: str):
+        s = Surface(
+            id=ctx.fresh_id("s"), type_=SurfaceType.CONE_Z,
+            params={
+                "x0": schema.x, "y0": schema.y, "z0": schema.z,
+                # OpenMC's r2 is the SQUARE of the slope — squared exactly
+                # once, here, at the schema boundary (see cone.py docstring).
+                "r2": schema.radius_slope ** 2,
+            },
+            boundary_type=schema.boundary_type,
+        )
+        return [s], Inside(s.id)
+
+
+class _TorusExpander:
+    def expand_primitive(self, ctx: ExpansionContext, schema: TorusSchema, name: str):
+        s = Surface(
+            id=ctx.fresh_id("s"), type_=SurfaceType.TORUS,
+            params={
+                "x0": schema.x, "y0": schema.y, "z0": schema.z,
+                "a": schema.ring_radius,
+                "b": schema.tube_radius,
+                "c": schema.tube_height if schema.tube_height is not None
+                     else schema.tube_radius,
+            },
+            boundary_type=schema.boundary_type,
+        )
+        return [s], Inside(s.id)
+
+
 # ---------------------------------------------------------------------------
 # Registry — schema class -> expander instance (plan §3.4)
 # ---------------------------------------------------------------------------
@@ -187,6 +224,8 @@ PRIMITIVE_REGISTRY: dict[type[BaseComponentSchema], PrimitiveExpander] = {
     CylinderXSchema: _CylinderXExpander(),
     CylinderYSchema: _CylinderYExpander(),
     CylinderZSchema: _CylinderZExpander(),
+    ConeZSchema:     _ConeZExpander(),
+    TorusSchema:     _TorusExpander(),
 }
 
 

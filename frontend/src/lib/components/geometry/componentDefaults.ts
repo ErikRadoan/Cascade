@@ -32,7 +32,40 @@ export const TEMPLATE_DEFAULTS: Record<string, Record<string, unknown>> = {
     y: 0.0,
     z: 0.0,
     boundary_type: 'none',
+    material: 'H2O',
   },
+  CylinderZ: {
+    type: 'CylinderZ',
+    radius: 0.5,
+    x: 0.0,
+    y: 0.0,
+    boundary_type: 'none',
+    material: 'H2O',
+  },
+  ConeZ: {
+    type: 'ConeZ',
+    radius_slope: 0.5,
+    x: 0.0,
+    y: 0.0,
+    z: 0.0,
+    boundary_type: 'none',
+    material: 'H2O',
+  },
+  Torus: {
+    type: 'Torus',
+    ring_radius: 10.0,
+    tube_radius: 2.0,
+    x: 0.0,
+    y: 0.0,
+    z: 0.0,
+    boundary_type: 'none',
+    material: 'H2O',
+  },
+  // CylinderX/CylinderY and PlaneX/Y/Z are intentionally not offered as
+  // one-click "New template" entries — they're helper/cutting surfaces
+  // (rarely a standalone "object" a user reaches for), same precedent as
+  // Plane already had. All remain fully usable via YAML/API and as
+  // boolean-composite operands or Tier-2 Cell region-expression terms.
   // Template-level Union/Subtraction/Intersection are no longer offered in
   // the Templates panel — use BooleanPlacement from the Objects panel
   // (multi-select → Union / Subtract / Intersect). Schema remains registered

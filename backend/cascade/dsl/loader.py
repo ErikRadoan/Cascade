@@ -14,12 +14,14 @@ from .schema.boolean import (
 )
 from .schema.box import BoxSchema
 from .schema.cell import CellSchema
+from .schema.cone import ConeZSchema
 from .schema.cylinder import CylinderXSchema, CylinderYSchema, CylinderZSchema
 from .schema.fuel_pin import FuelPinSchema
 from .schema.lattice import HexLatticeSchema, SquareLatticeSchema
 from .schema.plane import PlaneXSchema, PlaneYSchema, PlaneZSchema
 from .schema.single_placement import SinglePlacementSchema
 from .schema.sphere import SphereSchema
+from .schema.torus import TorusSchema
 
 
 SCHEMA_MAP: dict[str, type[BaseComponentSchema]] = {
@@ -44,6 +46,8 @@ SCHEMA_MAP: dict[str, type[BaseComponentSchema]] = {
     "CylinderX":       CylinderXSchema,
     "CylinderY":       CylinderYSchema,
     "CylinderZ":       CylinderZSchema,
+    "ConeZ":           ConeZSchema,
+    "Torus":           TorusSchema,
     # Tier-2 region-expression cells (geometry-restructuring-plan.md Phase B)
     "Cell":            CellSchema,
 }

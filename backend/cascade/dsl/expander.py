@@ -44,7 +44,7 @@ class Context:
 
     def has_axial_bounds(self) -> bool:
         return self.axial_bot_id is not None and self.axial_top_id is not None
-_TRANSLATE_PARAMS: dict[SurfaceType, dict[str, str]] = {SurfaceType.PLANE_X: {'x': 'dx', 'x0': 'dx'}, SurfaceType.PLANE_Y: {'y': 'dy', 'y0': 'dy'}, SurfaceType.PLANE_Z: {'z': 'dz', 'z0': 'dz'}, SurfaceType.CYLINDER_Z: {'x': 'dx', 'x0': 'dx', 'y': 'dy', 'y0': 'dy'}, SurfaceType.CYLINDER_X: {'y': 'dy', 'y0': 'dy', 'z': 'dz', 'z0': 'dz'}, SurfaceType.CYLINDER_Y: {'x': 'dx', 'x0': 'dx', 'z': 'dz', 'z0': 'dz'}, SurfaceType.SPHERE: {'x': 'dx', 'x0': 'dx', 'y': 'dy', 'y0': 'dy', 'z': 'dz', 'z0': 'dz'}}
+_TRANSLATE_PARAMS: dict[SurfaceType, dict[str, str]] = {SurfaceType.PLANE_X: {'x': 'dx', 'x0': 'dx'}, SurfaceType.PLANE_Y: {'y': 'dy', 'y0': 'dy'}, SurfaceType.PLANE_Z: {'z': 'dz', 'z0': 'dz'}, SurfaceType.CYLINDER_Z: {'x': 'dx', 'x0': 'dx', 'y': 'dy', 'y0': 'dy'}, SurfaceType.CYLINDER_X: {'y': 'dy', 'y0': 'dy', 'z': 'dz', 'z0': 'dz'}, SurfaceType.CYLINDER_Y: {'x': 'dx', 'x0': 'dx', 'z': 'dz', 'z0': 'dz'}, SurfaceType.SPHERE: {'x': 'dx', 'x0': 'dx', 'y': 'dy', 'y0': 'dy', 'z': 'dz', 'z0': 'dz'}, SurfaceType.CONE_Z: {'x': 'dx', 'x0': 'dx', 'y': 'dy', 'y0': 'dy', 'z': 'dz', 'z0': 'dz'}, SurfaceType.TORUS: {'x': 'dx', 'x0': 'dx', 'y': 'dy', 'y0': 'dy', 'z': 'dz', 'z0': 'dz'}}
 
 def _translate_params(type_: SurfaceType, params: dict, dx: float, dy: float, dz: float) -> dict:
     offsets = {'dx': dx, 'dy': dy, 'dz': dz}
@@ -162,17 +162,33 @@ def _expand_shape_at_origin(schema: BaseComponentSchema, name: str, schemas: dic
         region: Region = Intersection([Outside(label_map['xlo']), Inside(label_map['xhi']), Outside(label_map['ylo']), Inside(label_map['yhi']), Outside(label_map['bot']), Inside(label_map['top'])])
         return (surfaces, region)
     if primitives.is_primitive(schema):
-        # Bugfix: this schema was already expanded once in expand()'s Step 0
-        # (every Tier-1 primitive is expanded unconditionally, regardless of
-        # whether it's placed standalone or only used as an operand here).
-        # Re-expanding it produced a second, orphaned Surface with a fresh
-        # id that no Cell ever referenced — the "2 extra cell objects" bug.
-        # Reuse the Step-0 surface id via ctx.primitive_ids instead of
-        # minting a duplicate.
-        existing_id = ctx.primitive_ids.get(name)
-        if existing_id is not None:
-            return ([], Inside(existing_id))
+        # Bugfix (was): this schema was already expanded once in expand()'s
+        # Step 0 (every Tier-1 primitive is expanded unconditionally,
+        # regardless of whether it's placed standalone or only used as an
+        # operand here). To avoid a second, orphaned surface with no Cell
+        # referencing it, this used to reuse the Step-0 surface id via
+        # ctx.primitive_ids and return NO new surfaces at all.
+        #
+        # That "fix" broke composite placement instead: _place_boolean_composite
+        # translates whatever `local_surfaces` this function returns by the
+        # composite's placement offset — an empty list has nothing to
+        # translate, so the composite's region silently kept pointing at the
+        # primitive's original, untranslated Step-0 surface. A Subtraction of
+        # two Spheres placed via SinglePlacement at (10, 20, 30) stayed put
+        # at (0, 0, 0) with zero error or warning.
+        #
+        # Correct fix: always mint a fresh, independent copy here (matching
+        # exactly how the BoxSchema branch above always re-expands fresh
+        # surfaces for its own operand use) so the composite's own
+        # placement translate has something real to shift. The Step-0
+        # surface remains in geometry.surfaces at its own authored position
+        # for any Tier-2 Cell that references this primitive by name
+        # directly — a primitive can serve both roles at once, just as a
+        # Box template can be both a standalone placement and a boolean
+        # operand elsewhere, each with its own independent surfaces.
         (surfaces, region) = primitives.expand_primitive(ctx, schema, name)
+        # Same interior-vs-boundary rule as Box just above: an operand's
+        # boundary condition must never leak onto OpenMC's outer boundary.
         bt = getattr(schema, 'boundary_type', None)
         if bt is not None and bt != BoundaryType.NONE:
             surfaces = [Surface(id=s.id, type_=s.type_, params=s.params, boundary_type=BoundaryType.NONE) for s in surfaces]
@@ -254,6 +270,32 @@ def _expand_single_placement_objects(schema: SinglePlacementSchema, name: str, t
         region = Intersection([Outside(tlabels['xlo']), Inside(tlabels['xhi']), Outside(tlabels['ylo']), Inside(tlabels['yhi']), Outside(tlabels['bot']), Inside(tlabels['top'])])
         cell = Cell(id=ctx.fresh_id('c'), region=region, material_id=tpl.material, name=name)
         return translated_surfaces + [cell]
+    if primitives.is_primitive(tpl):
+        # A Tier-1 primitive (Sphere, CylinderX/Y/Z, ConeZ, Torus — Plane
+        # isn't included, see plane.py) can be placed directly as a solid
+        # object exactly like Box's role="solid", provided it has a
+        # `material` set. Mirrors Box just above: mint a fresh surface at
+        # this SinglePlacement's own position (schema.x/y/z is what the
+        # primitive would use standalone, but here the whole point is
+        # SinglePlacement chooses the position — reusing the Step-0
+        # standalone surface would hit the same "reuse breaks translation"
+        # bug fixed in _expand_shape_at_origin above), then wrap it in a
+        # Cell.
+        if getattr(tpl, 'material', None) is None:
+            raise ValueError(
+                f"SinglePlacement '{name}' places '{schema.template}' (a "
+                f"{type(tpl).__name__}), which has no `material` set. Add "
+                f"material: <id> to '{schema.template}' to place it as a "
+                f"solid object, or remove this SinglePlacement and "
+                f"reference '{schema.template}' from a Tier-2 Cell region "
+                f"expression instead."
+            )
+        (surfaces, region) = primitives.expand_primitive(ctx, tpl, schema.template)
+        (translated, id_map) = _translate(surfaces, pos[0], pos[1], pos[2], ctx)
+        translated_surfaces = [o for o in translated if isinstance(o, Surface)]
+        translated_region = _remap_region(region, id_map)
+        cell = Cell(id=ctx.fresh_id('c'), region=translated_region, material_id=tpl.material, name=name)
+        return translated_surfaces + [cell]
     if templates.is_composite_template(tpl):
         (surfaces, cells) = templates.expand_template(ctx, tpl, name, pos)
         return list(surfaces) + list(cells)
@@ -323,11 +365,14 @@ def _place_boolean_placement(schema: BooleanPlacementSchema, name: str, placemen
 def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, float] | None=None, geom_name: str='cascade_geometry') -> CascadeGeometry:
     ctx = Context(param_values=param_values or {})
     all_objects: list = []
-    # Bugfix: this dict is now the same object as ctx.primitive_ids so that
-    # _expand_shape_at_origin() (called later, while resolving boolean
-    # composite operands) can look up a primitive's Step-0 surface id
-    # instead of re-expanding the primitive and creating a duplicate,
-    # unreferenced Surface.
+    # Populates ctx.primitive_ids so Tier-2 CellSchema region expressions
+    # (region_from_yaml_dict, just below) can resolve a primitive's YAML
+    # name to its Step-0 surface id. NOT used by boolean-composite operand
+    # resolution any more (see _expand_shape_at_origin's primitive branch) —
+    # that path always mints its own fresh, independently-translatable
+    # copy instead of reusing this one, so a primitive can be placed via a
+    # Tier-2 Cell at its authored position AND used as a boolean operand
+    # elsewhere without the two uses fighting over one shared surface.
     primitive_name_to_id: dict[str, str] = ctx.primitive_ids
     cell_schemas: dict[str, CellSchema] = {}
     legacy_schemas: dict[str, BaseComponentSchema] = {}
@@ -350,6 +395,16 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
         if isinstance(schema, _PLACEMENT_TYPES):
             placements[name] = schema
         else:
+            templates_by_name[name] = schema
+    # Tier-1 primitives are ALSO valid SinglePlacement templates (see the
+    # primitive branches in this loop and in _expand_single_placement_objects)
+    # provided they have `material` set — register them here so `schema.template`
+    # lookups find them. They were deliberately excluded from `legacy_schemas`
+    # above (Step 0 already gave every primitive its own Tier-2-facing surface),
+    # but that's an orthogonal, independent use — see the comment on
+    # primitive_name_to_id above for why the two don't conflict.
+    for (name, schema) in schemas.items():
+        if primitives.is_primitive(schema):
             templates_by_name[name] = schema
     owned_by_boolean: set[str] = set()
     parent_of: dict[str, str] = {}
@@ -408,6 +463,28 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
                 tlabels = {k: id_map[v] for (k, v) in labels.items()}
                 region = Intersection([Outside(tlabels['xlo']), Inside(tlabels['xhi']), Outside(tlabels['ylo']), Inside(tlabels['yhi']), Outside(tlabels['bot']), Inside(tlabels['top'])])
                 cell = Cell(id=ctx.fresh_id('c'), region=region, material_id=tpl.material, name=name)
+                all_objects.extend([o for o in translated if isinstance(o, Surface)])
+                all_objects.append(cell)
+                continue
+            if primitives.is_primitive(tpl):
+                # Mirrors the role="solid" Box branch just above (and
+                # _expand_single_placement_objects' identical branch, used
+                # for BooleanPlacement children) — same duplication
+                # precedent already established in this function for Box.
+                if getattr(tpl, 'material', None) is None:
+                    raise ValueError(
+                        f"SinglePlacement '{name}' places '{schema.template}' "
+                        f"(a {type(tpl).__name__}), which has no `material` "
+                        f"set. Add material: <id> to '{schema.template}' to "
+                        f"place it as a solid object, or remove this "
+                        f"SinglePlacement and reference '{schema.template}' "
+                        f"from a Tier-2 Cell region expression instead."
+                    )
+                (surfaces, region) = primitives.expand_primitive(ctx, tpl, schema.template)
+                pos = schema.position()
+                (translated, id_map) = _translate(surfaces, pos[0], pos[1], pos[2], ctx)
+                translated_region = _remap_region(region, id_map)
+                cell = Cell(id=ctx.fresh_id('c'), region=translated_region, material_id=tpl.material, name=name)
                 all_objects.extend([o for o in translated if isinstance(o, Surface)])
                 all_objects.append(cell)
                 continue

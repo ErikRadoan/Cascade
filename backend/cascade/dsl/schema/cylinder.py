@@ -21,6 +21,15 @@ class CylinderXSchema(BaseComponentSchema):
     y: float = Field(0.0, description="Y of the cylinder's centerline (cm).")
     z: float = Field(0.0, description="Z of the cylinder's centerline (cm).")
     boundary_type: BoundaryType = Field(default=BoundaryType.NONE)
+    material: str | None = Field(
+        default=None,
+        description=(
+            "Optional. If set, this Cylinder can be placed as a solid Cell "
+            "via SinglePlacement (see expander._expand_single_placement_objects). "
+            "Note the cylinder is infinite along its axis unless bounded by "
+            "additional planes in a Tier-2 Cell region expression instead."
+        ),
+    )
 
     model_config = {"frozen": True}
 
@@ -32,6 +41,15 @@ class CylinderYSchema(BaseComponentSchema):
     x: float = Field(0.0, description="X of the cylinder's centerline (cm).")
     z: float = Field(0.0, description="Z of the cylinder's centerline (cm).")
     boundary_type: BoundaryType = Field(default=BoundaryType.NONE)
+    material: str | None = Field(
+        default=None,
+        description=(
+            "Optional. If set, this Cylinder can be placed as a solid Cell "
+            "via SinglePlacement (see expander._expand_single_placement_objects). "
+            "Note the cylinder is infinite along its axis unless bounded by "
+            "additional planes in a Tier-2 Cell region expression instead."
+        ),
+    )
 
     model_config = {"frozen": True}
 
@@ -48,5 +66,14 @@ class CylinderZSchema(BaseComponentSchema):
     x: float = Field(0.0, description="X of the cylinder's centerline (cm).")
     y: float = Field(0.0, description="Y of the cylinder's centerline (cm).")
     boundary_type: BoundaryType = Field(default=BoundaryType.NONE)
+    material: str | None = Field(
+        default=None,
+        description=(
+            "Optional. If set, this Cylinder can be placed as a solid Cell "
+            "via SinglePlacement (see expander._expand_single_placement_objects). "
+            "Note the cylinder is infinite along its axis unless bounded by "
+            "additional planes in a Tier-2 Cell region expression instead."
+        ),
+    )
 
     model_config = {"frozen": True}

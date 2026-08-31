@@ -40,9 +40,10 @@ def _surface_grid(surface: Surface, X: np.ndarray, Y: np.ndarray, Z: np.ndarray)
     """Signed implicit-function value over the whole pixel grid.
 
     Mirrors GeometryPlotPanel.svelte's old surfaceF(), one branch per
-    SurfaceType the expander actually emits (Box/FuelPin/lattices).
-    cone_z/torus aren't emitted by anything today — same as the JS
-    version, they degrade to "always outside" rather than erroring.
+    SurfaceType. cone_z/torus are now emitted by the ConeZ/Torus Tier-1
+    primitives (schema/cone.py, schema/torus.py) and handled below like
+    every other surface; anything genuinely unrecognized still degrades to
+    "always outside" rather than erroring, on the same principle as before.
     """
     p = surface.params
     t = surface.type_
@@ -69,8 +70,21 @@ def _surface_grid(surface: Surface, X: np.ndarray, Y: np.ndarray, Z: np.ndarray)
         x0, y0, z0 = _resolve(p, "x0", "x"), _resolve(p, "y0", "y"), _resolve(p, "z0", "z")
         r = float(p.get("r", 1.0))
         return (X - x0) ** 2 + (Y - y0) ** 2 + (Z - z0) ** 2 - r * r
+    if t == SurfaceType.CONE_Z:
+        x0, y0, z0 = _resolve(p, "x0", "x"), _resolve(p, "y0", "y"), _resolve(p, "z0", "z")
+        r2 = float(p.get("r2", 1.0))
+        # Double-napped cone: f < 0 inside EITHER nappe, matching the
+        # ConeZExpander's Inside(surface.id) convention (see primitives.py).
+        return (X - x0) ** 2 + (Y - y0) ** 2 - r2 * (Z - z0) ** 2
+    if t == SurfaceType.TORUS:
+        x0, y0, z0 = _resolve(p, "x0", "x"), _resolve(p, "y0", "y"), _resolve(p, "z0", "z")
+        a = float(p.get("a", 1.0))
+        b = float(p.get("b", 0.5))
+        c = float(p.get("c", 0.5))
+        radial = np.sqrt((X - x0) ** 2 + (Y - y0) ** 2) - a
+        return (radial ** 2) / (b * b) + ((Z - z0) ** 2) / (c * c) - 1.0
 
-    return np.ones_like(X)  # cone_z / torus: unsupported, always "outside"
+    return np.ones_like(X)  # genuinely unrecognized type: always "outside"
 
 
 def _region_mask(region: Region, grids: dict[str, np.ndarray], shape: tuple[int, int]) -> np.ndarray:
