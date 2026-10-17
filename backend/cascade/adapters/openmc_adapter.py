@@ -22,8 +22,7 @@ from __future__ import annotations
 
 import math
 import re
-import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -32,7 +31,7 @@ from xml.dom import minidom
 import h5py
 import numpy as np
 
-from ..domain.geometry import (
+from domain.geometry import (
     CascadeGeometry,
     Cell,
     Complement,
@@ -443,8 +442,23 @@ def _surface_element(surface: Surface) -> ET.Element:
     return el
 
 
+def _int_universe_id(universe_id: str) -> str:
+    """Like _int_id, but "0" (the implicit root universe) passes through
+    unchanged rather than being treated as a prefixed domain id."""
+    if universe_id == "0":
+        return "0"
+    return _int_id(universe_id)
+
+
 def _cell_element(cell: Cell, material_id_map: dict[str, int]) -> ET.Element:
     """Build an XML <cell> element from a Cell domain object.
+
+    A cell is either a material cell (holds a material, possibly void) or
+    a fill cell (cell.fill is set) that instances another universe into
+    this cell's region, transformed by cell.translation/cell.rotation —
+    OpenMC's native mechanism for rotated geometry (see
+    expander._place_rotated). Fill cells never have a material attribute;
+    material cells never have fill/rotation/translation attributes.
 
     Args:
         cell: Cell domain object.
@@ -463,7 +477,16 @@ def _cell_element(cell: Cell, material_id_map: dict[str, int]) -> ET.Element:
     if cell.name:
         el.set("name", cell.name)
 
-    if cell.material_id is not None:
+    if cell.universe_id != "0":
+        el.set("universe", _int_universe_id(cell.universe_id))
+
+    if cell.fill is not None:
+        el.set("fill", _int_universe_id(cell.fill))
+        if cell.translation is not None and any(v != 0.0 for v in cell.translation):
+            el.set("translation", " ".join(str(v) for v in cell.translation))
+        if cell.rotation is not None and any(v != 0.0 for v in cell.rotation):
+            el.set("rotation", " ".join(str(v) for v in cell.rotation))
+    elif cell.material_id is not None:
         mat_int_id = material_id_map.get(cell.material_id)
         if mat_int_id is None:
             raise ValueError(
@@ -753,7 +776,7 @@ def _compute_fissile_source_box(
 
 def _surface_ids_in_region(region) -> list[str]:
     """Recursively collect all surface IDs referenced in a region."""
-    from ..domain.geometry import Inside, Outside, Intersection, Union, Complement
+    from domain.geometry import Inside, Outside, Intersection, Union, Complement
     if isinstance(region, (Inside, Outside)):
         return [region.surface_id]
     elif isinstance(region, (Intersection, Union)):

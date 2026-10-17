@@ -4,19 +4,20 @@ Full documented version: project artifacts/expander.py.
 """
 
 from __future__ import annotations
+import math
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
-from ..domain.geometry import BoundaryType, CascadeGeometry, Cell, Complement, Inside, Intersection, LatticeInstance, Outside, Region, Surface, SurfaceType, Union, region_from_yaml_dict
-from . import primitives
-from . import templates
+from domain.geometry import BoundaryType, CascadeGeometry, Cell, Complement, Inside, Intersection, LatticeInstance, Outside, Region, Surface, SurfaceType, Union, region_from_yaml_dict
+from dsl import primitives, templates
 from .schema.base import BaseComponentSchema
 from .schema.boolean import BooleanPlacementSchema, IntersectionSchema, SubtractionSchema, UnionSchema
 from .schema.box import BoxSchema
 from .schema.cell import CellSchema
 from .schema.fuel_pin import FuelPinSchema
-from .schema.lattice import HexLatticeSchema, SquareLatticeSchema
-from .schema.single_placement import SinglePlacementSchema
+from dsl.schema.lattice import HexLatticeSchema, SquareLatticeSchema
+from dsl.schema.single_placement import SinglePlacementSchema
+from .schema.sphere import SphereSchema
+from .schema.torus import TorusSchema
 
 @dataclass
 class Context:
@@ -81,6 +82,101 @@ def _translate(objects: list[Surface | Cell], dx: float, dy: float, dz: float, c
         if isinstance(obj, Cell):
             new_cells.append(Cell(id=ctx.fresh_id('c'), region=_remap_region(obj.region, id_map), material_id=obj.material_id, name=obj.name))
     return (new_surfaces + new_cells, id_map)
+
+
+# ---------------------------------------------------------------------------
+# Rotation support — local universe + OpenMC-native fill-cell rotation.
+#
+# Rotating a surface's own coefficients only works for quadrics (planes,
+# cylinders, cones, spheres); Torus is a quartic and CANNOT be expressed as
+# a rotated general surface in OpenMC at all. So rotation is never baked
+# into coefficients here. Instead, a rotated placement's local geometry is
+# authored at the origin (untranslated, unrotated — exactly like the
+# existing "Step-0" surfaces used for boolean-composite operands), wrapped
+# in its own universe, and instanced into the parent universe via a single
+# fill-cell carrying OpenMC's native `translation`/`rotation` attributes.
+# OpenMC transforms the *particle* into local coordinates during tracking,
+# so every surface type comes out exactly right at any angle — this is the
+# same mechanism OpenMC itself recommends for rotated geometry.
+#
+# The fill-cell needs a region in the PARENT frame to confine where the
+# rotated universe appears. A sphere centered at the placement position is
+# used for this, sized to the local geometry's own circumradius from its
+# local origin — a sphere is rotation-invariant about its own center, so
+# this bound is exact regardless of what rotation is applied, with no
+# rotation matrix math needed on our side at all.
+# ---------------------------------------------------------------------------
+
+_UNBOUNDED_ROTATION_MSG = (
+    "'{name}' ({type_name}) has unbounded extent (an infinite plane, "
+    "cylinder, or cone) and can't be rotated as a standalone placement — "
+    "there's no finite bounding volume to confine the rotated local "
+    "universe within. Combine it with bounding surfaces in a boolean "
+    "composite (so the composite as a whole is finite), or place it "
+    "without rotation."
+)
+
+
+def _local_bounding_radius(schema: BaseComponentSchema, name: str, schemas: dict[str, BaseComponentSchema]) -> float:
+    """Conservative bounding-sphere radius, measured from the schema's own
+    local origin (0, 0, 0) — i.e. before any translation/rotation. Exact
+    for Sphere; conservative (uses full height, not half) for Box/FuelPin,
+    since their local origin sits at a face/end rather than the centroid.
+    """
+    if isinstance(schema, BoxSchema):
+        return math.sqrt(schema.half_x() ** 2 + schema.half_y() ** 2 + schema.z_size ** 2)
+    if isinstance(schema, FuelPinSchema):
+        max_r = max((r for r, _ in schema.radial_layers()), default=0.0)
+        return math.sqrt(max_r ** 2 + schema.pellet_height ** 2)
+    if isinstance(schema, SphereSchema):
+        return schema.radius
+    if isinstance(schema, TorusSchema):
+        tube_h = schema.tube_height if schema.tube_height is not None else schema.tube_radius
+        return schema.ring_radius + max(schema.tube_radius, tube_h)
+    if isinstance(schema, _BOOLEAN_COMPOSITE_TYPES):
+        if isinstance(schema, UnionSchema) and hasattr(schema, 'operand_names'):
+            op_names = schema.operand_names()
+        else:
+            op_names = [schema.a, schema.b]
+        best = 0.0
+        for op_name in op_names:
+            op_schema = schemas.get(op_name)
+            if op_schema is None:
+                continue
+            ox = float(getattr(op_schema, 'x', 0.0) or 0.0)
+            oy = float(getattr(op_schema, 'y', 0.0) or 0.0)
+            oz = float(getattr(op_schema, 'z', 0.0) or 0.0)
+            offset = math.sqrt(ox ** 2 + oy ** 2 + oz ** 2)
+            best = max(best, offset + _local_bounding_radius(op_schema, op_name, schemas))
+        return best
+    raise ValueError(_UNBOUNDED_ROTATION_MSG.format(name=name, type_name=type(schema).__name__))
+
+
+def _rotation_of(schema: BaseComponentSchema) -> tuple[float, float, float]:
+    return (
+        float(getattr(schema, 'rx', 0.0) or 0.0),
+        float(getattr(schema, 'ry', 0.0) or 0.0),
+        float(getattr(schema, 'rz', 0.0) or 0.0),
+    )
+
+
+def _is_rotated(rotation: tuple[float, float, float]) -> bool:
+    return rotation[0] != 0.0 or rotation[1] != 0.0 or rotation[2] != 0.0
+
+
+def _place_rotated(local_objects: list[Surface | Cell], position: tuple[float, float, float], rotation: tuple[float, float, float], bounding_radius: float, ctx: Context, cell_name: str) -> list[Surface | Cell]:
+    """Wrap already-expanded, origin-local `local_objects` (surfaces plus
+    exactly one material Cell, both authored untranslated/unrotated) into
+    their own universe, then instance that universe into the parent
+    (root) universe via one fill-cell carrying `translation`/`rotation`.
+    """
+    universe_id = ctx.fresh_id('u')
+    local_surfaces = [o for o in local_objects if isinstance(o, Surface)]
+    local_cells = [o for o in local_objects if isinstance(o, Cell)]
+    scoped_cells = [Cell(id=c.id, region=c.region, material_id=c.material_id, name=c.name, universe_id=universe_id) for c in local_cells]
+    confine = Surface(id=ctx.fresh_id('s'), type_=SurfaceType.SPHERE, params={'x0': position[0], 'y0': position[1], 'z0': position[2], 'r': bounding_radius})
+    fill_cell = Cell(id=ctx.fresh_id('c'), region=Inside(confine.id), material_id=None, name=cell_name, universe_id='0', fill=universe_id, translation=position, rotation=rotation)
+    return list(local_surfaces) + scoped_cells + [confine, fill_cell]
 
 def _expand_box_surfaces(schema: BoxSchema, ctx: Context) -> tuple[list[Surface], dict[str, str]]:
     hx = schema.half_x()
@@ -256,13 +352,23 @@ def _cells_to_combined_region(cells: list[Cell]) -> Region | None:
         return regions[0]
     return Union(regions)
 
-def _expand_single_placement_objects(schema: SinglePlacementSchema, name: str, templates_by_name: dict, schemas: dict, ctx: Context, extra_offset: tuple[float, float, float]=(0.0, 0.0, 0.0)) -> list:
+def _expand_single_placement_objects(schema: SinglePlacementSchema, name: str, templates_by_name: dict, schemas: dict, ctx: Context, extra_offset: tuple[float, float, float]=(0.0, 0.0, 0.0), _inside_boolean: bool=False) -> list:
     tpl = templates_by_name.get(schema.template)
     if tpl is None:
         raise ValueError(f"SinglePlacement '{name}' references undefined template '{schema.template}'.")
     (px, py, pz) = schema.position()
     pos = (px + extra_offset[0], py + extra_offset[1], pz + extra_offset[2])
+    rotation = _rotation_of(schema)
+    if _is_rotated(rotation) and _inside_boolean:
+        raise NotImplementedError(f"SinglePlacement '{name}' is a BooleanPlacement child and can't be rotated yet — combining a rotated (fill-cell) child's region with its siblings' Union/Subtraction/Intersection isn't supported in this pass. Rotate '{name}' as a standalone SinglePlacement instead, or remove its rotation.")
     if isinstance(tpl, BoxSchema):
+        if _is_rotated(rotation):
+            (local_surfaces, labels) = _expand_box_surfaces(tpl, ctx)
+            local_surfaces = [Surface(id=s.id, type_=s.type_, params=s.params, boundary_type=BoundaryType.NONE) for s in local_surfaces]
+            local_region = Intersection([Outside(labels['xlo']), Inside(labels['xhi']), Outside(labels['ylo']), Inside(labels['yhi']), Outside(labels['bot']), Inside(labels['top'])])
+            cell = Cell(id=ctx.fresh_id('c'), region=local_region, material_id=tpl.material, name=name)
+            radius = _local_bounding_radius(tpl, schema.template, schemas)
+            return _place_rotated(list(local_surfaces) + [cell], pos, rotation, radius, ctx, name)
         (surfaces, labels) = _expand_box_surfaces(tpl, ctx)
         (translated, id_map) = _translate(surfaces, pos[0], pos[1], pos[2], ctx)
         translated_surfaces = [o for o in translated if isinstance(o, Surface)]
@@ -290,6 +396,11 @@ def _expand_single_placement_objects(schema: SinglePlacementSchema, name: str, t
                 f"reference '{schema.template}' from a Tier-2 Cell region "
                 f"expression instead."
             )
+        if _is_rotated(rotation):
+            (local_surfaces, local_region) = primitives.expand_primitive(ctx, tpl, schema.template)
+            cell = Cell(id=ctx.fresh_id('c'), region=local_region, material_id=tpl.material, name=name)
+            radius = _local_bounding_radius(tpl, schema.template, schemas)
+            return _place_rotated(list(local_surfaces) + [cell], pos, rotation, radius, ctx, name)
         (surfaces, region) = primitives.expand_primitive(ctx, tpl, schema.template)
         (translated, id_map) = _translate(surfaces, pos[0], pos[1], pos[2], ctx)
         translated_surfaces = [o for o in translated if isinstance(o, Surface)]
@@ -297,9 +408,18 @@ def _expand_single_placement_objects(schema: SinglePlacementSchema, name: str, t
         cell = Cell(id=ctx.fresh_id('c'), region=translated_region, material_id=tpl.material, name=name)
         return translated_surfaces + [cell]
     if templates.is_composite_template(tpl):
+        if _is_rotated(rotation):
+            (local_surfaces, local_cells) = templates.expand_template(ctx, tpl, name, (0.0, 0.0, 0.0), force_local_axial=True)
+            radius = _local_bounding_radius(tpl, schema.template, schemas)
+            return _place_rotated(list(local_surfaces) + list(local_cells), pos, rotation, radius, ctx, name)
         (surfaces, cells) = templates.expand_template(ctx, tpl, name, pos)
         return list(surfaces) + list(cells)
     if isinstance(tpl, _BOOLEAN_COMPOSITE_TYPES):
+        if _is_rotated(rotation):
+            (local_surfaces, local_region) = _expand_shape_at_origin(tpl, schema.template, schemas, ctx)
+            cell = Cell(id=ctx.fresh_id('c'), region=local_region, material_id=tpl.material, name=name)
+            radius = _local_bounding_radius(tpl, schema.template, schemas)
+            return _place_rotated(list(local_surfaces) + [cell], pos, rotation, radius, ctx, name)
         return _place_boolean_composite(tpl, schema.template, pos, ctx, schemas, cell_name=name)
     raise TypeError(f"SinglePlacement '{name}' (template type {type(tpl).__name__}) cannot be a BooleanPlacement child.")
 
@@ -322,7 +442,7 @@ def _place_boolean_placement(schema: BooleanPlacementSchema, name: str, placemen
             cells = [o for o in objs if isinstance(o, Cell)]
             child_results.append((surfaces, cells))
         elif isinstance(child, SinglePlacementSchema):
-            objs = _expand_single_placement_objects(child, child_name, templates_by_name, schemas, ctx, residual)
+            objs = _expand_single_placement_objects(child, child_name, templates_by_name, schemas, ctx, residual, _inside_boolean=True)
             surfaces = [o for o in objs if isinstance(o, Surface)]
             cells = [o for o in objs if isinstance(o, Cell)]
             child_results.append((surfaces, cells))
@@ -432,6 +552,8 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
             continue
         if getattr(tpl, 'role', 'universe') != 'universe':
             continue
+        if _is_rotated(_rotation_of(schema)):
+            raise NotImplementedError(f"SinglePlacement '{name}' rotates the outer/universe Box '{schema.template}' — this drives the whole model's coordinate frame and FuelPin axial-bounds sharing, so rotating it isn't 'rotate one object', it's 'rotate the whole model', which isn't supported. Set role: solid on '{schema.template}' if you meant to rotate an ordinary interior box, or remove the rotation here.")
         prev_bot, prev_top = ctx.axial_bot_id, ctx.axial_top_id
         (placed_surfaces, translated_labels) = _place_box(tpl, schema.position(), ctx)
         all_objects.extend(placed_surfaces)
@@ -446,8 +568,26 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
             tpl = templates_by_name.get(schema.template)
             if tpl is None:
                 raise ValueError(f"SinglePlacement '{name}' references undefined template '{schema.template}'.")
+            rotation = _rotation_of(schema)
             if isinstance(tpl, BoxSchema):
                 if getattr(tpl, 'role', 'universe') == 'universe':
+                    continue
+                pos = schema.position()
+                if _is_rotated(rotation):
+                    # The outer/universe Box (role="universe", handled by
+                    # the box_placements pass above) is excluded from
+                    # rotation entirely — it drives the model's whole
+                    # coordinate frame and axial-bounds sharing, so tilting
+                    # it isn't "rotate one placed object", it's "rotate the
+                    # whole model", which is out of scope here. Only
+                    # role="solid" Boxes (ordinary interior objects) reach
+                    # this branch.
+                    (local_surfaces, labels) = _expand_box_surfaces(tpl, ctx)
+                    local_surfaces = [Surface(id=s.id, type_=s.type_, params=s.params, boundary_type=BoundaryType.NONE) for s in local_surfaces]
+                    local_region = Intersection([Outside(labels['xlo']), Inside(labels['xhi']), Outside(labels['ylo']), Inside(labels['yhi']), Outside(labels['bot']), Inside(labels['top'])])
+                    cell = Cell(id=ctx.fresh_id('c'), region=local_region, material_id=tpl.material, name=name)
+                    radius = _local_bounding_radius(tpl, schema.template, schemas)
+                    all_objects.extend(_place_rotated(list(local_surfaces) + [cell], pos, rotation, radius, ctx, name))
                     continue
                 (surfaces, labels) = _expand_box_surfaces(tpl, ctx)
                 # Bugfix: a role="solid" Box placed standalone (not a
@@ -458,7 +598,6 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
                 # schema's boundary_type (default REFLECTIVE) doesn't
                 # reflect particles off an interior wall in the OpenMC export.
                 surfaces = [Surface(id=s.id, type_=s.type_, params=s.params, boundary_type=BoundaryType.NONE) for s in surfaces]
-                pos = schema.position()
                 (translated, id_map) = _translate(surfaces, pos[0], pos[1], pos[2], ctx)
                 tlabels = {k: id_map[v] for (k, v) in labels.items()}
                 region = Intersection([Outside(tlabels['xlo']), Inside(tlabels['xhi']), Outside(tlabels['ylo']), Inside(tlabels['yhi']), Outside(tlabels['bot']), Inside(tlabels['top'])])
@@ -480,8 +619,14 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
                         f"SinglePlacement and reference '{schema.template}' "
                         f"from a Tier-2 Cell region expression instead."
                     )
-                (surfaces, region) = primitives.expand_primitive(ctx, tpl, schema.template)
                 pos = schema.position()
+                if _is_rotated(rotation):
+                    (local_surfaces, local_region) = primitives.expand_primitive(ctx, tpl, schema.template)
+                    cell = Cell(id=ctx.fresh_id('c'), region=local_region, material_id=tpl.material, name=name)
+                    radius = _local_bounding_radius(tpl, schema.template, schemas)
+                    all_objects.extend(_place_rotated(list(local_surfaces) + [cell], pos, rotation, radius, ctx, name))
+                    continue
+                (surfaces, region) = primitives.expand_primitive(ctx, tpl, schema.template)
                 (translated, id_map) = _translate(surfaces, pos[0], pos[1], pos[2], ctx)
                 translated_region = _remap_region(region, id_map)
                 cell = Cell(id=ctx.fresh_id('c'), region=translated_region, material_id=tpl.material, name=name)
@@ -489,12 +634,23 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
                 all_objects.append(cell)
                 continue
             if templates.is_composite_template(tpl):
-                (surfaces, cells) = templates.expand_template(ctx, tpl, name, schema.position())
-                all_objects.extend(surfaces)
-                all_objects.extend(cells)
+                if _is_rotated(rotation):
+                    (local_surfaces, local_cells) = templates.expand_template(ctx, tpl, name, (0.0, 0.0, 0.0), force_local_axial=True)
+                    radius = _local_bounding_radius(tpl, schema.template, schemas)
+                    all_objects.extend(_place_rotated(list(local_surfaces) + list(local_cells), schema.position(), rotation, radius, ctx, name))
+                else:
+                    (surfaces, cells) = templates.expand_template(ctx, tpl, name, schema.position())
+                    all_objects.extend(surfaces)
+                    all_objects.extend(cells)
             elif isinstance(tpl, _BOOLEAN_COMPOSITE_TYPES):
-                placed = _place_boolean_composite(tpl, schema.template, schema.position(), ctx, schemas, cell_name=name)
-                all_objects.extend(placed)
+                if _is_rotated(rotation):
+                    (local_surfaces, local_region) = _expand_shape_at_origin(tpl, schema.template, schemas, ctx)
+                    cell = Cell(id=ctx.fresh_id('c'), region=local_region, material_id=tpl.material, name=name)
+                    radius = _local_bounding_radius(tpl, schema.template, schemas)
+                    all_objects.extend(_place_rotated(list(local_surfaces) + [cell], schema.position(), rotation, radius, ctx, name))
+                else:
+                    placed = _place_boolean_composite(tpl, schema.template, schema.position(), ctx, schemas, cell_name=name)
+                    all_objects.extend(placed)
             else:
                 raise TypeError(f"SinglePlacement '{name}' references template of type '{type(tpl).__name__}' which has no placement handler.")
         elif isinstance(schema, BooleanPlacementSchema):
@@ -503,7 +659,7 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
         elif isinstance(schema, (SquareLatticeSchema, HexLatticeSchema)):
             if name in nested_template_lattices:
                 continue
-            _dispatch_lattice(ctx, schema, name, templates_by_name, lattice_schemas, all_objects)
+            _dispatch_lattice(ctx, schema, name, templates_by_name, lattice_schemas, all_objects, schemas)
     for bname, bschema, blabels in box_placements:
         fill_cell = _build_fill_cell(bschema, blabels, ctx, cell_name=bname or f'fill_{bschema.material}')
         all_objects.append(fill_cell)
@@ -511,10 +667,12 @@ def expand(schemas: dict[str, BaseComponentSchema], param_values: dict[str, floa
     cells = [obj for obj in all_objects if isinstance(obj, Cell)]
     return CascadeGeometry(id=str(uuid.uuid4()), name=geom_name, surfaces=surfaces, cells=cells, param_values=ctx.param_values, lattice_instances=ctx.lattice_instances, warnings=ctx.warnings)
 
-def _dispatch_lattice(ctx, schema, name, templates_by_name, lattice_schemas, all_objects):
+def _dispatch_lattice(ctx, schema, name, templates_by_name, lattice_schemas, all_objects, schemas):
     tpl_name = schema.template
     if tpl_name in lattice_schemas:
         inner = lattice_schemas[tpl_name]
+        if schema.is_rotated() or inner.is_rotated():
+            raise NotImplementedError(f"Nested lattice '{name}' -> '{tpl_name}': rotation on nested (lattice-of-lattice) assemblies isn't supported yet. Rotate a single-level lattice, or remove rotation from one of these two levels.")
         pin_tpl = templates_by_name.get(inner.template)
         if pin_tpl is None:
             raise ValueError(f"Nested lattice '{name}' -> '{tpl_name}' references undefined pin template '{inner.template}'.")
@@ -526,9 +684,61 @@ def _dispatch_lattice(ctx, schema, name, templates_by_name, lattice_schemas, all
     if tpl is None:
         raise ValueError(f"Lattice '{name}' references undefined template '{tpl_name}'.")
     if templates.is_composite_template(tpl):
-        _expand_lattice_with_instancing(ctx, tpl, tpl_name, name, schema.pin_positions(), all_objects)
+        if schema.is_rotated():
+            _expand_lattice_rotated(ctx, tpl, tpl_name, name, schema, schemas, all_objects)
+        else:
+            _expand_lattice_with_instancing(ctx, tpl, tpl_name, name, schema.pin_positions(), all_objects)
     else:
         raise TypeError(f"Lattice '{name}': template type not supported in lattices yet.")
+
+
+def _expand_lattice_rotated(ctx, tpl, prototype_key, lattice_name, schema, schemas, all_objects):
+    """Rotated-lattice path: every pin becomes its own fill-cell inside a
+    shared 'assembly' universe (pin universes are reused across every
+    position that shares the same own-rotation, so a lattice with a
+    handful of overridden pins doesn't mint hundreds of duplicate
+    universes). The whole assembly universe is then instanced into the
+    parent frame by ONE outer fill-cell carrying the lattice-level
+    rotation, pivoting about the lattice's own origin/center point.
+
+    This bypasses the LatticeInstance GPU-instancing side-channel (Phase C)
+    entirely — rotated lattices fall back to the ordinary flat surfaces/
+    cells list for rendering until the viewport's BVH gains per-instance
+    rotation support (Phase 3 of the rotation plan). OpenMC's own geometry
+    is exact either way; only the viewport's instancing fast path is
+    affected.
+    """
+    positions = schema.pin_positions()
+    if not positions:
+        return
+    pin_rotations = schema.pin_rotations()
+    assembly_rotation = schema.assembly_rotation()
+    origin = schema.origin_point()
+    pin_radius = _local_bounding_radius(tpl, prototype_key, schemas)
+    assembly_universe = ctx.fresh_id('u')
+
+    pin_universe_by_rotation: dict[tuple[float, float, float], str] = {}
+    assembly_bound = 0.0
+    proto_idx = 0
+    for i, pos in enumerate(positions):
+        local_pos = (pos[0] - origin[0], pos[1] - origin[1], pos[2] - origin[2])
+        own_rotation = pin_rotations[i]
+        u_id = pin_universe_by_rotation.get(own_rotation)
+        if u_id is None:
+            (local_surfaces, local_cells) = templates.expand_template(ctx, tpl, f'{lattice_name}_proto{proto_idx}', (0.0, 0.0, 0.0), force_local_axial=True)
+            proto_idx += 1
+            u_id = ctx.fresh_id('u')
+            all_objects.extend(local_surfaces)
+            all_objects.extend((Cell(id=c.id, region=c.region, material_id=c.material_id, name=c.name, universe_id=u_id) for c in local_cells))
+            pin_universe_by_rotation[own_rotation] = u_id
+        confine = Surface(id=ctx.fresh_id('s'), type_=SurfaceType.SPHERE, params={'x0': local_pos[0], 'y0': local_pos[1], 'z0': local_pos[2], 'r': pin_radius})
+        all_objects.append(confine)
+        all_objects.append(Cell(id=ctx.fresh_id('c'), region=Inside(confine.id), material_id=None, name=f'{lattice_name}_{i}', universe_id=assembly_universe, fill=u_id, translation=local_pos, rotation=own_rotation))
+        assembly_bound = max(assembly_bound, math.sqrt(local_pos[0] ** 2 + local_pos[1] ** 2 + local_pos[2] ** 2) + pin_radius)
+
+    assembly_confine = Surface(id=ctx.fresh_id('s'), type_=SurfaceType.SPHERE, params={'x0': 0.0, 'y0': 0.0, 'z0': 0.0, 'r': assembly_bound})
+    all_objects.append(assembly_confine)
+    all_objects.append(Cell(id=ctx.fresh_id('c'), region=Inside(assembly_confine.id), material_id=None, name=lattice_name, universe_id='0', fill=assembly_universe, translation=origin, rotation=assembly_rotation))
 
 def _expand_lattice_with_instancing(ctx, tpl, prototype_key, lattice_name, positions, all_objects):
     if not positions:

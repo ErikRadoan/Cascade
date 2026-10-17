@@ -162,19 +162,47 @@ class Surface:
 
 @dataclass(slots=True)
 class Cell:
-    """Region of space with a material."""
+    """Region of space with a material — OR a fill cell that instances
+    another universe into this one (rotation support, see
+    expander._place_rotated).
+
+    A cell is one of two kinds, distinguished by whether `fill` is set:
+      - Material cell (fill=None): ordinary Tier-2 cell, holds `material_id`
+        (None = void). Lives in universe `universe_id` ("0" = root/top level,
+        matching OpenMC's implicit default universe).
+      - Fill cell (fill=<universe_id>): has no material of its own; instead
+        it stamps another universe's entire contents into this cell's
+        `region`, transformed by `translation`/`rotation`. This is how
+        arbitrary rotation is achieved — OpenMC transforms the particle
+        into the filled universe's local coordinates during tracking, so
+        the local geometry's own surfaces never need their coefficients
+        hand-rotated. `rotation` is (rx, ry, rz) in degrees, OpenMC's
+        native XYZ Euler convention; `translation` is (dx, dy, dz) in cm.
+        Both are None on material cells.
+    """
     id: str
     region: Region
     material_id: str | None = None
     name: str | None = None
+    universe_id: str = "0"
+    fill: str | None = None
+    rotation: tuple[float, float, float] | None = None
+    translation: tuple[float, float, float] | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        d: dict[str, object] = {
             "id": self.id,
             "region": str(self.region),
             "material_id": self.material_id,
             "name": self.name,
         }
+        if self.universe_id != "0":
+            d["universe_id"] = self.universe_id
+        if self.fill is not None:
+            d["fill"] = self.fill
+            d["rotation"] = list(self.rotation) if self.rotation else [0.0, 0.0, 0.0]
+            d["translation"] = list(self.translation) if self.translation else [0.0, 0.0, 0.0]
+        return d
 
 
 @dataclass(slots=True)

@@ -49,7 +49,22 @@ class SinglePlacementSchema(BaseComponentSchema):
     y: float = Field(default=0.0, description="Y position of the template origin (cm).")
     z: float = Field(default=0.0, description="Z position of the template origin (cm).")
 
+    # Rotation — intrinsic XYZ Euler angles in degrees, OpenMC's native
+    # cell-rotation convention. (0, 0, 0) is the identity and takes the
+    # existing zero-overhead translate-only expansion path (see
+    # expander._rotation_of / _place_rotated); only placements that actually
+    # set one of these incur the local-universe/fill-cell machinery.
+    rx: float = Field(default=0.0, description="Rotation about X (degrees).")
+    ry: float = Field(default=0.0, description="Rotation about Y (degrees).")
+    rz: float = Field(default=0.0, description="Rotation about Z (degrees).")
+
     model_config = {"frozen": True}
 
     def position(self) -> tuple[float, float, float]:
         return (self.x, self.y, self.z)
+
+    def rotation(self) -> tuple[float, float, float]:
+        return (self.rx, self.ry, self.rz)
+
+    def is_rotated(self) -> bool:
+        return self.rx != 0.0 or self.ry != 0.0 or self.rz != 0.0

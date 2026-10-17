@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from ..domain.geometry import (
+from domain.geometry import (
     BoundaryType, Cell, Inside, Intersection, Outside, Surface, SurfaceType,
 )
 from .primitives import ExpansionContext, translate_params
@@ -30,6 +30,7 @@ class CompositeTemplateExpander(Protocol):
         schema: BaseComponentSchema,
         name: str,
         position: tuple[float, float, float],
+        force_local_axial: bool = False,
     ) -> tuple[list[Surface], list[Cell]]:
         ...
 
@@ -97,6 +98,7 @@ class _FuelPinTemplateExpander:
         schema: FuelPinSchema,
         name: str,
         position: tuple[float, float, float],
+        force_local_axial: bool = False,
     ) -> tuple[list[Surface], list[Cell]]:
         dx, dy, dz = position
 
@@ -127,8 +129,15 @@ class _FuelPinTemplateExpander:
         # a Box is present (bug: growing/shrinking the Box used to grow or
         # shrink every pin inside it, since both ends were the Box's own
         # surfaces).
+        # A rotated FuelPin (force_local_axial=True) can't borrow the
+        # parent Box's axial planes — those live in the BOX's own,
+        # unrotated frame, while this pin is about to be wrapped in its
+        # own local universe and rotated independently of the Box. Forcing
+        # the local-synthesis fallback keeps the pin's bottom/top planes in
+        # its own local frame, where the fill-cell's rotation applies to
+        # them correctly along with everything else.
         has_axial = getattr(ctx, "has_axial_bounds", None)
-        use_shared = callable(has_axial) and has_axial()
+        use_shared = callable(has_axial) and has_axial() and not force_local_axial
         extra_surfaces: list[Surface] = []
 
         if use_shared:
@@ -143,12 +152,13 @@ class _FuelPinTemplateExpander:
             )
             extra_surfaces.append(bot)
             bot_id = bot.id
-            _warn(
-                ctx,
-                "FuelPin placed without a Box for shared axial bounds; "
-                "using each pin's pellet_height for local z-planes (preview only). "
-                "Add a Box via SinglePlacement for production geometry.",
-            )
+            if not force_local_axial:
+                _warn(
+                    ctx,
+                    "FuelPin placed without a Box for shared axial bounds; "
+                    "using each pin's pellet_height for local z-planes (preview only). "
+                    "Add a Box via SinglePlacement for production geometry.",
+                )
 
         # Top is always synthesized from pellet_height, regardless of
         # whether a Box is present, so pin height stays independent of Box
@@ -206,6 +216,7 @@ def expand_template(
     schema: BaseComponentSchema,
     name: str,
     position: tuple[float, float, float],
+    force_local_axial: bool = False,
 ) -> tuple[list[Surface], list[Cell]]:
     expander = TEMPLATE_REGISTRY.get(type(schema))
     if expander is None:
@@ -214,4 +225,4 @@ def expand_template(
             f"composite template. Registered types: "
             f"{[t.__name__ for t in TEMPLATE_REGISTRY]}."
         )
-    return expander.expand_template(ctx, schema, name, position)
+    return expander.expand_template(ctx, schema, name, position, force_local_axial=force_local_axial)

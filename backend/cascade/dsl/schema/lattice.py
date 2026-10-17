@@ -22,6 +22,15 @@ from pydantic import Field, model_validator
 
 from .base import BaseComponentSchema
 
+# Shared rotation field descriptions/defaults for both lattice schemas.
+# See SinglePlacementSchema for the rotation convention (intrinsic XYZ
+# Euler, degrees, OpenMC's native cell-rotation semantics).
+_ROTATION_DOC = (
+    "Rigid-body rotation applied to the whole assembly (degrees, about "
+    "the lattice's own origin) — every pin's grid position AND its own "
+    "orientation rotate together, like tilting the whole lattice."
+)
+
 
 class SquareLatticeSchema(BaseComponentSchema):
     """Rectangular NxM grid of a single template type.
@@ -84,6 +93,26 @@ class SquareLatticeSchema(BaseComponentSchema):
     origin_z: float = Field(default=0.0,
         description="Z position (bottom face) of all pins (cm).")
 
+    # Assembly-level rigid rotation — see _ROTATION_DOC above.
+    rx: float = Field(default=0.0, description=_ROTATION_DOC + " X component.")
+    ry: float = Field(default=0.0, description=_ROTATION_DOC + " Y component.")
+    rz: float = Field(default=0.0, description=_ROTATION_DOC + " Z component.")
+
+    # Per-pin orientation override, keyed by row-major pin index (matching
+    # pin_positions()'s iteration order). Overrides that pin's OWN
+    # orientation only — its grid position still follows the (possibly
+    # assembly-rotated) lattice, exactly like swapping in a differently-
+    # oriented pin at that one slot (e.g. an alternately-keyed control
+    # blade). Most lattices leave this empty.
+    pin_rotation_overrides: dict[int, tuple[float, float, float]] = Field(
+        default_factory=dict,
+        description=(
+            "Per-pin orientation override: {pin_index: (rx, ry, rz) degrees}. "
+            "Index matches pin_positions()'s row-major order. Overrides only "
+            "that pin's own tilt, not its grid position."
+        ),
+    )
+
     model_config = {"frozen": True}
 
     @model_validator(mode="after")
@@ -106,6 +135,29 @@ class SquareLatticeSchema(BaseComponentSchema):
                 z = self.origin_z
                 positions.append((x, y, z))
         return positions
+
+    def pin_rotations(self) -> list[tuple[float, float, float]]:
+        """Return each pin's OWN (rx, ry, rz), before the assembly-level
+        rigid rotation is applied on top. Defaults to (0, 0, 0) — i.e. no
+        individual tilt beyond whatever the assembly rotation contributes —
+        except where pin_rotation_overrides names that index."""
+        return [
+            self.pin_rotation_overrides.get(i, (0.0, 0.0, 0.0))
+            for i in range(self.total_pins())
+        ]
+
+    def assembly_rotation(self) -> tuple[float, float, float]:
+        return (self.rx, self.ry, self.rz)
+
+    def origin_point(self) -> tuple[float, float, float]:
+        """The point the assembly-level rotation pivots about."""
+        return (self.origin_x, self.origin_y, self.origin_z)
+
+    def is_rotated(self) -> bool:
+        return (
+            self.rx != 0.0 or self.ry != 0.0 or self.rz != 0.0
+            or bool(self.pin_rotation_overrides)
+        )
 
     def total_pins(self) -> int:
         return self.nx * self.ny
@@ -161,6 +213,22 @@ class HexLatticeSchema(BaseComponentSchema):
     center_y: float = Field(default=0.0, description="Y of the center pin (cm).")
     center_z: float = Field(default=0.0, description="Z of the bottom face of all pins (cm).")
 
+    # Assembly-level rigid rotation — see _ROTATION_DOC above.
+    rx: float = Field(default=0.0, description=_ROTATION_DOC + " X component.")
+    ry: float = Field(default=0.0, description=_ROTATION_DOC + " Y component.")
+    rz: float = Field(default=0.0, description=_ROTATION_DOC + " Z component.")
+
+    # Per-pin orientation override — see SquareLatticeSchema for semantics.
+    # Index matches pin_positions()'s order (center-outward ring walk).
+    pin_rotation_overrides: dict[int, tuple[float, float, float]] = Field(
+        default_factory=dict,
+        description=(
+            "Per-pin orientation override: {pin_index: (rx, ry, rz) degrees}. "
+            "Index matches pin_positions()'s center-outward order. Overrides "
+            "only that pin's own tilt, not its grid position."
+        ),
+    )
+
     model_config = {"frozen": True}
 
     @model_validator(mode="after")
@@ -172,6 +240,26 @@ class HexLatticeSchema(BaseComponentSchema):
                 f"Maximum is 10,000."
             )
         return self
+
+    def pin_rotations(self) -> list[tuple[float, float, float]]:
+        """Return each pin's OWN (rx, ry, rz) — see SquareLatticeSchema."""
+        return [
+            self.pin_rotation_overrides.get(i, (0.0, 0.0, 0.0))
+            for i in range(self.total_pins())
+        ]
+
+    def assembly_rotation(self) -> tuple[float, float, float]:
+        return (self.rx, self.ry, self.rz)
+
+    def origin_point(self) -> tuple[float, float, float]:
+        """The point the assembly-level rotation pivots about."""
+        return (self.center_x, self.center_y, self.center_z)
+
+    def is_rotated(self) -> bool:
+        return (
+            self.rx != 0.0 or self.ry != 0.0 or self.rz != 0.0
+            or bool(self.pin_rotation_overrides)
+        )
 
     def total_pins(self) -> int:
         n = self.n_rings - 1
