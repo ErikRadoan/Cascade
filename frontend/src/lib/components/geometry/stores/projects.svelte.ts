@@ -7,6 +7,9 @@
 import type { SceneResponse, ValidationError } from '$lib/types';
 import * as api from '$lib/api';
 import { withBusy } from '$lib/stores/busy.svelte';
+import { TextHistory } from './textHistory';
+import { geometrySelection } from './selection.svelte';
+import yaml from '../yamlParseHelper';
 
 const DEFAULT_TEXT = `# Cascade geometry definition
 # Define templates first, then place them
@@ -63,6 +66,25 @@ export interface GeometryProject {
   isSaved: boolean;   // has this project ever been persisted (has a real backend id)
   isDirty: boolean;   // unsaved changes since the last successful save/update
   isSaving: boolean;
+
+  // ---- Undo/redo (see textHistory.ts) ----
+  // `history` is a plain class instance: Svelte does NOT make it reactive, so
+  // never read `history.canUndo` from a template. Read the mirrored booleans
+  // below, which syncHistoryFlags() refreshes after every history operation.
+  history: TextHistory<SelectionSnapshot>;
+  canUndo: boolean;
+  canRedo: boolean;
+
+  // Monotonic counter bumped by every applyText(). A validate/scene response
+  // is applied only if it still carries the latest value, so out-of-order
+  // responses (rapid undo/redo, fast edits) can never overwrite a newer scene.
+  validationSeq: number;
+}
+
+/** UI selection captured alongside each history snapshot (restored on undo/redo). */
+export interface SelectionSnapshot {
+  item:  { kind: 'template' | 'placement'; name: string } | null;
+  names: string[];
 }
 
 function makeProject(opts: { id?: string; name: string; text?: string; isSaved?: boolean }): GeometryProject {
@@ -79,6 +101,10 @@ function makeProject(opts: { id?: string; name: string; text?: string; isSaved?:
     isSaved:        opts.isSaved ?? false,
     isDirty:        false,
     isSaving:       false,
+    history:        new TextHistory<SelectionSnapshot>(),
+    canUndo:        false,
+    canRedo:        false,
+    validationSeq:  0,
   };
 }
 
@@ -164,8 +190,104 @@ export async function restoreProjects(
 const validateTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-export function setGeometryText(text: string, opts: { immediate?: boolean } = {}): Promise<void> | undefined {
+/**
+ * Replace the ACTIVE project's YAML text, revalidate, rebuild the scene, and
+ * schedule an autosave. This is the single write path for geometry text, which
+ * is what makes undo/redo complete: every edit lands here.
+ *
+ * History rules:
+ *  - A call whose text equals the current text is NOT recorded. This keeps the
+ *    internal "reload the scene" calls (newProject, openExistingProject,
+ *    restoreProjects, GeometryEditor's effect) out of the undo stack without
+ *    those callers needing to know about history.
+ *  - `coalesceKey` merges a burst of edits to the same thing (e.g. repeated
+ *    changes to one parameter field) into a single undo step. Omit it for
+ *    discrete operations (create, delete, rename) — each becomes its own step.
+ */
+export function setGeometryText(
+  text: string,
+  opts: { immediate?: boolean; coalesceKey?: string } = {},
+): Promise<void> | undefined {
   const project = activeProject();
+
+  if (text !== project.text) {
+    project.history.record(captureSnapshot(project), opts.coalesceKey);
+    syncHistoryFlags(project);
+  }
+
+  return applyText(project, text, { immediate: opts.immediate });
+}
+
+// ---------------------------------------------------------------------------
+// Undo / redo
+// ---------------------------------------------------------------------------
+
+function captureSnapshot(project: GeometryProject) {
+  const item = geometrySelection.selectedItem;
+  return {
+    text: project.text,
+    sel: {
+      item:  item ? { kind: item.kind, name: item.name } : null,
+      names: [...geometrySelection.selectedNames],
+    } satisfies SelectionSnapshot,
+  };
+}
+
+function syncHistoryFlags(project: GeometryProject) {
+  project.canUndo = project.history.canUndo;
+  project.canRedo = project.history.canRedo;
+}
+
+/**
+ * Restore the selection captured with a snapshot, dropping anything that does
+ * not exist in the restored document (e.g. undoing a "create" would otherwise
+ * leave the just-removed object selected and ParametersPanel pointing at air).
+ */
+function restoreSelection(sel: SelectionSnapshot, restoredText: string) {
+  const doc = yaml.parse(restoredText);
+  const exists = (name: string) =>
+    !!doc && typeof doc === 'object' && Object.prototype.hasOwnProperty.call(doc, name);
+
+  geometrySelection.selectedItem = sel.item && exists(sel.item.name) ? { ...sel.item } : null;
+  geometrySelection.selectedNames = sel.names.filter(exists);
+}
+
+function stepHistory(direction: 'undo' | 'redo'): boolean {
+  const project = activeProject();
+  const current = captureSnapshot(project);
+  const target = direction === 'undo'
+    ? project.history.undo(current)
+    : project.history.redo(current);
+  syncHistoryFlags(project);
+  if (!target) return false;
+
+  restoreSelection(target.sel, target.text);
+  // Short debounce rather than immediate: holding Ctrl+Z auto-repeats at
+  // ~30 Hz and each applied text costs a backend validate + scene build. 120 ms
+  // still feels instant for a single press and collapses a held key to one build.
+  applyText(project, target.text, { debounceMs: UNDO_REDO_DEBOUNCE_MS });
+  return true;
+}
+
+const UNDO_REDO_DEBOUNCE_MS = 120;
+
+/** Undo the last edit on the active project. Returns false if nothing to undo. */
+export function undo(): boolean { return stepHistory('undo'); }
+
+/** Redo the last undone edit on the active project. Returns false if nothing to redo. */
+export function redo(): boolean { return stepHistory('redo'); }
+
+/**
+ * Core text application: sets the text, marks dirty/stale, (re)schedules
+ * validation + scene build and autosave. Does NOT touch history — callers
+ * decide whether the change is an undoable edit (setGeometryText) or a
+ * history replay (undo/redo).
+ */
+function applyText(
+  project: GeometryProject,
+  text: string,
+  opts: { immediate?: boolean; debounceMs?: number } = {},
+): Promise<void> | undefined {
   project.text = text;
   project.isSceneStale = true;
   project.isDirty = true;
@@ -173,28 +295,41 @@ export function setGeometryText(text: string, opts: { immediate?: boolean } = {}
   const existingTimer = validateTimers.get(project.id);
   if (existingTimer) clearTimeout(existingTimer);
 
+  // This run supersedes every earlier one. After each await we bail out if a
+  // newer applyText() has happened, so a slow response for old text can never
+  // overwrite the scene/errors of newer text.
+  const seq = ++project.validationSeq;
+  const isLatest = () => seq === project.validationSeq;
+
   const run = async () => {
     project.isValidating = true;
     try {
       const result = await api.geometry.validate(text);
+      if (!isLatest()) return;
       project.isValid = result.valid;
       project.errors  = result.errors;
 
-      if (result.valid) {
-        project.isLoadingScene = true;
-        try {
-          project.scene = await api.geometry.scene(text);
-          project.isSceneStale = false;
-        } catch {
-          // keep stale flag — viewport shows "Updating…" rather than crash
-        } finally {
-          project.isLoadingScene = false;
-        }
+      if (!result.valid) {
+        // A superseded run may have left this true; the latest run owns it.
+        project.isLoadingScene = false;
+        return;
+      }
+
+      project.isLoadingScene = true;
+      try {
+        const scene = await api.geometry.scene(text);
+        if (!isLatest()) return;
+        project.scene = scene;
+        project.isSceneStale = false;
+      } catch {
+        // keep stale flag — viewport shows "Updating…" rather than crash
+      } finally {
+        if (isLatest()) project.isLoadingScene = false;
       }
     } catch {
       // network error — leave previous validation state visible
     } finally {
-      project.isValidating = false;
+      if (isLatest()) project.isValidating = false;
     }
   };
 
@@ -204,7 +339,7 @@ export function setGeometryText(text: string, opts: { immediate?: boolean } = {}
   if (opts.immediate) {
     inFlight = run();
   } else {
-    validateTimers.set(project.id, setTimeout(run, 400));
+    validateTimers.set(project.id, setTimeout(run, opts.debounceMs ?? 400));
   }
 
   scheduleAutosave(project);
@@ -228,12 +363,18 @@ export async function saveProject(projectId: string): Promise<void> {
   const project = projects.list.find(p => p.id === projectId);
   if (!project || project.isSaving) return;
 
+  // Persist exactly what we captured. The text can change while the request
+  // is in flight (and with undo/redo, it can change back and forth quickly).
+  const savedText = project.text;
+  const savedName = project.name;
+  let editedDuringSave = false;
+
   project.isSaving = true;
   try {
     if (project.isSaved) {
-      await api.geometry.update(project.id, project.text, project.name);
+      await api.geometry.update(project.id, savedText, savedName);
     } else {
-      const result = await api.geometry.save(project.text, project.name);
+      const result = await api.geometry.save(savedText, savedName);
       const oldId = project.id;
       // Adopt the real backend id — the tab's identity now matches the
       // persisted record. Existing references to the old tmp- id (e.g.
@@ -259,14 +400,24 @@ export async function saveProject(projectId: string): Promise<void> {
         }
       }
     }
-    project.isDirty = false;
+    // Only clean if nothing changed since we captured it. Previously this
+    // was unconditional, and an autosave that fired mid-save was dropped by
+    // the isSaving guard above — leaving the newest edit unpersisted yet
+    // marked clean. Undo/redo makes that window much easier to hit.
+    editedDuringSave = project.text !== savedText || project.name !== savedName;
+    project.isDirty = editedDuringSave;
   } catch {
     // Leave isDirty true — next edit or manual save retries.
     // Silent failure here is deliberate: autosave shouldn't interrupt
     // the user with a popup on every transient network hiccup.
+    // (We deliberately do NOT reschedule here, or a dead backend would be
+    // hammered every 1.2 s.)
   } finally {
     project.isSaving = false;
   }
+
+  // Successful save, but newer edits arrived meanwhile: persist them too.
+  if (editedDuringSave) scheduleAutosave(project);
 }
 
 // ---------------------------------------------------------------------------

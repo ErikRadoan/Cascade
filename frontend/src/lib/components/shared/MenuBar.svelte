@@ -3,6 +3,11 @@
   // View menu controls panel visibility and can open the YAML editor.
 
   import MaterialLibraryModal from '$lib/components/geometry/MaterialLibraryModal.svelte';
+  import { activeProject, undo, redo } from '$lib/components/geometry/stores/projects.svelte';
+  import { ui } from '$lib/stores/ui.svelte';
+
+  // Declared before `menus` below, which reads it while building shortcut hints.
+  const isMac = typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform);
 
   let openMenu = $state<string | null>(null);
   let showMaterialLibrary = $state(false);
@@ -10,7 +15,7 @@
   const menus: {
     id: string;
     label: string;
-    items: ({ label: string; action: () => void; divider?: never } | { divider: true; label?: never; action?: never })[];
+    items: ({ label: string; action: () => void; disabled?: () => boolean; hint?: string; divider?: never } | { divider: true; label?: never; action?: never; disabled?: never; hint?: never })[];
   }[] = [
     {
       id: 'file',
@@ -28,8 +33,9 @@
       id: 'edit',
       label: 'Edit',
       items: [
-        { label: 'Undo',  action: () => {} },
-        { label: 'Redo',  action: () => {} },
+        // Undo/redo only apply to the geometry tab's active project.
+        { label: 'Undo',  action: () => doUndo(), disabled: () => !historyAvailable('undo'), hint: isMac ? '⌘Z'  : 'Ctrl+Z' },
+        { label: 'Redo',  action: () => doRedo(), disabled: () => !historyAvailable('redo'), hint: isMac ? '⇧⌘Z' : 'Ctrl+Shift+Z' },
         { divider: true },
         { label: 'Select all', action: () => {} },
         { divider: true },
@@ -48,6 +54,15 @@
       ],
     },
   ];
+
+  // Reads reactive flags on the active project, so the menu items enable/disable live.
+  function historyAvailable(kind: 'undo' | 'redo'): boolean {
+    if (ui.activeTab !== 'geometry') return false;
+    const p = activeProject();
+    return kind === 'undo' ? p.canUndo : p.canRedo;
+  }
+  function doUndo() { undo(); closeMenu(); }
+  function doRedo() { redo(); closeMenu(); }
 
   // Placeholder actions — wire up when state is ready
   function newGeometry()       { /* TODO */ closeMenu(); }
@@ -107,8 +122,10 @@
                   class="menu-item"
                   role="menuitem"
                   onclick={item.action}
+                  disabled={item.disabled?.() ?? false}
                 >
-                  {item.label}
+                  <span>{item.label}</span>
+                  {#if item.hint}<span class="hint">{item.hint}</span>{/if}
                 </button>
               </li>
             {/if}
@@ -192,12 +209,26 @@
     padding: 5px 10px;
     border-radius: 4px;
     cursor: pointer;
-    display: block;
+    display: flex;
+    justify-content: space-between;
+    gap: 24px;
   }
 
-  .menu-item:hover {
+  .menu-item:hover:not(:disabled) {
     background: var(--color-bg-raised);
     color: var(--color-accent-hi);
+  }
+
+  .menu-item:disabled {
+    color: var(--color-subtext);
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .hint {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--color-subtext);
   }
 
   .menu-divider {

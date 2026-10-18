@@ -104,7 +104,10 @@
 
     doc[sel.name][key] = newValue;
     const newText = dump(doc, { indent: 2, lineWidth: -1 });
-    setGeometryText(newText);
+    // coalesceKey: a burst of edits to the same field (spinner clicks, typing
+    // that commits repeatedly) collapses into ONE undo step. Different
+    // field/object => different key => separate steps.
+    setGeometryText(newText, { coalesceKey: `field:${sel.kind}:${sel.name}:${key}` });
   }
 
   function toggleMaterial(field: FieldEntry, mat: string, checked: boolean) {

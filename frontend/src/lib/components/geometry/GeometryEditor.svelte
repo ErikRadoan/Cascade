@@ -7,7 +7,7 @@
   //
   // Everything below the tab bar operates on the ACTIVE project.
 
-  import { activeProject, setGeometryText } from './stores/projects.svelte';
+  import { activeProject, setGeometryText, undo, redo } from './stores/projects.svelte';
   import GeometryTabBar from './GeometryTabBar.svelte';
   import DockLayout from './dock/DockLayout.svelte';
   import { dock } from './dock/dockStore.svelte.js';
@@ -44,7 +44,46 @@
       setGeometryText(p.text, { immediate: true });
     }
   });
+
+  // ---- Undo / redo shortcuts -------------------------------------------------
+  // Ctrl/Cmd+Z = undo, Ctrl/Cmd+Shift+Z = redo, Ctrl+Y = redo (Windows/Linux).
+  // This component is only mounted while the geometry tab is showing, so the
+  // listener is naturally scoped to it.
+  //
+  // We deliberately stand down when the user is typing in a text field: the
+  // browser's native per-input undo is what they expect there, and hijacking
+  // it would undo the whole geometry instead of the character they just typed.
+  // Checkboxes/ranges/buttons have no native text undo, so the shortcut applies.
+  const NON_TEXT_INPUT_TYPES = new Set([
+    'checkbox', 'radio', 'button', 'submit', 'reset', 'range', 'color', 'file', 'image',
+  ]);
+
+  function isTextEntryTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) return false;
+    if (target.isContentEditable) return true;
+    if (target instanceof HTMLInputElement) return !NON_TEXT_INPUT_TYPES.has(target.type);
+    return target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
+  }
+
+  function onHistoryKeydown(e: KeyboardEvent) {
+    if (e.defaultPrevented || e.altKey) return;
+    if (!(e.ctrlKey || e.metaKey)) return;
+    if (isTextEntryTarget(e.target)) return;
+    // Don't edit the geometry behind an open modal (Material Library, job dialogs).
+    if (document.querySelector('.modal-backdrop, [aria-modal="true"]')) return;
+
+    const key = e.key.toLowerCase();
+    if (key === 'z') {
+      e.preventDefault();
+      if (e.shiftKey) redo(); else undo();
+    } else if (key === 'y' && e.ctrlKey && !e.shiftKey) {
+      e.preventDefault();
+      redo();
+    }
+  }
 </script>
+
+<svelte:window onkeydown={onHistoryKeydown} />
 
 <div class="geometry-tab">
   <GeometryTabBar />
