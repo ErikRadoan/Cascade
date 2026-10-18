@@ -6,6 +6,7 @@
 
 import type { SceneResponse, ValidationError } from '$lib/types';
 import * as api from '$lib/api';
+import { withBusy } from '$lib/stores/busy.svelte';
 
 const DEFAULT_TEXT = `# Cascade geometry definition
 # Define templates first, then place them
@@ -99,11 +100,18 @@ export function activeProject(): GeometryProject {
 
 /**
  * Restore previously saved geometries as open tabs on app startup.
- * Called once from GeometryEditor's onMount. If there are no saved
- * geometries yet (fresh install), falls back to the default blank tab
+ * Called once from `bootstrap()` in stores/appStatus.svelte.ts (NOT from a
+ * component's onMount any more — the splash screen owns startup). If there are
+ * no saved geometries yet (fresh install), falls back to the default blank tab
  * already seeded by the module-level `projects` state above.
+ *
+ * `onProgress(done, total)` drives the splash's "2 of 5 loaded" line. The
+ * returned promise resolves only after the ACTIVE tab's scene has been built
+ * (or failed), so the splash can stay up until the viewport is ready.
  */
-export async function restoreProjects(): Promise<void> {
+export async function restoreProjects(
+  opts: { onProgress?: (done: number, total: number) => void } = {},
+): Promise<void> {
   let saved: { id: string; name: string; created_at: string }[];
   try {
     saved = await api.geometry.list();
@@ -115,20 +123,26 @@ export async function restoreProjects(): Promise<void> {
 
   // Load full text for each saved geometry and replace the default
   // placeholder tab with real ones, most recently created first.
-  const loaded: GeometryProject[] = [];
-  for (const g of saved) {
+  // Fetched in parallel; Promise.all preserves the order of `saved`, so tab
+  // order is unchanged from the old sequential loop.
+  let done = 0;
+  opts.onProgress?.(0, saved.length);
+  const results = await Promise.all(saved.map(async (g): Promise<GeometryProject | null> => {
     try {
       const detail = await api.geometry.get(g.id);
-      loaded.push(makeProject({
+      return makeProject({
         id:      detail.id,
         name:    detail.name,
         text:    detail.yaml_text ?? DEFAULT_TEXT,
         isSaved: true,
-      }));
+      });
     } catch {
-      // skip any geometry that fails to load individually
+      return null; // skip any geometry that fails to load individually
+    } finally {
+      opts.onProgress?.(++done, saved.length);
     }
-  }
+  }));
+  const loaded = results.filter((p): p is GeometryProject => p !== null);
 
   if (loaded.length === 0) return;
 
@@ -136,8 +150,9 @@ export async function restoreProjects(): Promise<void> {
   projects.activeId = loaded[0].id;
 
   // Validate + build scene for whichever tab ends up active, same as
-  // newProject()/openExistingProject() already do.
-  setGeometryText(activeProject().text, { immediate: true });
+  // newProject()/openExistingProject() already do. Awaited so callers (the
+  // splash screen) know when the first viewport is actually ready.
+  await setGeometryText(activeProject().text, { immediate: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +164,7 @@ export async function restoreProjects(): Promise<void> {
 const validateTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-export function setGeometryText(text: string, opts: { immediate?: boolean } = {}) {
+export function setGeometryText(text: string, opts: { immediate?: boolean } = {}): Promise<void> | undefined {
   const project = activeProject();
   project.text = text;
   project.isSceneStale = true;
@@ -183,13 +198,17 @@ export function setGeometryText(text: string, opts: { immediate?: boolean } = {}
     }
   };
 
+  // Immediate runs hand their promise back so callers can await the finished
+  // scene (restoreProjects does). Debounced runs return undefined: nothing to wait for.
+  let inFlight: Promise<void> | undefined;
   if (opts.immediate) {
-    run();
+    inFlight = run();
   } else {
     validateTimers.set(project.id, setTimeout(run, 400));
   }
 
   scheduleAutosave(project);
+  return inFlight;
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +296,9 @@ export async function openExistingProject(geometryId: string): Promise<void> {
     return;
   }
 
-  const detail = await api.geometry.get(geometryId);
+  // The tab doesn't exist until this resolves, so there's no per-project
+  // loading flag to hang a spinner on — hence the global busy indicator.
+  const detail = await withBusy('Opening geometry…', () => api.geometry.get(geometryId));
   const project = makeProject({
     id:      detail.id,
     name:    detail.name,

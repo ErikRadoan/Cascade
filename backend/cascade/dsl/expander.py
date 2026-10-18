@@ -7,15 +7,15 @@ from __future__ import annotations
 import math
 import uuid
 from dataclasses import dataclass, field
-from domain.geometry import BoundaryType, CascadeGeometry, Cell, Complement, Inside, Intersection, LatticeInstance, Outside, Region, Surface, SurfaceType, Union, region_from_yaml_dict
-from dsl import primitives, templates
+from ..domain.geometry import BoundaryType, CascadeGeometry, Cell, Complement, Inside, Intersection, LatticeInstance, Outside, Region, Surface, SurfaceType, Union, region_from_yaml_dict
+from . import primitives, templates
 from .schema.base import BaseComponentSchema
 from .schema.boolean import BooleanPlacementSchema, IntersectionSchema, SubtractionSchema, UnionSchema
 from .schema.box import BoxSchema
 from .schema.cell import CellSchema
 from .schema.fuel_pin import FuelPinSchema
-from dsl.schema.lattice import HexLatticeSchema, SquareLatticeSchema
-from dsl.schema.single_placement import SinglePlacementSchema
+from .schema.lattice import HexLatticeSchema, SquareLatticeSchema
+from .schema.single_placement import SinglePlacementSchema
 from .schema.sphere import SphereSchema
 from .schema.torus import TorusSchema
 

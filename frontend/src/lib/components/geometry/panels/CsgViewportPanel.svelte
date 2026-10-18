@@ -29,6 +29,13 @@
   const MAX_TOKENS_PER_PROTO = 256;
   const MAX_BVH_NODES = 8192;
   const INTERACT_DPR = 0.65;
+  // Tint pixels where two solid (non-fill) cells genuinely overlap. Overlaps are
+  // invalid in OpenMC, so this doubles as a cheap geometry sanity check.
+  const MARK_OVERLAPS = true;
+  // Depth-tolerance floor as a fraction of scene span. ~50x float32 ulp at the
+  // scene scale: small enough never to blur real features, big enough that
+  // float noise cannot flip a tie. The per-pixel tolerance is screen-relative.
+  const EPS_MIN_FRACTION = 1e-5;
   const IDLE_DPR = Math.min(typeof window !== 'undefined' ? window.devicePixelRatio : 1.5, 1.5);
 
   const OP_INSIDE = 0, OP_OUTSIDE = 1, OP_AND = 2, OP_OR = 3, OP_NOT = 4;
@@ -417,6 +424,10 @@
     uniform sampler2D uTokenTex, uInstanceTex, uBvhTex;
     uniform int uInstanceCount, uBvhNodeCount;
     uniform vec3 uSceneBMin, uSceneBMax;
+    // Phase 1 (coincident faces). See epsAt()/sceneHit(). All three are set from JS.
+    uniform float uEpsMin;        // depth-tolerance floor, scene-scaled (float32 noise guard)
+    uniform float uPixelAngle;    // half a pixel, in radians: 0.5 * 2*tan(fov/2) / drawingBufferHeight
+    uniform float uMarkOverlaps;  // >0.5 tints pixels where two solid cells genuinely overlap
     varying vec2 vUv;
 
     float surfaceSDF(int idx, vec3 p) {
@@ -632,19 +643,104 @@
       return tEnter;
     }
 
+    // ======================================================================
+    // Hit tolerance + coincident-face (tie) handling  -- Phase 1
+    // ======================================================================
+    // PROBLEM: when two cells share a face (adjacent boxes, pellet|gap|clad
+    // rings on the same z-plane, box wall == fill wall) both leaves "hit" at
+    // the same depth. The old code kept whichever leaf the BVH visited first,
+    // so the winner depended on camera angle (shimmering seams). On top of
+    // that the march stop test (d < 0.002) dilates every cell by ~0.002, so
+    // two neighbours overlap in a thin sliver and BOTH report a hit there.
+    //
+    // FIX, in three parts:
+    //  1. epsAt(): the tolerance is half a pixel of world-space footprint at
+    //     distance t (floored by uEpsMin) instead of a hard-coded 0.002, so it
+    //     scales with zoom and scene size.
+    //  2. Hits whose depths differ by < tieAt(t) are a TIE. All tied leaves are
+    //     kept as candidates instead of "first found wins".
+    //  3. Ties are resolved by EXACT containment: sample every candidate's
+    //     region (no dilation) at a point just past the hit, and pick the cell
+    //     that genuinely contains it. If several contain it (a real overlap),
+    //     solid cells beat the plane-only fill stand-in, then the later-defined
+    //     cell (higher prototype index) wins, and the pixel is flagged so it
+    //     can be tinted (uMarkOverlaps).
+    // Result: deterministic, camera-angle independent, no dilation slivers.
+    float epsAt(float t) { return max(uEpsMin, t * uPixelAngle); }
+    float tieAt(float t) { return 2.0 * epsAt(t); }
+    #define MAX_CAND 8
+    // Probe depth past the hit, in units of eps. leafExact() returns the EXACT crossing
+    // depth, so the probe only has to clear float noise, and every extra bit of depth
+    // drifts the probe sideways on tilted rays (misattributing boundary pixels by
+    // ~PROBE_MUL*eps*sin(tilt)). On a CPU port of this logic 0.1 gave zero order-
+    // dependence and ~1.5% wrong-owner rays (all within noise of a boundary), vs ~45%
+    // at the 1.25 that the old sphere-trace needed to clear its own stopping error.
+    // NOTE: the oversized-prototype march fallback has up to ~1 eps stopping error, so
+    // ties between two such cells can still misattribute at tilted angles.
+    #define PROBE_MUL 0.1
+
+    // ======================================================================
+    // Exact leaf hit (Phase 2) -- replaces sphere-tracing for ordinary cells
+    // ======================================================================
+    // PROBLEM: the old leaf hit sphere-traced region SDF with a 96-step cap.
+    // Inside a narrow, deep cavity (a pin-cell shaft, a slot, a hole) the rays
+    // run almost parallel to the walls, so each step (= distance to the
+    // nearest wall) barely advances and convergence is geometric with a ratio
+    // of (1 - cos(angle to wall normal)) ~ 1. The cap is hit before the ray
+    // reaches the wall, the leaf reports "no hit", and the wall / floor
+    // vanishes (showing whatever lies behind, or the background).
+    //
+    // FIX: a cell's boundary can only be entered at a ray/surface crossing of
+    // one of ITS OWN surfaces, and every surface type we render is analytic.
+    // So: intersect the ray with each surface in the token stream (<= 2 t's
+    // each), and take the nearest crossing where the region flips from
+    // outside to inside. Cost is O(tokens^2) per leaf but independent of ray
+    // angle, so it cannot run out of steps, and the returned t is exact (no
+    // early-stop error), which also makes Phase-1 ties cleaner.
+    //
+    // Falls back to the old march only for oversized token streams (> MAX_EXACT_TOKENS),
+    // where trying every crossing would be too expensive.
+    #define MAX_EXACT_TOKENS 48
+    // Returns the first t in [tStart, tEnd) where the ray enters the region, else INF.
+    float leafExact(int protoIdx, vec3 roL, vec3 rd, float tStart, float tEnd) {
+      // Ray already inside the cell at the window start (camera inside geometry).
+      if (evalRegion(protoIdx, roL + rd * tStart) <= 0.0) return tStart;
+      int tokenCount = uProtoTokenCount[protoIdx];
+      float best = INF;
+      for (int i = 0; i < MAX_EXACT_TOKENS; i++) {
+        if (i >= tokenCount) break;
+        vec2 tok = fetchToken(protoIdx, i);
+        int op = int(tok.x + 0.5);
+        if (op > 1) continue;                    // only Inside/Outside tokens name a surface
+        int sIdx = int(tok.y + 0.5);
+        if (sIdx < 0) continue;
+        vec2 iv = surfaceInterval(sIdx, roL, rd);  // (INF, NEG_INF) = no crossing; +/-INF = open end
+        for (int k = 0; k < 2; k++) {
+          float tc = (k == 0) ? iv.x : iv.y;
+          if (abs(tc) >= INF * 0.5 || tc < tStart || tc >= min(tEnd, best)) continue;
+          // Entering test: outside just before the crossing, inside just after.
+          // Rejects crossings of internal faces that are not part of the cell boundary.
+          // dl is a fraction of a pixel, so thinner-than-that slivers are skipped.
+          float dl = max(0.1 * epsAt(tc), 1.0e-6);
+          if (evalRegion(protoIdx, roL + rd * (tc - dl)) > 0.0 &&
+              evalRegion(protoIdx, roL + rd * (tc + dl)) <= 0.0) best = tc;
+        }
+      }
+      return best;
+    }
+
     // Traverse BVH; for each leaf hybrid-hit in local frame:
     //   1) analytic interval as a seed (fast when CSG is simple Inside-heavy)
     //   2) SDF sphere-trace clamped to the leaf AABB interval (robust for
     //      Outside/Complement, which single-interval CSG cannot represent)
-    // Returns best t; outs proto + instance offset for shading.
-    float sceneHit(vec3 ro, vec3 rd, out int hitProto, out vec3 hitOff) {
-      // Track pin vs fill hits separately. Plane-only fill is a solid box (no
-      // pin holes); without priority, the shared top/bot plane makes fill win
-      // every ray from above and pins disappear past ~7 pins (when plane-only
-      // activates). Pin wins on near-ties and whenever it is clearly nearer.
-      hitProto = -1; hitOff = vec3(0.0);
-      float bestPin = INF; int pinProto = -1; vec3 pinOff = vec3(0.0);
-      float bestFill = INF; int fillProto = -1; vec3 fillOff = vec3(0.0);
+    // Collects every hit within tieAt() of the nearest one, then resolves ties
+    // by containment. Returns best t; outs proto + instance offset for shading
+    // and whether two solid (non-fill) cells genuinely overlap at this pixel.
+    float sceneHit(vec3 ro, vec3 rd, out int hitProto, out vec3 hitOff, out bool hitOverlap) {
+      hitProto = -1; hitOff = vec3(0.0); hitOverlap = false;
+      float candT[MAX_CAND]; int candProto[MAX_CAND]; vec3 candOff[MAX_CAND];
+      int candCount = 0;
+      float tBest = INF;   // nearest hit found so far (tie group is [tBest, tBest + tieAt])
       if (uBvhNodeCount <= 0) return INF;
       int stack[MAX_BVH_STACK]; int sp = 0; stack[sp++] = 0;
       for (int iter = 0; iter < MAX_BVH_ITERS; iter++) {
@@ -653,38 +749,59 @@
         if (nodeIdx < 0 || nodeIdx >= uBvhNodeCount) continue;
         vec4 t0 = fetchBvhTexel(nodeIdx, 0);
         vec4 t1 = fetchBvhTexel(nodeIdx, 1);
-        float bestAny = min(bestPin, bestFill);
+        // Tie window for the current best. Zero until the first hit (tBest = INF).
+        float tTol = (tBest < INF) ? tieAt(tBest) : 0.0;
         vec2 bi = boxInterval(ro, rd, t0.xyz, t1.xyz);
-        if (bi.x > bi.y || bi.x >= bestAny) continue;
+        // Prune only boxes that start beyond the tie window: a box that begins
+        // inside it can still hold a tied candidate.
+        if (bi.x > bi.y || bi.x > tBest + tTol) continue;
         if (t0.w > 0.5) {
           int instIdx = int(t1.w + 0.5);
           if (instIdx < 0 || instIdx >= uInstanceCount) continue;
           vec4 inst = fetchInstance(instIdx);
           int protoIdx = int(inst.w + 0.5);
           if (protoIdx < 0 || protoIdx >= uProtoCount) continue;
-          bool isFill = uProtoIsFill[protoIdx] > 0;
           vec3 roL = ro - inst.xyz;
           float tStart = max(bi.x, 0.0);
-          float tEnd = min(bi.y, isFill ? bestFill : bestPin);
+          float tEnd = min(bi.y, tBest + tTol);
           if (tStart >= tEnd) continue;
 
-          float tHit = evalIntervalEntry(protoIdx, roL, rd);
-          if (tHit < tStart || tHit >= tEnd) tHit = tStart;
-
-          for (int k = 0; k < LEAF_MARCH_STEPS; k++) {
-            if (tHit >= tEnd) break;
-            float d = evalRegion(protoIdx, roL + rd * tHit);
-            if (d < 0.002) {
-              if (tHit >= 0.0) {
-                if (isFill) {
-                  if (tHit < bestFill) { bestFill = tHit; fillProto = protoIdx; fillOff = inst.xyz; }
-                } else {
-                  if (tHit < bestPin) { bestPin = tHit; pinProto = protoIdx; pinOff = inst.xyz; }
-                }
-              }
-              break;
+          // hitT = depth of the first entry into this cell, or INF.
+          float hitT = INF;
+          if (uProtoTokenCount[protoIdx] <= MAX_EXACT_TOKENS) {
+            hitT = leafExact(protoIdx, roL, rd, tStart, tEnd);
+          } else {
+            // Fallback for huge token streams: analytic seed + SDF sphere-trace.
+            // Can still run out of steps at grazing angles (known limitation).
+            float tHit = evalIntervalEntry(protoIdx, roL, rd);
+            if (tHit < tStart || tHit >= tEnd) tHit = tStart;
+            for (int k = 0; k < LEAF_MARCH_STEPS; k++) {
+              if (tHit >= tEnd) break;
+              float eps = epsAt(tHit);
+              float d = evalRegion(protoIdx, roL + rd * tHit);
+              if (d < eps) { hitT = tHit; break; }
+              tHit += max(d, eps);
             }
-            tHit += max(d, 0.002);
+          }
+
+          if (hitT < INF && hitT >= 0.0) {
+            float tHit = hitT;
+            // Clearly nearer than the whole current group -> start a new group.
+            if (tHit < tBest - tTol) { candCount = 0; tBest = tHit; }
+            // Within the tie window -> keep as a candidate (never first-wins).
+            if (tHit <= tBest + tTol) {
+              int slot = candCount;
+              if (candCount >= MAX_CAND) {
+                // Full: evict the farthest candidate if this one is nearer.
+                slot = 0; float worst = candT[0];
+                for (int c = 1; c < MAX_CAND; c++) { if (candT[c] > worst) { worst = candT[c]; slot = c; } }
+                if (tHit >= worst) slot = -1;
+              } else {
+                candCount++;
+              }
+              if (slot >= 0) { candT[slot] = tHit; candProto[slot] = protoIdx; candOff[slot] = inst.xyz; }
+              tBest = min(tBest, tHit);
+            }
           }
         } else {
           vec4 t2 = fetchBvhTexel(nodeIdx, 2);
@@ -705,38 +822,54 @@
           }
         }
       }
-      // Pin-vs-fill priority:
-      // - Strictly nearer hit always wins.
-      // - Near-ties: pin wins. "fill" is a coarse stand-in for "everywhere
-      //   a pin doesn't exist" (lattices skip real pin-hole carving for
-      //   token-budget reasons — see planeOnlyRegion), so wherever there's
-      //   genuine ambiguity between the two, the pin's own exact geometry
-      //   is the one that should be trusted.
-      //   (This used to special-case "prefer fill unless looking steeply
-      //   down", to stop the shared top/bot plane from making every
-      //   top-down ray show fill instead of pin tops. But the same rule
-      //   was *also* hiding real cladding/gap on any pin at or beyond the
-      //   Box's edge — for a lattice wider than its Box, that's most of
-      //   the boundary row/column: the pin's clad surface sits at nearly
-      //   the same depth as the Box's own wall from most oblique angles,
-      //   so the "prefer fill" branch was firing there too, painting over
-      //   real pin material with the moderator's solid-box fill. Pin
-      //   winning unconditionally on ties fixes the top-down case *and*
-      //   this one, since it was never really about camera angle — it's
-      //   "trust the exact geometry over the approximation" either way.)
-      if (pinProto >= 0 && fillProto >= 0) {
-        if (bestFill < bestPin - 0.002) {
-          hitProto = fillProto; hitOff = fillOff; return bestFill;
-        }
-        hitProto = pinProto; hitOff = pinOff; return bestPin;
+      if (candCount == 0) return INF;
+
+      // Group may have shrunk after later, nearer hits: re-filter against final tBest.
+      float tFinalTol = tieAt(tBest);
+
+      // Fast path: a single candidate in the window is not a tie (the common case).
+      // Behaviour is identical to the pre-Phase-1 renderer here.
+      int only = -1; int inWindow = 0;
+      for (int c = 0; c < MAX_CAND; c++) {
+        if (c >= candCount) break;
+        if (candT[c] <= tBest + tFinalTol) { inWindow++; only = c; }
       }
-      if (fillProto >= 0) {
-        hitProto = fillProto; hitOff = fillOff; return bestFill;
+      if (inWindow == 1) { hitProto = candProto[only]; hitOff = candOff[only]; return candT[only]; }
+
+      // ---- Tie resolution by exact containment ----
+      // Probe slightly PAST the surface along the ray (deeper than the march's
+      // own ~1 eps stopping error) and ask each candidate's un-dilated region
+      // whether it really contains that point (SDF <= 0).
+      vec3 pProbe = ro + rd * (tBest + PROBE_MUL * epsAt(tBest));
+      int win = -1; bool winContains = false; float winD = INF; bool winFill = true; int winProto = -1;
+      int solidContaining = 0;
+      for (int c = 0; c < MAX_CAND; c++) {
+        if (c >= candCount) break;
+        if (candT[c] > tBest + tFinalTol) continue;
+        int pc = candProto[c];
+        float d2 = evalRegion(pc, pProbe - candOff[c]);
+        bool contains = d2 <= 0.0;
+        bool isFill = uProtoIsFill[pc] > 0;
+        if (contains && !isFill) solidContaining++;
+        bool better;
+        if (win < 0) better = true;
+        // 1. a cell that truly contains the probe beats one that does not
+        else if (contains != winContains) better = contains;
+        // 2. neither contains it (thin cell / grazing): take the closer one,
+        //    falling through to priority when the two are indistinguishable
+        else if (!contains && abs(d2 - winD) > epsAt(tBest)) better = d2 < winD;
+        // 3. true overlap: solid cells beat the plane-only fill stand-in
+        else if (isFill != winFill) better = !isFill;
+        // 4. still tied: the later-defined cell (higher prototype index) wins
+        else better = pc > winProto;
+        if (better) { win = c; winContains = contains; winD = d2; winFill = isFill; winProto = pc; }
       }
-      if (pinProto >= 0) {
-        hitProto = pinProto; hitOff = pinOff; return bestPin;
-      }
-      return INF;
+      if (win < 0) return INF;
+      hitProto = candProto[win]; hitOff = candOff[win];
+      // Fill-vs-solid overlap is expected (fill is a deliberate stand-in under
+      // instancing); only flag two *solid* cells occupying the same volume.
+      hitOverlap = solidContaining >= 2;
+      return candT[win];
     }
 
     // Tetrahedron technique — 4 samples
@@ -760,13 +893,15 @@
       // Phase A: root AABB pre-test
       vec2 rootHit = boxInterval(ro, rd, uSceneBMin, uSceneBMax);
       if (rootHit.x <= rootHit.y && rootHit.y >= 0.0) {
-        int hitProto; vec3 hitOff;
-        float t = sceneHit(ro, rd, hitProto, hitOff);
+        int hitProto; vec3 hitOff; bool hitOverlap;
+        float t = sceneHit(ro, rd, hitProto, hitOff, hitOverlap);
         if (hitProto >= 0 && t < INF) {
           vec3 p = ro + rd * t;
           vec3 n = calcNormal(p - hitOff, hitProto);
           float diff = max(dot(n, normalize(vec3(0.4, 0.6, 0.8))), 0.0);
           col = uProtoColor[hitProto] * (0.35 + 0.65 * diff);
+          // Genuine solid-on-solid overlap (OpenMC would reject this geometry).
+          if (uMarkOverlaps > 0.5 && hitOverlap) col = mix(col, vec3(1.0, 0.1, 0.8), 0.5);
         }
       }
       gl_FragColor = vec4(col, 1.0);
@@ -795,10 +930,15 @@
       uBvhNodeCount: { value: 0 },
       uSceneBMin: { value: new THREE.Vector3(-1e3, -1e3, -1e3) },
       uSceneBMax: { value: new THREE.Vector3(1e3, 1e3, 1e3) },
+      // Phase 1 coincident-face tolerance (see epsAt() in the shader).
+      uEpsMin: { value: 1e-4 },        // set per scene in rebuildAndRender()
+      uPixelAngle: { value: 1e-3 },    // set per frame in updateCameraUniforms()
+      uMarkOverlaps: { value: MARK_OVERLAPS ? 1 : 0 },
     };
   }
 
   const _camPos = new THREE.Vector3();
+  const _bufSize = new THREE.Vector2();
   const _forward = new THREE.Vector3();
   const _worldUp = new THREE.Vector3(0, 0, 1);
   const _right = new THREE.Vector3();
@@ -820,6 +960,11 @@
     u.uCamForward.value.copy(_forward);
     u.uCamRight.value.copy(_right);
     u.uCamUp.value.copy(_up);
+    // Half a pixel of angular footprint, from the *actual* drawing-buffer height
+    // (it changes between INTERACT_DPR and IDLE_DPR, so read it every frame).
+    renderer?.getDrawingBufferSize(_bufSize);
+    const hPx = Math.max(1, _bufSize.y || 1);
+    u.uPixelAngle.value = 0.5 * (2 * u.uTanHalfFov.value) / hPx;
   }
 
   // Prints:
@@ -894,14 +1039,33 @@
   function u_tanHalfFov() { return shaderMaterial?.uniforms.uTanHalfFov.value ?? Math.tan(THREE.MathUtils.degToRad(25)); }
   function aspectRatio() { return shaderMaterial?.uniforms.uAspect.value ?? 1; }
 
+  // Change the render resolution WITHOUT ever presenting a blank frame.
+  //
+  // WHY THIS EXISTS: renderer.setPixelRatio() resizes the <canvas>, and resizing a
+  // canvas wipes its drawing buffer. The old code changed the ratio and then only
+  // *scheduled* a redraw (requestRender -> rAF), or on pointer-down scheduled none at
+  // all, so the browser could present the cleared buffer: the whole scene vanished for
+  // a frame every time you clicked to rotate (and again when settling back to full res).
+  //
+  // RULE FOR FUTURE EDITORS: never call renderer.setPixelRatio()/setSize() directly.
+  // Go through here (or resize()), which redraws synchronously in the SAME task. A
+  // buffer is only presented after the task ends, so the blank one is never shown.
+  // It is also a no-op when the ratio is unchanged, so per-move/per-wheel calls don't
+  // needlessly clear and redraw the canvas.
+  function setRenderScale(dpr: number) {
+    if (!renderer || renderer.getPixelRatio() === dpr) return;
+    renderer.setPixelRatio(dpr);
+    // The synchronous render below supersedes any queued one.
+    if (pendingRenderFrame !== null) { cancelAnimationFrame(pendingRenderFrame); pendingRenderFrame = null; }
+    renderQueued = false;
+    render();
+  }
+
   function beginInteraction() {
     if (!renderer) return;
-    renderer.setPixelRatio(INTERACT_DPR);
+    setRenderScale(INTERACT_DPR);
     clearTimeout(interactTimer);
-    interactTimer = setTimeout(() => {
-      renderer.setPixelRatio(IDLE_DPR);
-      requestRender();
-    }, 150);
+    interactTimer = setTimeout(() => setRenderScale(IDLE_DPR), 150);
   }
 
   function latticeCellNameSet(lis: LatticeInstance[]): Set<string> {
@@ -960,6 +1124,9 @@
       );
       u.uSceneBMin.value.set(sceneBounds.xMin - pad, sceneBounds.yMin - pad, sceneBounds.zMin - pad);
       u.uSceneBMax.value.set(sceneBounds.xMax + pad, sceneBounds.yMax + pad, sceneBounds.zMax + pad);
+      u.uEpsMin.value = EPS_MIN_FRACTION * Math.max(
+        sceneBounds.xMax - sceneBounds.xMin, sceneBounds.yMax - sceneBounds.yMin,
+        sceneBounds.zMax - sceneBounds.zMin, 1);
     }
 
     const surfType = u.uSurfType.value as number[];
@@ -1166,7 +1333,10 @@
     renderQueued = true;
     pendingRenderFrame = requestAnimationFrame(() => { renderQueued = false; pendingRenderFrame = null; render(); });
   }
-  function onPointerDown(e: PointerEvent) { isDragging = true; lastX = e.clientX; lastY = e.clientY; canvasEl.setPointerCapture(e.pointerId); beginInteraction(); }
+  // Deliberately NOT calling beginInteraction() here: a plain click (no drag) should not
+  // drop the resolution at all. The first pointermove of a real drag does that, and
+  // setRenderScale() redraws in the same task, so there is no blank frame either way.
+  function onPointerDown(e: PointerEvent) { isDragging = true; lastX = e.clientX; lastY = e.clientY; canvasEl.setPointerCapture(e.pointerId); }
   function onPointerMove(e: PointerEvent) {
     if (!isDragging) return;
     pointerMoveCount++;
@@ -1193,9 +1363,9 @@
   function resize() {
     if (!containerEl || !renderer || !shaderMaterial) return;
     const w = containerEl.clientWidth, h = containerEl.clientHeight;
-    renderer.setSize(w, h, false);
+    renderer.setSize(w, h, false);       // wipes the drawing buffer ...
     shaderMaterial.uniforms.uAspect.value = w / Math.max(1, h);
-    requestRender();
+    render();                            // ... so redraw in the same task (see setRenderScale)
   }
 
   onMount(() => {

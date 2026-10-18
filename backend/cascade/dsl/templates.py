@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from domain.geometry import (
+from ..domain.geometry import (
     BoundaryType, Cell, Inside, Intersection, Outside, Surface, SurfaceType,
 )
 from .primitives import ExpansionContext, translate_params

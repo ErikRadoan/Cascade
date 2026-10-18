@@ -7,16 +7,33 @@
   //
   // Everything below the tab bar operates on the ACTIVE project.
 
-  import { onMount } from 'svelte';
-  import {activeProject, setGeometryText, restoreProjects} from './stores/projects.svelte';
+  import { activeProject, setGeometryText } from './stores/projects.svelte';
   import GeometryTabBar from './GeometryTabBar.svelte';
   import DockLayout from './dock/DockLayout.svelte';
   import { dock } from './dock/dockStore.svelte.js';
+  import LoadingScreen from '../shared/LoadingScreen.svelte';
+  import { busy } from '$lib/stores/busy.svelte';
 
-  onMount(() => {
-    restoreProjects();
-  });
+  // NOTE: restoreProjects() is no longer called here. Startup is owned by the splash
+  // screen (stores/appStatus.svelte.ts), and this component isn't even mounted until
+  // it has finished.
 
+  // Loading overlay. Shown while:
+  //  - a geometry is being fetched before its tab exists (withBusy), or
+  //  - the active geometry has no scene yet and one is being built — i.e. on first open
+  //    or when switching to a tab that hasn't loaded (restored tabs load lazily).
+  // Deliberately NOT shown for edits to an already-loaded geometry (it has a scene, so
+  // `!scene` is false): covering the editor on every keystroke-triggered rebuild
+  // would be unusable.
+  const proj = $derived(activeProject());
+  const loadingMessage = $derived(
+    busy.count > 0 ? busy.label
+    : proj.isValidating ? 'Validating geometry…'
+    : 'Building scene…'
+  );
+  const showLoading = $derived(
+    busy.count > 0 || (!proj.scene && (proj.isLoadingScene || proj.isValidating))
+  );
 
   // Re-run scene load whenever the active tab changes AND that project
   // has never had its scene loaded yet (switching back to an
@@ -34,6 +51,10 @@
 
   <div class="geometry-editor">
     <DockLayout node={dock.layout} />
+    {#if showLoading}
+      <!-- delay: loads under ~150 ms never show it, so quick switches don't flash. -->
+      <LoadingScreen variant="overlay" delay={150} message={loadingMessage} detail={busy.count > 0 ? '' : proj.name} />
+    {/if}
   </div>
 </div>
 
@@ -46,6 +67,7 @@
   }
 
   .geometry-editor {
+    position: relative;   /* anchors the loading overlay */
     display: flex;
     flex: 1;
     min-height: 0;

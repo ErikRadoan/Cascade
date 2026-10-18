@@ -31,7 +31,7 @@ from xml.dom import minidom
 import h5py
 import numpy as np
 
-from domain.geometry import (
+from ..domain.geometry import (
     CascadeGeometry,
     Cell,
     Complement,
@@ -776,7 +776,7 @@ def _compute_fissile_source_box(
 
 def _surface_ids_in_region(region) -> list[str]:
     """Recursively collect all surface IDs referenced in a region."""
-    from domain.geometry import Inside, Outside, Intersection, Union, Complement
+    from ..domain.geometry import Inside, Outside, Intersection, Union, Complement
     if isinstance(region, (Inside, Outside)):
         return [region.surface_id]
     elif isinstance(region, (Intersection, Union)):

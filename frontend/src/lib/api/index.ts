@@ -82,6 +82,34 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 // ---------------------------------------------------------------------------
+// System
+// ---------------------------------------------------------------------------
+// Backend: main.py `GET /health` (NOT under /api). Used only by the startup
+// splash (stores/appStatus.svelte.ts) to wait for the backend to come up.
+
+export const system = {
+  /**
+   * Resolves true if the backend answered /health in time, false otherwise.
+   * NEVER throws: "backend not up yet" is an expected state during startup, not
+   * an error. Deliberately bypasses request() so a down backend can't produce
+   * a thrown/logged error per retry, and so a hung connection is cut off
+   * after `timeoutMs` instead of stalling the splash screen.
+   */
+  health: async (timeoutMs = 2500): Promise<boolean> => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${BASE}/health`, { signal: ctrl.signal });
+      return res.ok;
+    } catch {
+      return false;
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------
 // Backend: geometry.py, router prefix "/geometry". Does NOT touch
