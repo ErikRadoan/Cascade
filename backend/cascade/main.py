@@ -5,13 +5,13 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api.geometry import router as geometry_router
-from .api.jobs import router as jobs_router
-from .api.materials import router as materials_router
-from .api.results import router as results_router
-from .api.backends import router as backends_router
-from .repositories.db import create_tables
-from .api.projects import router as projects_router
+from cascade.api.backends import router as backends_router
+from cascade.api.geometry import router as geometry_router
+from cascade.api.jobs import router as jobs_router
+from cascade.api.materials import router as materials_router
+from cascade.api.projects import router as projects_router
+from cascade.api.results import router as results_router
+from cascade.repositories.db import create_tables
 
 app = FastAPI(
     title="Cascade",
