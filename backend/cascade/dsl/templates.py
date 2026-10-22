@@ -172,7 +172,13 @@ class _FuelPinTemplateExpander:
         extra_surfaces.append(top)
         top_id = top.id
 
-        if new_outermost:
+        # A force_local_axial expansion is an origin-local prototype that gets
+        # wrapped in a rotated universe (see expander._place_rotated). Its
+        # radial surface lives in that local frame, so registering it here
+        # would make the Box's moderator cell exclude a ghost cylinder at the
+        # world origin instead of the real, rotated pin. The rotated
+        # placement's confining sphere is excluded from the moderator instead.
+        if new_outermost and not force_local_axial:
             outermost_list = getattr(ctx, "outermost_surfaces", None)
             if isinstance(outermost_list, list):
                 outermost_list.append(new_outermost)

@@ -108,6 +108,15 @@ class Context:
     lattice_instances: list[LatticeInstance] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
+    # Rotated-instance bookkeeping (see _fill_instance / _finish_rotated_instances).
+    # Every fill cell stamped into the ROOT universe: (confining sphere id,
+    # centre, radius, fill cell). The universe Box's moderator cell excludes
+    # each sphere, and each fill cell is clipped to the Box at the end.
+    root_fills: list[tuple[str, Vec3, float, Cell]] = field(default_factory=list)
+    # Background cells of local universes. Their material is the universe
+    # Box's material, which isn't known until every Box has been placed.
+    background_cells: list[Cell] = field(default_factory=list)
+
     _counter: int = field(default=0, init=False, repr=False)
 
     def fresh_id(self, prefix: str = "s") -> str:
@@ -261,11 +270,12 @@ def _combine_regions(op: str, regions: list[Region]) -> Region:
     """Fold regions left to right with a binary boolean op."""
     if not regions:
         raise ValueError("Cannot combine empty region list")
+    if op == "union":
+        # Flat n-ary union rather than a left-nested chain of binary unions.
+        return regions[0] if len(regions) == 1 else Union(list(regions))
     result = regions[0]
     for region in regions[1:]:
-        if op == "union":
-            result = Union([result, region])
-        elif op == "intersection":
+        if op == "intersection":
             result = Intersection([result, region])
         elif op == "subtraction":
             result = Intersection([result, Complement(region)])
@@ -284,10 +294,8 @@ def _origin_offset(schema: BaseComponentSchema) -> Vec3:
 
 
 def _operand_names(schema: BaseComponentSchema) -> list[str]:
-    """Names of a boolean composite's operands (Union may be n-ary)."""
-    if isinstance(schema, UnionSchema):
-        return schema.operand_names()
-    return [schema.a, schema.b]
+    """Names of a boolean composite's operands (all three ops may be n-ary)."""
+    return schema.operand_names()
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +407,47 @@ def _fill_instance(
         translation=translation,
         rotation=rotation,
     )
+    if parent_universe == "0":
+        ctx.root_fills.append((confine.id, center, radius, fill_cell))
     return [confine, fill_cell]
+
+
+def _background(
+    ctx: Context,
+    universe_id: str,
+    covered: list[Region],
+    radius: float,
+    name: str,
+    material: str | None = None,
+) -> list[SceneObject]:
+    """A background cell for a local universe.
+
+    A fill cell's confining sphere is larger than the object inside it, and
+    OpenMC does not fall back to a neighbouring cell when a particle sits
+    inside the fill cell but outside everything the local universe defines
+    (it is a lost particle). The background covers the rest of the sphere in
+    the local frame: ``inside sphere AND NOT (any local cell)``. Its material
+    is filled in by ``_finish_rotated_instances`` (the Box's material) unless
+    ``material`` is given. Returns ``[bounding sphere, background cell]``.
+    """
+    bound = Surface(
+        id=ctx.fresh_id("s"),
+        type_=SurfaceType.SPHERE,
+        params={"x0": 0.0, "y0": 0.0, "z0": 0.0, "r": radius},
+    )
+    terms: list[Region] = [Inside(bound.id)]
+    if covered:
+        terms.append(Complement(covered[0] if len(covered) == 1 else Union(list(covered))))
+    cell = Cell(
+        id=ctx.fresh_id("c"),
+        region=Intersection(terms),
+        material_id=material,
+        name=f"{name}_background",
+        universe_id=universe_id,
+    )
+    if material is None:
+        ctx.background_cells.append(cell)
+    return [bound, cell]
 
 
 def _place_rotated(
@@ -424,6 +472,9 @@ def _place_rotated(
              universe_id=universe_id)
         for c in _only_cells(local_objects)
     ]
+    background = _background(
+        ctx, universe_id, [c.region for c in scoped_cells], bounding_radius, cell_name,
+    )
     fill = _fill_instance(
         ctx,
         name=cell_name,
@@ -434,7 +485,7 @@ def _place_rotated(
         center=position,
         radius=bounding_radius,
     )
-    return [*local_surfaces, *scoped_cells, *fill]
+    return [*local_surfaces, *scoped_cells, *background, *fill]
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +585,11 @@ def _build_fill_cell(
         if radial_id not in covered_radial_ids:
             exclusions.append(Outside(radial_id))
 
+    # Rotated placements are stamped in through fill cells that own their
+    # whole confining sphere, so the moderator must not also claim it.
+    for sphere_id in dict.fromkeys(sphere for sphere, *_rest in ctx.root_fills):
+        exclusions.append(Outside(sphere_id))
+
     return Cell(
         id=ctx.fresh_id("c"),
         region=Intersection(_box_interior_terms(labels) + exclusions),
@@ -552,11 +608,16 @@ def _expand_shape_at_origin(
     index: _SchemaIndex,
     ctx: Context,
     visiting: tuple[str, ...] = (),
+    *,
+    as_operand: bool = False,
 ) -> tuple[list[Surface], Region]:
     """Build a shape's surfaces and region at its local origin.
 
     Used for boolean operands and for placing a composite. ``visiting`` is the
     chain of composites being resolved, used to report circular references.
+    ``as_operand`` is True for an operand of another composite: only then does
+    a boolean's own x/y/z offset apply (a placed composite is positioned by
+    its placement instead).
     """
     if isinstance(schema, FuelPinSchema):
         raise TypeError(f"'{name}' is a FuelPin, which cannot be used as a boolean composite operand.")
@@ -598,12 +659,18 @@ def _expand_shape_at_origin(
                     f"'{operand_name}'."
                 )
             operand_surfaces, operand_region = _expand_shape_at_origin(
-                operand, operand_name, index, ctx, next_visiting,
+                operand, operand_name, index, ctx, next_visiting, as_operand=True,
             )
             composite_surfaces.extend(operand_surfaces)
             operand_regions.append(operand_region)
 
-        return composite_surfaces, _combine_operand_regions(schema, operand_regions)
+        region = _combine_operand_regions(schema, operand_regions)
+        offset = _origin_offset(schema)
+        if as_operand and any(offset):
+            translated, id_map = _translate(composite_surfaces, *offset, ctx)
+            composite_surfaces = _only_surfaces(translated)
+            region = _remap_region(region, id_map)
+        return composite_surfaces, region
 
     raise TypeError(
         f"'{name}' (type {type(schema).__name__}) cannot be used as a "
@@ -612,11 +679,13 @@ def _expand_shape_at_origin(
 
 
 def _combine_operand_regions(schema: BaseComponentSchema, regions: list[Region]) -> Region:
+    """Fold operand regions flat (n-ary), not as a chain of binary nodes."""
     if isinstance(schema, UnionSchema):
-        # Union is n-ary, so it stays flat instead of nesting binary unions.
-        return regions[0] if len(regions) == 1 else Union(regions)
-    op = "subtraction" if isinstance(schema, SubtractionSchema) else "intersection"
-    return _combine_regions(op, regions)
+        return Union(list(regions))
+    if isinstance(schema, SubtractionSchema):
+        kept, *cutters = regions
+        return Intersection([kept, *(Complement(r) for r in cutters)])
+    return Intersection(list(regions))
 
 
 # ---------------------------------------------------------------------------
@@ -741,8 +810,10 @@ def _place_boolean_placement(
     BooleanPlacements) with a boolean op.
 
     Children are expanded like standalone placements, shifted by this
-    placement's x/y/z, and then either kept as separate cells (union) or
-    merged into one cell (subtraction, intersection).
+    placement's x/y/z, and then merged into ONE cell whatever the op. A union
+    used to keep one cell per child, which left overlapping children as
+    overlapping cells (undefined in OpenMC) and made the union not behave as
+    a single object.
     """
     if name in visiting:
         chain = " -> ".join((*visiting, name))
@@ -751,9 +822,51 @@ def _place_boolean_placement(
     children = _expand_boolean_children(schema, name, index, ctx, (*visiting, name))
     material_filter = set(schema.materials) if schema.materials else None
 
-    if schema.op == "union":
-        return _union_children(children, name, material_filter)
     return _merge_children(children, schema.op, name, material_filter, ctx)
+
+
+@dataclass
+class _RotatedOperand:
+    """A rotated BooleanPlacement child, still in its own origin-local frame.
+
+    Its shape lives inside a rotated universe, so it has no region in the
+    parent frame and can't be folded into siblings' regions directly. See
+    ``_merge_with_rotated``.
+    """
+
+    surfaces: list[Surface]
+    cells: list[Cell]       # origin-local material cells
+    position: Vec3          # placement position in the parent frame
+    rotation: Vec3
+    radius: float           # bounding-sphere radius around ``position``
+
+
+_BooleanOperand = tuple[list[Surface], list[Cell]] | _RotatedOperand
+
+
+def _rotated_operand(
+    child: SinglePlacementSchema, child_name: str, index: _SchemaIndex, ctx: Context, offset: Vec3,
+) -> _RotatedOperand:
+    tpl = index.templates.get(child.template)
+    if tpl is None:
+        raise ValueError(f"SinglePlacement '{child_name}' references undefined template '{child.template}'.")
+    x, y, z = child.position()
+    position = (x + offset[0], y + offset[1], z + offset[2])
+
+    if templates.is_composite_template(tpl):
+        surfaces, cells = templates.expand_template(
+            ctx, tpl, child_name, _NO_OFFSET, force_local_axial=True,
+        )
+    else:
+        # Interior geometry: boundary conditions are cleared (inside_boolean=False).
+        surfaces, region = _build_solid_at_origin(child, child_name, tpl, index, ctx, inside_boolean=False)
+        cells = [Cell(id=ctx.fresh_id("c"), region=region, material_id=tpl.material, name=child_name)]
+
+    return _RotatedOperand(
+        surfaces=list(surfaces), cells=list(cells), position=position,
+        rotation=_rotation_of(child),
+        radius=_local_bounding_radius(tpl, child.template, index),
+    )
 
 
 def _expand_boolean_children(
@@ -762,10 +875,13 @@ def _expand_boolean_children(
     index: _SchemaIndex,
     ctx: Context,
     visiting: tuple[str, ...],
-) -> list[tuple[list[Surface], list[Cell]]]:
-    """Expand each child into its (surfaces, cells), offset by the parent."""
+) -> list[_BooleanOperand]:
+    """Expand each child into its (surfaces, cells), offset by the parent.
+
+    A rotated SinglePlacement child comes back as a ``_RotatedOperand``.
+    """
     offset = (schema.x, schema.y, schema.z)
-    results: list[tuple[list[Surface], list[Cell]]] = []
+    results: list[_BooleanOperand] = []
 
     for child_name in schema.children:
         child = index.placements.get(child_name)
@@ -776,9 +892,18 @@ def _expand_boolean_children(
 
         if isinstance(child, BooleanPlacementSchema):
             objects = _place_boolean_placement(child, child_name, index, ctx, visiting)
+            if any(isinstance(o, Cell) and o.fill is not None for o in objects):
+                raise NotImplementedError(
+                    f"BooleanPlacement '{name}': child '{child_name}' is a BooleanPlacement that "
+                    f"contains a rotated child, and can't be nested inside another boolean yet. "
+                    f"Put the rotated object directly in '{name}' instead."
+                )
             if any(offset):
                 objects, _ = _translate(objects, *offset, ctx)
         elif isinstance(child, SinglePlacementSchema):
+            if _is_rotated(_rotation_of(child)):
+                results.append(_rotated_operand(child, child_name, index, ctx, offset))
+                continue
             objects = _expand_single_placement_objects(
                 child, child_name, index, ctx, offset, inside_boolean=True,
             )
@@ -801,28 +926,8 @@ def _keeps_material(cell: Cell, material_filter: set[str] | None) -> bool:
     return material_filter is None or cell.material_id in material_filter
 
 
-def _union_children(
-    children: list[tuple[list[Surface], list[Cell]]],
-    name: str,
-    material_filter: set[str] | None,
-) -> list[SceneObject]:
-    """Union keeps every child cell, renamed ``<parent>_<child cell>``."""
-    objects: list[SceneObject] = []
-    for surfaces, cells in children:
-        objects.extend(surfaces)
-        for cell in cells:
-            if _keeps_material(cell, material_filter):
-                objects.append(Cell(
-                    id=cell.id,
-                    region=cell.region,
-                    material_id=cell.material_id,
-                    name=name if cell.name is None else f"{name}_{cell.name}",
-                ))
-    return objects
-
-
 def _merge_children(
-    children: list[tuple[list[Surface], list[Cell]]],
+    children: list[_BooleanOperand],
     op: str,
     name: str,
     material_filter: set[str] | None,
@@ -837,6 +942,18 @@ def _merge_children(
     child_regions: list[Region] = []
     material: str | None = None
 
+    rotated = [c for c in children if isinstance(c, _RotatedOperand)]
+    if len(rotated) > 1:
+        raise NotImplementedError(
+            f"BooleanPlacement '{name}' has {len(rotated)} rotated children. Only one rotated "
+            f"child per BooleanPlacement is supported: each one is confined by its own sphere "
+            f"and the spheres would overlap. Group the others in a nested BooleanPlacement."
+        )
+    if rotated:
+        return _merge_with_rotated(children, op, name, material_filter, ctx)
+
+    kept_materials: list[str | None] = []
+
     for child_surfaces, child_cells in children:
         surfaces.extend(child_surfaces)
         kept = [c for c in child_cells if _keeps_material(c, material_filter)]
@@ -844,12 +961,22 @@ def _merge_children(
             continue
         if material is None:
             material = kept[0].material_id
+        for cell in kept:
+            if cell.material_id not in kept_materials:
+                kept_materials.append(cell.material_id)
         region = _union_of_cell_regions(kept)
         if region is not None:
             child_regions.append(region)
 
     if not child_regions:
         return list(surfaces)
+
+    if len(kept_materials) > 1:
+        ctx.warnings.append(
+            f"BooleanPlacement '{name}' ({op}) merges cells of several materials "
+            f"({', '.join(str(m) for m in kept_materials)}) into one cell of material "
+            f"'{material}'. Set `materials` on '{name}' to choose which materials it keeps."
+        )
 
     cell = Cell(
         id=ctx.fresh_id("c"),
@@ -858,6 +985,155 @@ def _merge_children(
         name=name,
     )
     return [*surfaces, cell]
+
+
+def _piece_universe(
+    ctx: Context,
+    x_cells: list[Cell],
+    x_material: str | None,
+    bg_material: str | None,
+    radius: float,
+    name: str,
+) -> tuple[str, list[SceneObject]]:
+    """A local universe for one part of a rotated composite operand.
+
+    ``x_cells`` are the rotated operand's cells, re-created with a single
+    material. A material of None means "the Box's material", resolved in
+    ``_finish_rotated_instances``. No ``x_cells`` gives an empty universe
+    holding only a background.
+    """
+    universe_id = ctx.fresh_id("u")
+    scoped: list[Cell] = []
+    for source in x_cells:
+        cell = Cell(id=ctx.fresh_id("c"), region=source.region, material_id=x_material,
+                    name=name, universe_id=universe_id)
+        if x_material is None:
+            ctx.background_cells.append(cell)
+        scoped.append(cell)
+    background = _background(
+        ctx, universe_id, [c.region for c in scoped], radius, name, material=bg_material,
+    )
+    return universe_id, [*scoped, *background]
+
+
+def _merge_with_rotated(
+    children: list[_BooleanOperand],
+    op: str,
+    name: str,
+    material_filter: set[str] | None,
+    ctx: Context,
+) -> list[SceneObject]:
+    """Merge children when exactly one of them is rotated.
+
+    The rotated operand X lives in its own universe, so its region doesn't
+    exist in the parent frame. The ordinary siblings, though, fold into one
+    region R there. X's confining sphere S is then partitioned by R: each
+    part is a fill cell that instances a small universe holding X's cells
+    (with the composite's material, or the Box's for a cutter) over a
+    background. Nothing overlaps, and the result is the same single-material
+    object the unrotated merge produces. With m the first kept child's material:
+
+      union          R-S: m            S&R: X=m, bg=m      S&~R: X=m, bg=Box
+      intersection                     S&R: X=m, bg=Box    S&~R: empty (Box)
+      subtraction    X kept: R = cutters   S&~R: X=m, bg=Box    S&R: empty
+      subtraction    X cutter: R = kept - other cutters
+                     R-S: m            S&R: X=Box, bg=m    S&~R: empty
+
+    "Box" is the universe Box's material (the moderator that fills the
+    space the object doesn't); "empty" is a universe of just that.
+    """
+    surfaces: list[Surface] = []
+    # (is_rotated, region, material) for every operand that kept a cell.
+    contributors: list[tuple[bool, Region | None, str | None]] = []
+    x_cells: list[Cell] = []
+    rotated = next(c for c in children if isinstance(c, _RotatedOperand))
+
+    for child in children:
+        if isinstance(child, _RotatedOperand):
+            surfaces.extend(child.surfaces)
+            x_cells = [c for c in child.cells if _keeps_material(c, material_filter)]
+            if x_cells:
+                contributors.append((True, None, x_cells[0].material_id))
+            continue
+        child_surfaces, child_cells = child
+        surfaces.extend(child_surfaces)
+        kept = [c for c in child_cells if _keeps_material(c, material_filter)]
+        if kept:
+            contributors.append((False, _union_of_cell_regions(kept), kept[0].material_id))
+
+    plain_only = [c for c in children if not isinstance(c, _RotatedOperand)]
+    if not x_cells:
+        return _merge_children(plain_only, op, name, material_filter, ctx)
+    if all(is_rot for is_rot, _r, _m in contributors):
+        # Nothing to combine with: it is just a rotated object.
+        cells = [Cell(id=c.id, region=c.region, material_id=contributors[0][2], name=name)
+                 for c in x_cells]
+        return [*surfaces, *_place_rotated(
+            [*rotated.surfaces, *cells], rotated.position, rotated.rotation, rotated.radius, ctx, name,
+        )]
+
+    material = contributors[0][2]
+    plain = [r for is_rot, r, _m in contributors if not is_rot and r is not None]
+
+    def any_of(regions: list[Region]) -> Region:
+        return regions[0] if len(regions) == 1 else Union(list(regions))
+
+    x_is_first = contributors[0][0]
+    if op == "union":
+        region = any_of(plain)
+    elif op == "intersection":
+        region = plain[0] if len(plain) == 1 else Intersection(list(plain))
+    elif op == "subtraction":
+        if x_is_first:
+            region = any_of(plain)                      # the cutters
+        else:
+            kept_body, cutters = plain[0], plain[1:]
+            region = kept_body if not cutters else Intersection([kept_body, Complement(any_of(cutters))])
+    else:
+        raise ValueError(f"Unknown boolean op '{op}'")
+
+    confine = Surface(
+        id=ctx.fresh_id("s"), type_=SurfaceType.SPHERE,
+        params={"x0": rotated.position[0], "y0": rotated.position[1],
+                "z0": rotated.position[2], "r": rotated.radius},
+    )
+    inside_s, outside_s = Inside(confine.id), Outside(confine.id)
+    objects: list[SceneObject] = [*surfaces, confine]
+
+    # (part region, x material, background material); None = the Box's material.
+    parts: list[tuple[Region, str | None, str | None]]
+    keeps_plain_outside = False
+    if op == "union":
+        keeps_plain_outside = True
+        parts = [(region, material, material), (Complement(region), material, None)]
+    elif op == "intersection":
+        parts = [(region, material, None), (Complement(region), None, None)]
+    elif x_is_first:
+        parts = [(Complement(region), material, None), (region, None, None)]
+    else:
+        keeps_plain_outside = True
+        parts = [(region, None, material), (Complement(region), None, None)]
+
+    if keeps_plain_outside:
+        objects.append(Cell(
+            id=ctx.fresh_id("c"), region=Intersection([region, outside_s]),
+            material_id=material, name=name,
+        ))
+
+    for part_region, x_material, bg_material in parts:
+        is_empty = x_material is None and bg_material is None
+        use_x = [] if is_empty else x_cells
+        universe_id, local = _piece_universe(ctx, use_x, x_material, bg_material, rotated.radius, name)
+        fill_cell = Cell(
+            id=ctx.fresh_id("c"),
+            region=Intersection([inside_s, part_region]),
+            material_id=None, name=name, universe_id="0",
+            fill=universe_id, translation=rotated.position, rotation=rotated.rotation,
+        )
+        ctx.root_fills.append((confine.id, rotated.position, rotated.radius, fill_cell))
+        objects.extend([*local, fill_cell])
+
+    return objects
 
 
 def _union_of_cell_regions(cells: list[Cell]) -> Region | None:
@@ -1010,13 +1286,19 @@ def _expand_rotated_lattice(
     index: _SchemaIndex,
     ctx: Context,
 ) -> list[SceneObject]:
-    """Expand a rotated lattice as an "assembly" universe of pin universes.
+    """Expand a rotated lattice as an "assembly" universe.
 
-    Every pin becomes a fill cell inside one shared assembly universe. Pins
-    with the same own-rotation share a single pin universe, so a lattice with
-    a few overridden pins does not create hundreds of duplicate universes. One
-    outer fill cell then instances the assembly into the root universe with the
-    lattice-level rotation, pivoting about the lattice origin.
+    Pins that carry no rotation of their own are plain translated copies
+    placed directly in the assembly universe, so they need no fill cell and no
+    confining sphere. Only pins with a ``pin_rotation_overrides`` entry become
+    fill cells, and pins with the same own-rotation share one pin universe.
+    The assembly universe gets a background cell, and one outer fill cell
+    instances it into the root universe with the lattice-level rotation,
+    pivoting about the lattice origin.
+
+    Cell order inside the assembly universe matters: OpenMC takes the first
+    cell that contains a point, so the direct (unrotated) pins come first and
+    the overridden pins' confining spheres can't shadow them.
 
     These lattices skip ``ctx.lattice_instances``, so the viewport falls back
     to the flat surface/cell list for them. The OpenMC geometry is exact either
@@ -1031,13 +1313,31 @@ def _expand_rotated_lattice(
     pin_radius = _local_bounding_radius(tpl, prototype_key, index)
     assembly_universe = ctx.fresh_id("u")
 
-    objects: list[SceneObject] = []
+    direct: list[SceneObject] = []        # unrotated pins, in the assembly universe
+    prototypes: list[SceneObject] = []    # pin universes of overridden pins
+    fills: list[SceneObject] = []         # fill cells of overridden pins
+    covered: list[Region] = []            # regions the assembly background must avoid
     pin_universe_by_rotation: dict[Vec3, str] = {}
+    override_centres: list[Vec3] = []
     assembly_radius = 0.0
 
     for i, position in enumerate(positions):
         local_position = (position[0] - origin[0], position[1] - origin[1], position[2] - origin[2])
         own_rotation = pin_rotations[i]
+        distance = math.sqrt(sum(v ** 2 for v in local_position))
+        assembly_radius = max(assembly_radius, distance + pin_radius)
+
+        if not _is_rotated(own_rotation):
+            surfaces, cells = templates.expand_template(
+                ctx, tpl, f"{lattice_name}_{i}", local_position, force_local_axial=True,
+            )
+            direct.extend(surfaces)
+            for cell in cells:
+                scoped = Cell(id=cell.id, region=cell.region, material_id=cell.material_id,
+                              name=cell.name, universe_id=assembly_universe)
+                direct.append(scoped)
+                covered.append(scoped.region)
+            continue
 
         pin_universe = pin_universe_by_rotation.get(own_rotation)
         if pin_universe is None:
@@ -1046,15 +1346,20 @@ def _expand_rotated_lattice(
                 ctx, tpl, f"{lattice_name}_proto{prototype_number}", _NO_OFFSET, force_local_axial=True,
             )
             pin_universe = ctx.fresh_id("u")
-            objects.extend(local_surfaces)
-            objects.extend(
+            scoped_cells = [
                 Cell(id=c.id, region=c.region, material_id=c.material_id, name=c.name,
                      universe_id=pin_universe)
                 for c in local_cells
-            )
+            ]
+            prototypes.extend(local_surfaces)
+            prototypes.extend(scoped_cells)
+            prototypes.extend(_background(
+                ctx, pin_universe, [c.region for c in scoped_cells], pin_radius,
+                f"{lattice_name}_proto{prototype_number}",
+            ))
             pin_universe_by_rotation[own_rotation] = pin_universe
 
-        objects.extend(_fill_instance(
+        fill = _fill_instance(
             ctx,
             name=f"{lattice_name}_{i}",
             parent_universe=assembly_universe,
@@ -1063,21 +1368,74 @@ def _expand_rotated_lattice(
             rotation=own_rotation,
             center=local_position,
             radius=pin_radius,
-        ))
-        distance = math.sqrt(local_position[0] ** 2 + local_position[1] ** 2 + local_position[2] ** 2)
-        assembly_radius = max(assembly_radius, distance + pin_radius)
+        )
+        fills.extend(fill)
+        covered.append(fill[1].region)
+        override_centres.append(local_position)
 
-    objects.extend(_fill_instance(
+    if len(override_centres) > 1:
+        ctx.warnings.append(
+            f"Lattice '{lattice_name}' has {len(override_centres)} pins with their own rotation. "
+            f"Each rotated pin is confined by a sphere of radius {pin_radius:.1f} cm, which is "
+            f"much larger than the pin pitch, so these spheres overlap and the earlier pin's "
+            f"universe wins wherever they do. Prefer one rotated pin per lattice."
+        )
+
+    assembly_background = _background(ctx, assembly_universe, covered, assembly_radius, lattice_name)
+    root_fill = _fill_instance(
         ctx,
         name=lattice_name,
         parent_universe="0",
         child_universe=assembly_universe,
         translation=origin,
         rotation=schema.assembly_rotation(),
-        center=_NO_OFFSET,
+        center=origin,
         radius=assembly_radius,
-    ))
-    return objects
+    )
+    return [*direct, *prototypes, *fills, *assembly_background, *root_fill]
+
+
+# ---------------------------------------------------------------------------
+# Rotated-instance finishing (runs once every Box has been placed)
+# ---------------------------------------------------------------------------
+
+def _finish_rotated_instances(
+    universe_boxes: list[tuple[str, BoxSchema, dict[str, str]]], ctx: Context,
+) -> None:
+    """Resolve what a rotated instance can only know after the Boxes exist.
+
+    - Background cells take the universe Box's material (void when the model
+      has no Box, since there is no moderator to match).
+    - Root fill cells are clipped to the Box interior. A confining sphere can
+      reach past the Box, and without clipping the rotated universe would
+      leak through the Box's boundary planes (vacuum/reflective faces).
+    """
+    material = universe_boxes[0][1].material if universe_boxes else None
+    for cell in ctx.background_cells:
+        cell.material_id = material
+
+    if not ctx.root_fills:
+        return
+
+    if len(universe_boxes) == 1:
+        _name, _schema, labels = universe_boxes[0]
+        for _sphere, _centre, _radius, fill_cell in ctx.root_fills:
+            fill_cell.region = Intersection([fill_cell.region, *_box_interior_terms(labels)])
+    elif len(universe_boxes) > 1:
+        ctx.warnings.append(
+            "Rotated placements are not clipped to a Box when the model has several "
+            "universe Boxes; check that no rotated object reaches past a Box boundary."
+        )
+
+    # One entry per confining sphere (a composite can share one between parts).
+    spheres = list({sid: (c, r, cell) for sid, c, r, cell in reversed(ctx.root_fills)}.values())[::-1]
+    for i, (c1, r1, cell1) in enumerate(spheres):
+        for c2, r2, cell2 in spheres[i + 1:]:
+            if math.dist(c1, c2) < r1 + r2:
+                ctx.warnings.append(
+                    f"The confining spheres of rotated '{cell1.name}' and '{cell2.name}' overlap; "
+                    f"inside the overlap the earlier one wins. Move them apart or reduce their size."
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1112,11 +1470,20 @@ def expand(
         fill_name = name or f"fill_{box_schema.material}"
         objects.append(_build_fill_cell(box_schema, labels, ctx, cell_name=fill_name))
 
+    _finish_rotated_instances(universe_boxes, ctx)
+
+    # OpenMC takes the first cell in a universe that contains a point. Rotated
+    # fill cells own a whole confining sphere, which can overlap ordinary
+    # neighbours, so list them last and let the ordinary cells win.
+    root_fill_ids = {id(cell) for *_rest, cell in ctx.root_fills}
+    cells = _only_cells(objects)
+    cells = [c for c in cells if id(c) not in root_fill_ids] + [c for c in cells if id(c) in root_fill_ids]
+
     return CascadeGeometry(
         id=str(uuid.uuid4()),
         name=geom_name,
         surfaces=_only_surfaces(objects),
-        cells=_only_cells(objects),
+        cells=cells,
         param_values=ctx.param_values,
         lattice_instances=ctx.lattice_instances,
         warnings=ctx.warnings,

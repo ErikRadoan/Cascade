@@ -3,8 +3,8 @@
 Template booleans (Union / Subtraction / Intersection) author shapes at the
 origin. BooleanPlacement composes already-placed objects in the scene graph.
 
-Union supports both binary ``a``/``b`` and n-ary ``items`` for flat multi-way
-unions without intermediate named nodes.
+All three template booleans support both binary ``a``/``b`` and n-ary
+``items`` for flat multi-way operations without intermediate named nodes.
 """
 
 from __future__ import annotations
@@ -16,41 +16,41 @@ from pydantic import Field, model_validator
 from .base import BaseComponentSchema
 
 
-class _BooleanSchemaBase(BaseComponentSchema):
-    """Shared fields for binary boolean templates (Subtraction / Intersection)."""
+class _BooleanTemplateBase(BaseComponentSchema):
+    """Shared shape of the Union / Subtraction / Intersection templates.
 
-    a: str = Field(..., min_length=1, description="YAML key of the left-hand operand template.")
-    b: str = Field(..., min_length=1, description="YAML key of the right-hand operand template.")
-    material: str = Field(default="H2O", description="Material ID assigned to the resulting solid cell.")
-    model_config = {"frozen": True}
-
-
-class UnionSchema(BaseComponentSchema):
-    """Solid is the union of operands.
-
-    Prefer ``items`` for 2+ shapes (flat n-ary). Legacy ``a``/``b`` still works.
-    Only the outermost material is used; intermediate materials are ignored.
+    All three take their operands the same way: either ``items`` (n-ary,
+    preferred) or the legacy ``a`` / ``b`` pair. The result is one solid cell
+    that uses this template's ``material``; operand materials are ignored.
+    An operand can be a primitive, a Box or another boolean template, and may
+    carry its own ``x`` / ``y`` / ``z`` to shift it inside this composite.
     """
 
-    a: str | None = Field(default=None, description="Legacy left operand (use items instead).")
-    b: str | None = Field(default=None, description="Legacy right operand (use items instead).")
+    a: str | None = Field(default=None, description="Legacy first operand (use items instead).")
+    b: str | None = Field(default=None, description="Legacy second operand (use items instead).")
     items: list[str] = Field(
         default_factory=list,
         description="N-ary operand template names (≥2). Preferred over a/b.",
     )
     material: str = Field(default="H2O", description="Material ID for the resulting solid cell.")
+    x: float = Field(default=0.0, description="Local X offset when used as an operand of another boolean.")
+    y: float = Field(default=0.0, description="Local Y offset when used as an operand of another boolean.")
+    z: float = Field(default=0.0, description="Local Z offset when used as an operand of another boolean.")
     model_config = {"frozen": True}
 
     @model_validator(mode="after")
-    def require_operands(self) -> UnionSchema:
-        if len(self.items) >= 2:
-            return self
-        if self.a and self.b:
-            return self
-        raise ValueError(
-            "Union requires either items: [name, ...] with ≥2 entries, "
-            "or both a and b set."
-        )
+    def require_operands(self) -> _BooleanTemplateBase:
+        names = self.operand_names()
+        if len(self.items) < 2 and not (self.a and self.b):
+            raise ValueError(
+                f"{type(self).__name__[:-len('Schema')]} requires either items: [name, ...] "
+                f"with ≥2 entries, or both a and b set."
+            )
+        self.check_operands(names)
+        return self
+
+    def check_operands(self, names: list[str]) -> None:
+        """Hook for operation-specific operand checks."""
 
     def operand_names(self) -> list[str]:
         if len(self.items) >= 2:
@@ -58,20 +58,35 @@ class UnionSchema(BaseComponentSchema):
         return [self.a or "", self.b or ""]
 
 
-class SubtractionSchema(_BooleanSchemaBase):
-    """Solid is a minus b (a ∩ ¬b). Order matters: a is kept, b is cut out."""
-
-    pass
+class UnionSchema(_BooleanTemplateBase):
+    """Solid is the union of all operands."""
 
 
-class IntersectionSchema(_BooleanSchemaBase):
-    """Solid is the intersection of operands a and b (a ∩ b)."""
+class SubtractionSchema(_BooleanTemplateBase):
+    """Solid is the first operand minus every other one (a ∩ ¬b ∩ ¬c ...).
 
-    pass
+    Order matters: the first operand is kept, the rest are cut out of it.
+    """
+
+    def check_operands(self, names: list[str]) -> None:
+        kept, *cutters = names
+        if kept in cutters:
+            raise ValueError(
+                f"Subtraction cuts its own kept operand '{kept}' out of itself, "
+                f"which always leaves an empty solid."
+            )
+
+
+class IntersectionSchema(_BooleanTemplateBase):
+    """Solid is the intersection of all operands."""
 
 
 class BooleanPlacementSchema(BaseComponentSchema):
-    """Hierarchy node that combines already-placed objects with a boolean op."""
+    """Hierarchy node that combines already-placed objects with a boolean op.
+
+    Every op, union included, produces a single cell. Its material is the
+    first kept child's; use ``materials`` to choose which materials are kept.
+    """
 
     op: Literal["union", "subtraction", "intersection"] = Field(
         ...,
@@ -97,3 +112,21 @@ class BooleanPlacementSchema(BaseComponentSchema):
     z: float = Field(default=0.0, description="Z translation of the composite.")
 
     model_config = {"frozen": True}
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_rotation(cls, data):
+        """Rotation isn't implemented for composites, so refuse it loudly.
+
+        Without this the rx/ry/rz keys were accepted and silently ignored,
+        leaving the user with an unrotated composite and no explanation.
+        """
+        if isinstance(data, dict):
+            given = [k for k in ("rx", "ry", "rz") if data.get(k) not in (None, 0, 0.0)]
+            if given:
+                raise ValueError(
+                    f"BooleanPlacement doesn't support rotation yet ({', '.join(given)} set). "
+                    f"Rotate the composite as a template instead: define a Union / Subtraction / "
+                    f"Intersection template and place it with a rotated SinglePlacement."
+                )
+        return data
