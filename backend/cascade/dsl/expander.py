@@ -8,8 +8,8 @@ roles, and the expander treats each one differently:
 * **Cells** (Tier 2): a material plus a region expression that refers to
   primitives by name.
 * **Templates**: reusable shapes that only become geometry once placed. These
-  are Box, FuelPin and the Union / Subtraction / Intersection composites.
-  A primitive that has a ``material`` can also be placed as a solid.
+  are Box and FuelPin. A primitive that has a ``material`` can also be placed
+  as a solid.
 * **Placements**: SinglePlacement, SquareLattice, HexLattice and
   BooleanPlacement. They instantiate templates into the scene.
 
@@ -54,12 +54,7 @@ from ..domain.geometry import (
 from . import primitives, templates
 from .primitives import translate_params
 from .schema.base import BaseComponentSchema
-from .schema.boolean import (
-    BooleanPlacementSchema,
-    IntersectionSchema,
-    SubtractionSchema,
-    UnionSchema,
-)
+from .schema.boolean import BooleanPlacementSchema
 from .schema.box import BoxSchema
 from .schema.cell import CellSchema
 from .schema.fuel_pin import FuelPinSchema
@@ -73,7 +68,6 @@ __all__ = ["Context", "expand"]
 Vec3 = tuple[float, float, float]
 SceneObject = Surface | Cell
 
-_BOOLEAN_TEMPLATE_TYPES = (UnionSchema, SubtractionSchema, IntersectionSchema)
 _LATTICE_TYPES = (SquareLatticeSchema, HexLatticeSchema)
 _PLACEMENT_TYPES = (SinglePlacementSchema, BooleanPlacementSchema, *_LATTICE_TYPES)
 
@@ -283,20 +277,6 @@ def _combine_regions(op: str, regions: list[Region]) -> Region:
     raise ValueError(f"Unknown boolean op '{op}'")
 
 
-def _origin_offset(schema: BaseComponentSchema) -> Vec3:
-    """A schema's own local x/y/z offset (0 for schemas that have none)."""
-    return (
-        float(getattr(schema, "x", 0.0) or 0.0),
-        float(getattr(schema, "y", 0.0) or 0.0),
-        float(getattr(schema, "z", 0.0) or 0.0),
-    )
-
-
-def _operand_names(schema: BaseComponentSchema) -> list[str]:
-    """Names of a boolean composite's operands (all three ops may be n-ary)."""
-    return schema.operand_names()
-
-
 # ---------------------------------------------------------------------------
 # Rotated placements
 #
@@ -335,13 +315,13 @@ def _is_rotated(rotation: Vec3) -> bool:
 
 
 def _local_bounding_radius(
-    schema: BaseComponentSchema, name: str, index: _SchemaIndex,
+    schema: BaseComponentSchema, name: str,
 ) -> float:
     """Radius of a sphere around the schema's local origin that encloses it.
 
     Exact for a Sphere, conservative elsewhere: Box and FuelPin have their
     local origin on a face or end rather than at the centre, so the full height
-    is used instead of half. A boolean composite takes its farthest operand.
+    is used instead of half.
 
     Raises ValueError for unbounded shapes (planes, cylinders, cones): a
     rotated placement needs a finite bound.
@@ -359,17 +339,6 @@ def _local_bounding_radius(
     if isinstance(schema, TorusSchema):
         tube_height = schema.tube_height if schema.tube_height is not None else schema.tube_radius
         return schema.ring_radius + max(schema.tube_radius, tube_height)
-
-    if isinstance(schema, _BOOLEAN_TEMPLATE_TYPES):
-        farthest = 0.0
-        for operand_name in _operand_names(schema):
-            operand = index.schemas.get(operand_name)
-            if operand is None:
-                continue
-            ox, oy, oz = _origin_offset(operand)
-            offset = math.sqrt(ox ** 2 + oy ** 2 + oz ** 2)
-            farthest = max(farthest, offset + _local_bounding_radius(operand, operand_name, index))
-        return farthest
 
     raise ValueError(_UNBOUNDED_ROTATION_MSG.format(name=name, type_name=type(schema).__name__))
 
@@ -598,96 +567,6 @@ def _build_fill_cell(
 
 
 # ---------------------------------------------------------------------------
-# Boolean composite templates (Union / Subtraction / Intersection)
-# ---------------------------------------------------------------------------
-
-def _expand_shape_at_origin(
-    schema: BaseComponentSchema,
-    name: str,
-    index: _SchemaIndex,
-    ctx: Context,
-    visiting: tuple[str, ...] = (),
-    *,
-    as_operand: bool = False,
-) -> tuple[list[Surface], Region]:
-    """Build a shape's surfaces and region at its local origin.
-
-    Used for boolean operands and for placing a composite. ``visiting`` is the
-    chain of composites being resolved, used to report circular references.
-    ``as_operand`` is True for an operand of another composite: only then does
-    a boolean's own x/y/z offset apply (a placed composite is positioned by
-    its placement instead).
-    """
-    if isinstance(schema, FuelPinSchema):
-        raise TypeError(f"'{name}' is a FuelPin, which cannot be used as a boolean composite operand.")
-
-    if isinstance(schema, BoxSchema):
-        surfaces, region = _box_solid_at_origin(schema, ctx, clear_boundary=True)
-        offset = _origin_offset(schema)
-        if any(offset):
-            translated, id_map = _translate(surfaces, *offset, ctx)
-            surfaces = _only_surfaces(translated)
-            region = _remap_region(region, id_map)
-        return surfaces, region
-
-    if primitives.is_primitive(schema):
-        # Always make a fresh copy of the primitive's surface rather than
-        # reusing the one created in step 1. A composite is translated as a
-        # unit by its placement offset; a reused surface would stay at the
-        # primitive's authored position and ignore that offset. The step-1
-        # surface still exists for Tier-2 cells that name the primitive.
-        surfaces, region = primitives.expand_primitive(ctx, schema, name)
-        return _without_boundary(surfaces), region
-
-    if isinstance(schema, _BOOLEAN_TEMPLATE_TYPES):
-        if name in visiting:
-            chain = " -> ".join((*visiting, name))
-            raise ValueError(
-                "Circular reference detected while resolving boolean composite "
-                f"operands: {chain}."
-            )
-        next_visiting = (*visiting, name)
-
-        composite_surfaces: list[Surface] = []
-        operand_regions: list[Region] = []
-        for operand_name in _operand_names(schema):
-            operand = index.schemas.get(operand_name)
-            if operand is None:
-                raise ValueError(
-                    f"'{name}' operand references undefined template/primitive "
-                    f"'{operand_name}'."
-                )
-            operand_surfaces, operand_region = _expand_shape_at_origin(
-                operand, operand_name, index, ctx, next_visiting, as_operand=True,
-            )
-            composite_surfaces.extend(operand_surfaces)
-            operand_regions.append(operand_region)
-
-        region = _combine_operand_regions(schema, operand_regions)
-        offset = _origin_offset(schema)
-        if as_operand and any(offset):
-            translated, id_map = _translate(composite_surfaces, *offset, ctx)
-            composite_surfaces = _only_surfaces(translated)
-            region = _remap_region(region, id_map)
-        return composite_surfaces, region
-
-    raise TypeError(
-        f"'{name}' (type {type(schema).__name__}) cannot be used as a "
-        f"boolean composite operand."
-    )
-
-
-def _combine_operand_regions(schema: BaseComponentSchema, regions: list[Region]) -> Region:
-    """Fold operand regions flat (n-ary), not as a chain of binary nodes."""
-    if isinstance(schema, UnionSchema):
-        return Union(list(regions))
-    if isinstance(schema, SubtractionSchema):
-        kept, *cutters = regions
-        return Intersection([kept, *(Complement(r) for r in cutters)])
-    return Intersection(list(regions))
-
-
-# ---------------------------------------------------------------------------
 # SinglePlacement
 # ---------------------------------------------------------------------------
 
@@ -729,7 +608,7 @@ def _expand_single_placement_objects(
             local_surfaces, local_cells = templates.expand_template(
                 ctx, tpl, name, _NO_OFFSET, force_local_axial=True,
             )
-            radius = _local_bounding_radius(tpl, schema.template, index)
+            radius = _local_bounding_radius(tpl, schema.template)
             return _place_rotated([*local_surfaces, *local_cells], position, rotation, radius, ctx, name)
         surfaces, cells = templates.expand_template(ctx, tpl, name, position)
         return [*surfaces, *cells]
@@ -742,7 +621,7 @@ def _expand_single_placement_objects(
 
     if rotated:
         cell = Cell(id=ctx.fresh_id("c"), region=local_region, material_id=tpl.material, name=name)
-        radius = _local_bounding_radius(tpl, schema.template, index)
+        radius = _local_bounding_radius(tpl, schema.template)
         return _place_rotated([*local_surfaces, cell], position, rotation, radius, ctx, name)
 
     translated, id_map = _translate(local_surfaces, *position, ctx)
@@ -784,9 +663,6 @@ def _build_solid_at_origin(
                 f"expression instead."
             )
         return primitives.expand_primitive(ctx, tpl, schema.template)
-
-    if isinstance(tpl, _BOOLEAN_TEMPLATE_TYPES):
-        return _expand_shape_at_origin(tpl, schema.template, index, ctx)
 
     raise TypeError(
         f"SinglePlacement '{name}' references template of type "
@@ -869,9 +745,7 @@ def _composite_bounding_radius(
                         f"SinglePlacement '{child_name}' references undefined template '{child.template}'."
                     )
                 cx, cy, cz = child.position()
-                reach = math.sqrt(cx ** 2 + cy ** 2 + cz ** 2) + _local_bounding_radius(
-                    tpl, child.template, index,
-                )
+                reach = math.sqrt(cx ** 2 + cy ** 2 + cz ** 2) + _local_bounding_radius(tpl, child.template)
             elif isinstance(child, _LATTICE_TYPES):
                 reach = _lattice_reach(child, child_name, index)
             elif isinstance(child, BooleanPlacementSchema):
@@ -939,7 +813,7 @@ def _rotated_operand(
     return _RotatedOperand(
         surfaces=list(surfaces), cells=list(cells), position=position,
         rotation=_rotation_of(child),
-        radius=_local_bounding_radius(tpl, child.template, index),
+        radius=_local_bounding_radius(tpl, child.template),
     )
 
 
@@ -986,7 +860,7 @@ def _rotated_lattice_operand(
             f"nested (lattice-of-lattice) assemblies isn't supported yet."
         )
     tpl, key = _lattice_pin_template(child, child_name, index)
-    pin_radius = _local_bounding_radius(tpl, key, index)
+    pin_radius = _local_bounding_radius(tpl, key)
     origin = child.origin_point()
 
     surfaces: list[Surface] = []
@@ -1024,7 +898,7 @@ def _lattice_reach(
     else:
         tpl, key = _lattice_pin_template(schema, name, index)
         centres = schema.pin_positions()
-    pin_radius = _local_bounding_radius(tpl, key, index)
+    pin_radius = _local_bounding_radius(tpl, key)
     return max((math.sqrt(x ** 2 + y ** 2 + z ** 2) + pin_radius for x, y, z in centres), default=0.0)
 
 
@@ -1519,7 +1393,7 @@ def _expand_rotated_lattice(
 
     pin_rotations = schema.pin_rotations()
     origin = schema.origin_point()
-    pin_radius = _local_bounding_radius(tpl, prototype_key, index)
+    pin_radius = _local_bounding_radius(tpl, prototype_key)
     assembly_universe = ctx.fresh_id("u")
 
     direct: list[SceneObject] = []        # unrotated pins, in the assembly universe

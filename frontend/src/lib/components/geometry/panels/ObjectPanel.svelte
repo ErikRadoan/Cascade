@@ -318,8 +318,6 @@
       if (Array.isArray(block.children)) {
         block.children = (block.children as string[]).map((c) => (c === oldName ? newName : c));
       }
-      if (typeof block.a === 'string' && block.a === oldName) block.a = newName;
-      if (typeof block.b === 'string' && block.b === oldName) block.b = newName;
       updated[key] = block;
     }
 

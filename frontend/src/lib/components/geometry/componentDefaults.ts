@@ -65,11 +65,11 @@ export const TEMPLATE_DEFAULTS: Record<string, Record<string, unknown>> = {
   // one-click "New template" entries — they're helper/cutting surfaces
   // (rarely a standalone "object" a user reaches for), same precedent as
   // Plane already had. All remain fully usable via YAML/API and as
-  // boolean-composite operands or Tier-2 Cell region-expression terms.
-  // Template-level Union/Subtraction/Intersection are no longer offered in
-  // the Templates panel — use BooleanPlacement from the Objects panel
-  // (multi-select → Union / Subtract / Intersect). Schema remains registered
-  // on the backend for existing YAML compatibility.
+  // BooleanPlacement operands (place them with a SinglePlacement first) or
+  // Tier-2 Cell region-expression terms.
+  // Boolean shapes are built with BooleanPlacement from the Objects panel
+  // (multi-select → Union / Subtract / Intersect); template-level
+  // Union/Subtraction/Intersection no longer exist.
 };
 
 export const PLACEMENT_DEFAULTS: Record<string, (templateName: string) => Record<string, unknown>> = {

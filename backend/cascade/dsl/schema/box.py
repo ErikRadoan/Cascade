@@ -44,11 +44,6 @@ class BoxSchema(BaseComponentSchema):
         ),
     )
 
-    # Local offset when used as a boolean operand (template Union/etc.).
-    x: float = Field(default=0.0, description="Local X offset when used as a boolean operand.")
-    y: float = Field(default=0.0, description="Local Y offset when used as a boolean operand.")
-    z: float = Field(default=0.0, description="Local Z offset when used as a boolean operand.")
-
     model_config = {"frozen": True}
 
     def half_x(self) -> float:

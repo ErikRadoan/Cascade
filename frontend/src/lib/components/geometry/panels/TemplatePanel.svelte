@@ -1,7 +1,8 @@
 <script lang="ts">
   // TemplatePanel — shows template definitions as thumbnail cards.
-  // Template-level Union/Subtraction/Intersection are no longer offered here;
-  // use Objects multi-select → BooleanPlacement instead.
+  // Boolean shapes are not templates: build them with Objects multi-select →
+  // BooleanPlacement. (The old template-level Union/Subtraction/Intersection
+  // types were removed from the backend.)
 
   import { activeProject, setGeometryText } from '../stores/projects.svelte.js';
   import { geometrySelection } from '../stores/selection.svelte.js';
@@ -23,9 +24,6 @@
     'BooleanPlacement',
   ]);
 
-  // Legacy template booleans — still loadable from YAML but not creatable here
-  const HIDDEN_TEMPLATE_TYPES = new Set(['Union', 'Subtraction', 'Intersection']);
-
   let parsedDoc = $derived((): Record<string, { type?: string }> | null => {
     const raw = yaml.parse(activeProject().text);
     if (!raw || typeof raw !== 'object') return null;
@@ -39,7 +37,6 @@
       .filter(([, v]) =>
         v && typeof v === 'object' && v.type
         && !NON_TEMPLATE_TYPES.has(v.type)
-        && !HIDDEN_TEMPLATE_TYPES.has(v.type)
       )
       .map(([name, v]) => ({ name, type: v.type! }));
   });
@@ -112,8 +109,6 @@
       if (Array.isArray(block.children)) {
         block.children = (block.children as string[]).map((c) => (c === oldName ? newName : c));
       }
-      if (typeof block.a === 'string' && block.a === oldName) block.a = newName;
-      if (typeof block.b === 'string' && block.b === oldName) block.b = newName;
       updated[key] = block as { type?: string };
     }
 

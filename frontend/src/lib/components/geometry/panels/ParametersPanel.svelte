@@ -205,11 +205,6 @@
       if (Array.isArray(block.children)) {
         block.children = (block.children as string[]).map((c) => (c === oldName ? trimmed : c));
       }
-      if (typeof block.a === 'string' && block.a === oldName) block.a = trimmed;
-      if (typeof block.b === 'string' && block.b === oldName) block.b = trimmed;
-      if (Array.isArray(block.items)) {
-        block.items = (block.items as string[]).map((c) => (c === oldName ? trimmed : c));
-      }
       updated[key] = block;
     }
     const newText = dump(updated, { indent: 2, lineWidth: -1 });

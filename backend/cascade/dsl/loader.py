@@ -6,12 +6,7 @@ import yaml
 from pydantic import ValidationError
 
 from .schema.base import BaseComponentSchema
-from .schema.boolean import (
-    BooleanPlacementSchema,
-    IntersectionSchema,
-    SubtractionSchema,
-    UnionSchema,
-)
+from .schema.boolean import BooleanPlacementSchema
 from .schema.box import BoxSchema
 from .schema.cell import CellSchema
 from .schema.cone import ConeZSchema
@@ -28,11 +23,6 @@ SCHEMA_MAP: dict[str, type[BaseComponentSchema]] = {
     # Templates (legacy sugar — expand to Tier-1/2 objects internally)
     "FuelPin":         FuelPinSchema,
     "Box":             BoxSchema,
-    # Boolean composites (templates) — place via SinglePlacement; operands
-    # a/b are other template names (Box, Sphere, nested Union/…).
-    "Union":           UnionSchema,
-    "Subtraction":     SubtractionSchema,
-    "Intersection":    IntersectionSchema,
     # Placements
     "SinglePlacement":   SinglePlacementSchema,
     "SquareLattice":     SquareLatticeSchema,
@@ -51,6 +41,26 @@ SCHEMA_MAP: dict[str, type[BaseComponentSchema]] = {
     # Tier-2 region-expression cells (geometry-restructuring-plan.md Phase B)
     "Cell":            CellSchema,
 }
+
+
+# Template-level boolean composites were removed in favour of BooleanPlacement.
+# They are kept here only so old documents get a precise migration message
+# instead of a generic "unknown type".
+_REMOVED_BOOLEAN_TEMPLATES = {"Union": "union", "Subtraction": "subtraction", "Intersection": "intersection"}
+
+
+def _removed_boolean_message(component_type: str, name: str) -> str:
+    op = _REMOVED_BOOLEAN_TEMPLATES[component_type]
+    return (
+        f"'{name}' uses the removed template type '{component_type}'. Boolean shapes are now "
+        f"built with BooleanPlacement: place each operand with a SinglePlacement, then combine "
+        f"the placements, e.g.\n"
+        f"  {name}:\n"
+        f"    type: BooleanPlacement\n"
+        f"    op: {op}\n"
+        f"    children: [<placement_a>, <placement_b>]\n"
+        f"The first child is the kept body for a subtraction."
+    )
 
 
 class LoadError(Exception):
@@ -107,6 +117,9 @@ def load(text: str) -> dict[str, BaseComponentSchema]:
                 f"Known types: {', '.join(SCHEMA_MAP)}.",
                 component_name=name,
             )
+
+        if component_type in _REMOVED_BOOLEAN_TEMPLATES:
+            raise LoadError(_removed_boolean_message(component_type, name), component_name=name)
 
         schema_class = SCHEMA_MAP.get(component_type)
         if schema_class is None:

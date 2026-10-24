@@ -219,8 +219,7 @@ async def build_csg(body: SceneRequest) -> dict:
     """Fully-expanded CSG (surfaces + cells + region trees) for live editor
     text — the general-purpose counterpart to /scene's template-aware
     SceneBuilder output. Renders arbitrary surfaces/regions, including
-    future Union/Subtraction component types, unlike /scene which only
-    knows FuelPin/Box.
+    BooleanPlacement results, unlike /scene which only knows FuelPin/Box.
 
     Mirrors GET /jobs/{job_id}/csg for a job that hasn't been submitted yet.
     Phase C: response also includes lattice_instances (additive field).
