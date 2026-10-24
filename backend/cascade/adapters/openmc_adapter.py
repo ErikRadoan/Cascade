@@ -326,13 +326,17 @@ def _region_to_openmc(region: Region) -> str:
 
     elif isinstance(region, Union):
         if not region.regions:
-            return ""
+            # An empty union is the empty set, but "" would be read by OpenMC
+            # as all of space. Refuse rather than emit the opposite.
+            raise ValueError("Cannot export an empty Union region to OpenMC.")
         parts = [_region_to_openmc(r) for r in region.regions]
         inner = " | ".join(parts)
         return f"({inner})" if len(region.regions) > 1 else inner
 
     elif isinstance(region, Complement):
         inner = _region_to_openmc(region.region)
+        if not inner:
+            raise ValueError("Cannot export the complement of an empty region to OpenMC.")
         return f"~{inner}"
 
     else:

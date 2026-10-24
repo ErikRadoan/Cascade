@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from abc import ABC
@@ -71,6 +72,8 @@ def region_from_yaml_dict(d: dict, name_to_id: dict[str, str]) -> Region:
 
     if op == "or":
         items = d.get("items") or []
+        if not items:
+            raise ValueError("An 'or' region node needs at least one item.")
         return Union([region_from_yaml_dict(i, name_to_id) for i in items])
 
     if op == "not":
@@ -82,6 +85,95 @@ def region_from_yaml_dict(d: dict, name_to_id: dict[str, str]) -> Region:
     raise ValueError(
         f"Unknown region op '{op}'. Must be one of: inside, outside, and, or, not."
     )
+
+
+def region_from_json(d: dict) -> Region:
+    """Exact inverse of region_to_json(); surface ids are taken verbatim.
+
+    This is the lossless way to persist a region. The repr string is for
+    display (and for rows stored before region_json existed).
+    """
+    if not isinstance(d, dict):
+        raise ValueError(f"Region node must be a mapping, got {type(d).__name__}.")
+    op = d.get("op")
+    if op == "inside":
+        return Inside(d["surface"])
+    if op == "outside":
+        return Outside(d["surface"])
+    if op == "and":
+        return Intersection([region_from_json(i) for i in d.get("items") or []])
+    if op == "or":
+        items = d.get("items") or []
+        if not items:
+            raise ValueError("An 'or' region node needs at least one item.")
+        return Union([region_from_json(i) for i in items])
+    if op == "not":
+        if d.get("item") is None:
+            raise ValueError("A 'not' region node requires an 'item'.")
+        return Complement(region_from_json(d["item"]))
+    raise ValueError(f"Unknown region op '{op}'. Must be one of: inside, outside, and, or, not.")
+
+
+_REGION_TOKEN = re.compile(r"\s*(?:(?P<punct>[()~:])|(?P<surf>[-+][^\s()~:]+))")
+
+
+def region_from_str(text: str) -> Region:
+    """Parse the string produced by ``repr(region)`` back into a Region tree.
+
+    Grammar (what Region.__repr__ emits):
+        atom  := '-'id | '+'id | '~' atom | '(' atom+ ')' | '(' atom (':' atom)+ ')'
+    A parenthesised group with ':' separators is a Union, one with plain
+    whitespace is an Intersection. Nesting to any depth is supported.
+    An empty string is the empty Intersection (all of space), which is how
+    OpenMC reads an empty region too.
+    """
+    s = text.strip()
+    if not s:
+        return Intersection([])
+
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    while pos < len(s):
+        m = _REGION_TOKEN.match(s, pos)
+        if m is None:
+            raise ValueError(f"Cannot parse region {text!r} at offset {pos}.")
+        tokens.append(("punct", m["punct"]) if m["punct"] else ("surf", m["surf"]))
+        pos = m.end()
+        while pos < len(s) and s[pos].isspace():
+            pos += 1
+
+    index = 0
+
+    def parse_atom() -> Region:
+        nonlocal index
+        if index >= len(tokens):
+            raise ValueError(f"Unexpected end of region {text!r}.")
+        kind, value = tokens[index]
+        index += 1
+        if kind == "surf":
+            return Inside(value[1:]) if value[0] == "-" else Outside(value[1:])
+        if value == "~":
+            return Complement(parse_atom())
+        if value == "(":
+            items = [parse_atom()]
+            is_union = False
+            while index < len(tokens) and tokens[index] != ("punct", ")"):
+                if tokens[index] == ("punct", ":"):
+                    is_union = True
+                    index += 1
+                items.append(parse_atom())
+            if index >= len(tokens):
+                raise ValueError(f"Unbalanced parentheses in region {text!r}.")
+            index += 1  # the closing ')'
+            if len(items) == 1:
+                return items[0]
+            return Union(items) if is_union else Intersection(items)
+        raise ValueError(f"Unexpected {value!r} in region {text!r}.")
+
+    region = parse_atom()
+    if index != len(tokens):
+        raise ValueError(f"Trailing input in region {text!r}.")
+    return region
 
 
 class Region(ABC):
@@ -143,6 +235,26 @@ class Complement(Region):
         return f"~({self.region})"
 
 
+def union_of(regions: list[Region]) -> Region:
+    """Union of ``regions``, flattening nested unions and collapsing a single item."""
+    flat: list[Region] = []
+    for r in regions:
+        flat.extend(r.regions if isinstance(r, Union) else [r])
+    if not flat:
+        raise ValueError("Cannot take the union of no regions.")
+    return flat[0] if len(flat) == 1 else Union(flat)
+
+
+def intersection_of(regions: list[Region]) -> Region:
+    """Intersection of ``regions``, flattening nested intersections."""
+    flat: list[Region] = []
+    for r in regions:
+        flat.extend(r.regions if isinstance(r, Intersection) else [r])
+    if not flat:
+        raise ValueError("Cannot take the intersection of no regions.")
+    return flat[0] if len(flat) == 1 else Intersection(flat)
+
+
 @dataclass(slots=True)
 class Surface:
     """Pure geometric surface with no material."""
@@ -193,6 +305,7 @@ class Cell:
         d: dict[str, object] = {
             "id": self.id,
             "region": str(self.region),
+            "region_json": region_to_json(self.region),
             "material_id": self.material_id,
             "name": self.name,
         }

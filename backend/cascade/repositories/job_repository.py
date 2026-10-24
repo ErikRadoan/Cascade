@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 from ..domain.job import JobStatus, SimulationJob
 from ..domain.job_step import JobStep
 from ..domain.geometry import CascadeGeometry, Surface, Cell, SurfaceType, BoundaryType
-from ..domain.geometry import Inside, Outside, Intersection, Union, Complement
+from ..domain.geometry import region_from_json, region_from_str
 from ..domain.material import Material
 from .models import JobRow
 from ..domain.results_config import ResultsConfig, R2SResultsConfig
@@ -306,49 +306,28 @@ def _surface_from_dict(d: dict) -> Surface:
 
 
 def _cell_from_dict(d: dict) -> Cell:
+    # Prefer the lossless structured form; rows saved before it existed only
+    # have the repr string, which region_from_str() parses.
+    if d.get("region_json") is not None:
+        region = region_from_json(d["region_json"])
+    else:
+        region = region_from_str(d.get("region", ""))
+    fill = d.get("fill")
     return Cell(
         id=          d["id"],
-        region=      _region_from_str(d.get("region", "")),
+        region=      region,
         material_id= d.get("material_id"),
         name=        d.get("name"),
+        universe_id= d.get("universe_id", "0"),
+        fill=        fill,
+        rotation=    tuple(d["rotation"]) if fill is not None and d.get("rotation") else None,
+        translation= tuple(d["translation"]) if fill is not None and d.get("translation") else None,
     )
 
 
 def _region_from_str(region_str: str):
-    """Reconstruct a Region from its __repr__ string.
-
-    The repr format is what Cell.to_dict() stores:
-        "-s1"         → Inside("s1")
-        "+s1"         → Outside("s1")
-        "(-s1 +s2)"   → Intersection([Inside("s1"), Outside("s2")])
-
-    This is a best-effort reconstruction sufficient for re-running jobs.
-    For display purposes the string itself is usable directly.
-    """
-    s = region_str.strip()
-
-    if s.startswith("(") and s.endswith(")"):
-        inner = s[1:-1]
-        if " : " in inner:
-            parts = inner.split(" : ")
-            return Union([_region_from_str(p) for p in parts])
-        else:
-            parts = inner.split()
-            if len(parts) == 1:
-                return _region_from_str(parts[0])
-            return Intersection([_region_from_str(p) for p in parts])
-
-    if s.startswith("~"):
-        return Complement(_region_from_str(s[1:]))
-
-    if s.startswith("-"):
-        return Inside(s[1:])
-
-    if s.startswith("+"):
-        return Outside(s[1:])
-
-    # Fallback — wrap as Inside
-    return Inside(s)
+    """Kept for callers of the old name; see domain.geometry.region_from_str."""
+    return region_from_str(region_str)
 
 
 def _material_from_dict(d: dict) -> Material:

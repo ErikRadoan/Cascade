@@ -47,7 +47,9 @@ from ..domain.geometry import (
     Surface,
     SurfaceType,
     Union,
+    intersection_of,
     region_from_yaml_dict,
+    union_of,
 )
 from . import primitives, templates
 from .primitives import translate_params
@@ -272,16 +274,13 @@ def _combine_regions(op: str, regions: list[Region]) -> Region:
         raise ValueError("Cannot combine empty region list")
     if op == "union":
         # Flat n-ary union rather than a left-nested chain of binary unions.
-        return regions[0] if len(regions) == 1 else Union(list(regions))
-    result = regions[0]
-    for region in regions[1:]:
-        if op == "intersection":
-            result = Intersection([result, region])
-        elif op == "subtraction":
-            result = Intersection([result, Complement(region)])
-        else:
-            raise ValueError(f"Unknown boolean op '{op}'")
-    return result
+        return union_of(regions)
+    if op == "intersection":
+        return intersection_of(regions)
+    if op == "subtraction":
+        kept, *cutters = regions
+        return intersection_of([kept, *[Complement(c) for c in cutters]])
+    raise ValueError(f"Unknown boolean op '{op}'")
 
 
 def _origin_offset(schema: BaseComponentSchema) -> Vec3:
@@ -1111,6 +1110,11 @@ def _keeps_material(cell: Cell, material_filter: set[str] | None) -> bool:
     return material_filter is None or cell.material_id in material_filter
 
 
+def _empties_result(op: str, position: int) -> bool:
+    """Whether an operand that keeps no cells makes the whole result empty."""
+    return op == "intersection" or (op == "subtraction" and position == 0)
+
+
 def _merge_children(
     children: list[_BooleanOperand],
     op: str,
@@ -1139,11 +1143,17 @@ def _merge_children(
 
     kept_materials: list[str | None] = []
     kept_count = 0
+    result_is_empty = False
 
-    for child_surfaces, child_cells in children:
+    for position, (child_surfaces, child_cells) in enumerate(children):
         surfaces.extend(child_surfaces)
         kept = [c for c in child_cells if _keeps_material(c, material_filter)]
         if not kept:
+            # An operand with nothing kept is the empty set. A union can ignore
+            # it, but it empties an intersection and a subtraction's kept body.
+            # (A subtraction just skips an empty cutter: nothing is cut.)
+            if _empties_result(op, position):
+                result_is_empty = True
             continue
         kept_count += len(kept)
         if material is None:
@@ -1155,7 +1165,7 @@ def _merge_children(
         if region is not None:
             child_regions.append(region)
 
-    if not child_regions:
+    if result_is_empty or not child_regions:
         return list(surfaces)
 
     _warn_if_heavy(ctx, name, kept_count)
@@ -1235,19 +1245,27 @@ def _merge_with_rotated(
     contributors: list[tuple[bool, Region | None, str | None]] = []
     x_cells: list[Cell] = []
     rotated = next(c for c in children if isinstance(c, _RotatedOperand))
+    result_is_empty = False
 
-    for child in children:
+    for position, child in enumerate(children):
         if isinstance(child, _RotatedOperand):
             surfaces.extend(child.surfaces)
             x_cells = [c for c in child.cells if _keeps_material(c, material_filter)]
             if x_cells:
                 contributors.append((True, None, x_cells[0].material_id))
+            elif _empties_result(op, position):
+                result_is_empty = True
             continue
         child_surfaces, child_cells = child
         surfaces.extend(child_surfaces)
         kept = [c for c in child_cells if _keeps_material(c, material_filter)]
         if kept:
             contributors.append((False, _union_of_cell_regions(kept), kept[0].material_id))
+        elif _empties_result(op, position):
+            result_is_empty = True
+
+    if result_is_empty:
+        return list(surfaces)
 
     plain_only = [c for c in children if not isinstance(c, _RotatedOperand)]
     if not x_cells:
@@ -1267,14 +1285,15 @@ def _merge_with_rotated(
         for child in children if not isinstance(child, _RotatedOperand)
     ))
 
-    def any_of(regions: list[Region]) -> Region:
-        return regions[0] if len(regions) == 1 else Union(list(regions))
-
-    x_is_first = contributors[0][0]
+    any_of = union_of
+    # Only subtraction cares which operand is the kept body. If the first child
+    # had kept nothing we would have returned above, so "the rotated operand is
+    # the first child" is the right test (not "first operand that contributed").
+    x_is_first = isinstance(children[0], _RotatedOperand)
     if op == "union":
         region = any_of(plain)
     elif op == "intersection":
-        region = plain[0] if len(plain) == 1 else Intersection(list(plain))
+        region = intersection_of(plain)
     elif op == "subtraction":
         if x_is_first:
             region = any_of(plain)                      # the cutters
@@ -1332,9 +1351,7 @@ def _union_of_cell_regions(cells: list[Cell]) -> Region | None:
     regions = [c.region for c in cells if c.region is not None]
     if not regions:
         return None
-    if len(regions) == 1:
-        return regions[0]
-    return Union(regions)
+    return union_of(regions)
 
 
 # ---------------------------------------------------------------------------
