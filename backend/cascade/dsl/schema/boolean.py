@@ -86,6 +86,7 @@ class BooleanPlacementSchema(BaseComponentSchema):
 
     Every op, union included, produces a single cell. Its material is the
     first kept child's; use ``materials`` to choose which materials are kept.
+    With ``rx/ry/rz`` the whole composite is rotated about its x/y/z point.
     """
 
     op: Literal["union", "subtraction", "intersection"] = Field(
@@ -111,22 +112,11 @@ class BooleanPlacementSchema(BaseComponentSchema):
     y: float = Field(default=0.0, description="Y translation of the composite.")
     z: float = Field(default=0.0, description="Z translation of the composite.")
 
+    # Rotation of the whole composite about its x/y/z point, intrinsic XYZ
+    # Euler angles in degrees (same convention as SinglePlacement). Children
+    # are positioned relative to that point. Zero keeps the plain path.
+    rx: float = Field(default=0.0, description="Rotation of the composite about X (degrees).")
+    ry: float = Field(default=0.0, description="Rotation of the composite about Y (degrees).")
+    rz: float = Field(default=0.0, description="Rotation of the composite about Z (degrees).")
+
     model_config = {"frozen": True}
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_rotation(cls, data):
-        """Rotation isn't implemented for composites, so refuse it loudly.
-
-        Without this the rx/ry/rz keys were accepted and silently ignored,
-        leaving the user with an unrotated composite and no explanation.
-        """
-        if isinstance(data, dict):
-            given = [k for k in ("rx", "ry", "rz") if data.get(k) not in (None, 0, 0.0)]
-            if given:
-                raise ValueError(
-                    f"BooleanPlacement doesn't support rotation yet ({', '.join(given)} set). "
-                    f"Rotate the composite as a template instead: define a Union / Subtraction / "
-                    f"Intersection template and place it with a rotated SinglePlacement."
-                )
-        return data

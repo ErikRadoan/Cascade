@@ -79,6 +79,9 @@ export const PLACEMENT_DEFAULTS: Record<string, (templateName: string) => Record
     x: 0.0,
     y: 0.0,
     z: 0.0,
+    rx: 0.0,
+    ry: 0.0,
+    rz: 0.0,
   }),
   SquareLattice: (template) => ({
     type: 'SquareLattice',
@@ -118,6 +121,9 @@ export const PLACEMENT_DEFAULTS: Record<string, (templateName: string) => Record
     x: 0.0,
     y: 0.0,
     z: 0.0,
+    rx: 0.0,
+    ry: 0.0,
+    rz: 0.0,
   }),
 };
 

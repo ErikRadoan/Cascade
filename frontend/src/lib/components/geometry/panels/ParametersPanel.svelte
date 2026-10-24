@@ -46,7 +46,10 @@
     const sel = geometrySelection.selectedItem;
 
     return Object.entries(block)
-      .filter(([k]) => k !== 'type')
+      // Dict-valued fields (e.g. a lattice's pin_rotation_overrides) have no
+      // generic editor: it would render them as "[object Object]" and write
+      // that back. They stay editable in the YAML and are listed in a note.
+      .filter(([k, v]) => k !== 'type' && !isDictValue(v))
       .map(([key, value]) => {
         let kind: FieldEntry['kind'] = 'string';
         if (Array.isArray(value)) kind = 'string[]';
@@ -71,6 +74,16 @@
           options,
         };
       });
+  });
+
+  function isDictValue(value: unknown): boolean {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  let dictFieldKeys = $derived((): string[] => {
+    const block = selectedBlock();
+    if (!block) return [];
+    return Object.entries(block).filter(([, v]) => isDictValue(v)).map(([k]) => k);
   });
 
   let componentType = $derived(() => {
@@ -194,6 +207,9 @@
       }
       if (typeof block.a === 'string' && block.a === oldName) block.a = trimmed;
       if (typeof block.b === 'string' && block.b === oldName) block.b = trimmed;
+      if (Array.isArray(block.items)) {
+        block.items = (block.items as string[]).map((c) => (c === oldName ? trimmed : c));
+      }
       updated[key] = block;
     }
     const newText = dump(updated, { indent: 2, lineWidth: -1 });
@@ -371,12 +387,25 @@
             </div>
           </div>
         {/each}
+        {#if dictFieldKeys().length > 0}
+          <p class="dict-note">
+            {dictFieldKeys().map(formatLabel).join(', ')} can only be edited in the YAML editor.
+          </p>
+        {/if}
       </div>
     {/if}
   </div>
 </div>
 
 <style>
+  .dict-note {
+    font-size: 11px;
+    color: var(--color-subtext);
+    opacity: 0.8;
+    line-height: 1.5;
+    margin: 8px 0 0;
+  }
+
   .panel {
     display: flex;
     flex-direction: column;

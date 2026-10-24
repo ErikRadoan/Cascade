@@ -819,10 +819,85 @@ def _place_boolean_placement(
         chain = " -> ".join((*visiting, name))
         raise ValueError(f"Circular BooleanPlacement reference: {chain}.")
 
-    children = _expand_boolean_children(schema, name, index, ctx, (*visiting, name))
+    rotation = _rotation_of(schema)
+    rotated = _is_rotated(rotation)
+    position = (schema.x, schema.y, schema.z)
+
+    # A rotated composite is built in its own local frame (children positioned
+    # relative to its x/y/z point) and then instanced through one fill cell.
+    children = _expand_boolean_children(
+        schema, name, index, ctx, (*visiting, name),
+        offset=_NO_OFFSET if rotated else position,
+    )
     material_filter = set(schema.materials) if schema.materials else None
 
-    return _merge_children(children, schema.op, name, material_filter, ctx)
+    if rotated and any(isinstance(c, _RotatedOperand) for c in children):
+        raise NotImplementedError(
+            f"BooleanPlacement '{name}' is rotated and also has a rotated child. A rotated "
+            f"composite can't hold a rotated child yet: its children would need a rotated "
+            f"universe inside a rotated universe. Rotate only the composite, or only the child."
+        )
+
+    objects = _merge_children(children, schema.op, name, material_filter, ctx)
+    if not rotated:
+        return objects
+
+    radius = _composite_bounding_radius(schema, name, index)
+    return _place_rotated(objects, position, rotation, radius, ctx, name)
+
+
+def _composite_bounding_radius(
+    schema: BooleanPlacementSchema, name: str, index: _SchemaIndex,
+) -> float:
+    """Radius of a sphere around the composite's x/y/z point that encloses it.
+
+    Children sit at their own positions relative to that point. The result
+    only has to contain what the op leaves, so it follows the op: a union needs
+    every child bounded, a subtraction only its kept (first) child, and an
+    intersection fits inside its smallest bounded child. That lets a body be
+    cut by an unbounded shape (a cylinder through a sphere) and still rotate.
+    """
+    reaches: list[float | None] = []
+    first_error: ValueError | None = None
+
+    for child_name in schema.children:
+        child = index.placements.get(child_name)
+        try:
+            if isinstance(child, SinglePlacementSchema):
+                tpl = index.templates.get(child.template)
+                if tpl is None:
+                    raise ValueError(
+                        f"SinglePlacement '{child_name}' references undefined template '{child.template}'."
+                    )
+                cx, cy, cz = child.position()
+                reach = math.sqrt(cx ** 2 + cy ** 2 + cz ** 2) + _local_bounding_radius(
+                    tpl, child.template, index,
+                )
+            elif isinstance(child, _LATTICE_TYPES):
+                reach = _lattice_reach(child, child_name, index)
+            elif isinstance(child, BooleanPlacementSchema):
+                reach = math.sqrt(child.x ** 2 + child.y ** 2 + child.z ** 2) + _composite_bounding_radius(
+                    child, child_name, index,
+                )
+            else:
+                raise ValueError(f"'{child_name}' has no bounding radius.")
+            reaches.append(reach)
+        except ValueError as error:
+            reaches.append(None)
+            first_error = first_error or error
+
+    finite = [r for r in reaches if r is not None]
+    if schema.op == "union":
+        if first_error is not None:
+            raise first_error
+        return max(finite)
+    if schema.op == "subtraction":
+        if reaches[0] is None:
+            raise first_error or ValueError(f"BooleanPlacement '{name}' has no bounded kept child.")
+        return reaches[0]
+    if not finite:
+        raise first_error or ValueError(f"BooleanPlacement '{name}' has no bounded child.")
+    return min(finite)
 
 
 @dataclass
@@ -869,18 +944,107 @@ def _rotated_operand(
     )
 
 
+_MERGE_CELL_WARN = 64
+
+
+def _warn_if_heavy(ctx: Context, name: str, cell_count: int) -> None:
+    """Merging many cells (a lattice of pins) yields one huge region."""
+    if cell_count > _MERGE_CELL_WARN:
+        ctx.warnings.append(
+            f"BooleanPlacement '{name}' merges {cell_count} cells into one region. Large "
+            f"lattices make slow viewport rendering and transport; narrow it with `materials` "
+            f"or combine a smaller lattice."
+        )
+
+
+def _lattice_pin_template(
+    schema: SquareLatticeSchema | HexLatticeSchema, name: str, index: _SchemaIndex,
+) -> tuple[BaseComponentSchema, str]:
+    tpl = index.templates.get(schema.template)
+    if tpl is None:
+        raise ValueError(f"Lattice '{name}' references undefined template '{schema.template}'.")
+    if not templates.is_composite_template(tpl):
+        raise TypeError(f"Lattice '{name}': template type not supported in lattices yet.")
+    return tpl, schema.template
+
+
+def _rotated_lattice_operand(
+    child: SquareLatticeSchema | HexLatticeSchema,
+    child_name: str,
+    index: _SchemaIndex,
+    ctx: Context,
+    offset: Vec3,
+) -> _RotatedOperand:
+    """A lattice with an assembly rotation, as an operand in its own local frame.
+
+    Pins are built relative to the lattice origin (the rotation pivot), so the
+    operand is the whole assembly: ``position`` is the origin and ``radius``
+    reaches the farthest pin.
+    """
+    if index.lattices.get(child.template) is not None:
+        raise NotImplementedError(
+            f"Lattice '{child_name}' is rotated and nests another lattice; rotation on "
+            f"nested (lattice-of-lattice) assemblies isn't supported yet."
+        )
+    tpl, key = _lattice_pin_template(child, child_name, index)
+    pin_radius = _local_bounding_radius(tpl, key, index)
+    origin = child.origin_point()
+
+    surfaces: list[Surface] = []
+    cells: list[Cell] = []
+    radius = 0.0
+    for i, position in enumerate(child.pin_positions()):
+        local = (position[0] - origin[0], position[1] - origin[1], position[2] - origin[2])
+        pin_surfaces, pin_cells = templates.expand_template(
+            ctx, tpl, f"{child_name}_{i}", local, force_local_axial=True,
+        )
+        surfaces.extend(pin_surfaces)
+        cells.extend(pin_cells)
+        radius = max(radius, math.sqrt(sum(v ** 2 for v in local)) + pin_radius)
+
+    return _RotatedOperand(
+        surfaces=surfaces, cells=cells,
+        position=(origin[0] + offset[0], origin[1] + offset[1], origin[2] + offset[2]),
+        rotation=child.assembly_rotation(), radius=radius,
+    )
+
+
+def _lattice_reach(
+    schema: SquareLatticeSchema | HexLatticeSchema, name: str, index: _SchemaIndex,
+) -> float:
+    """Distance from the coordinate origin to the farthest point of an unrotated lattice."""
+    inner = index.lattices.get(schema.template)
+    if inner is not None:
+        tpl, key = _lattice_pin_template(inner, name, index)
+        inner_offsets = _relative_positions(inner.pin_positions()) if inner.pin_positions() else []
+        centres = [
+            (ax + px, ay + py, az + pz)
+            for ax, ay, az in schema.pin_positions()
+            for px, py, pz in inner_offsets
+        ]
+    else:
+        tpl, key = _lattice_pin_template(schema, name, index)
+        centres = schema.pin_positions()
+    pin_radius = _local_bounding_radius(tpl, key, index)
+    return max((math.sqrt(x ** 2 + y ** 2 + z ** 2) + pin_radius for x, y, z in centres), default=0.0)
+
+
 def _expand_boolean_children(
     schema: BooleanPlacementSchema,
     name: str,
     index: _SchemaIndex,
     ctx: Context,
     visiting: tuple[str, ...],
+    offset: Vec3 | None = None,
 ) -> list[_BooleanOperand]:
     """Expand each child into its (surfaces, cells), offset by the parent.
 
     A rotated SinglePlacement child comes back as a ``_RotatedOperand``.
+    ``offset`` defaults to the parent's x/y/z; a rotated composite passes zero
+    so its children stay in its own local frame.
     """
-    offset = (schema.x, schema.y, schema.z)
+    if offset is None:
+        offset = (schema.x, schema.y, schema.z)
     results: list[_BooleanOperand] = []
 
     for child_name in schema.children:
@@ -889,14 +1053,20 @@ def _expand_boolean_children(
             raise ValueError(
                 f"BooleanPlacement '{name}' child '{child_name}' is not a defined placement."
             )
+        # Pins registered while expanding a child would make the moderator
+        # exclude their full volume, leaving a void wherever the boolean cuts
+        # a pin away. The merged cell owns the space instead (it is listed
+        # before the moderator, like any other solid).
+        extents_before = len(ctx.outermost_pin_extents)
+        surfaces_before = len(ctx.outermost_surfaces)
 
         if isinstance(child, BooleanPlacementSchema):
             objects = _place_boolean_placement(child, child_name, index, ctx, visiting)
             if any(isinstance(o, Cell) and o.fill is not None for o in objects):
                 raise NotImplementedError(
-                    f"BooleanPlacement '{name}': child '{child_name}' is a BooleanPlacement that "
-                    f"contains a rotated child, and can't be nested inside another boolean yet. "
-                    f"Put the rotated object directly in '{name}' instead."
+                    f"BooleanPlacement '{name}': child '{child_name}' is rotated or contains a "
+                    f"rotated child, and can't be nested inside another boolean yet. Put the "
+                    f"rotated object directly in '{name}', or rotate '{name}' as a whole instead."
                 )
             if any(offset):
                 objects, _ = _translate(objects, *offset, ctx)
@@ -908,15 +1078,30 @@ def _expand_boolean_children(
                 child, child_name, index, ctx, offset, inside_boolean=True,
             )
         elif isinstance(child, _LATTICE_TYPES):
-            raise TypeError(
-                f"BooleanPlacement '{name}': lattice child '{child_name}' is not supported in v1."
-            )
+            if child.pin_rotation_overrides:
+                raise NotImplementedError(
+                    f"BooleanPlacement '{name}': lattice child '{child_name}' has "
+                    f"pin_rotation_overrides. Per-pin rotation inside a boolean isn't supported; "
+                    f"rotate the whole lattice or remove the overrides."
+                )
+            if _is_rotated(child.assembly_rotation()):
+                results.append(_rotated_lattice_operand(child, child_name, index, ctx, offset))
+                continue
+            instances_before = len(ctx.lattice_instances)
+            objects = _expand_lattice(child, child_name, index, ctx)
+            # The pins are merged into one cell here, so the viewport can't draw
+            # them as shared instances: drop the entry _expand_lattice recorded.
+            del ctx.lattice_instances[instances_before:]
+            if any(offset):
+                objects, _ = _translate(objects, *offset, ctx)
         else:
             raise TypeError(
                 f"BooleanPlacement '{name}': child '{child_name}' has unsupported type "
                 f"{type(child).__name__}."
             )
 
+        del ctx.outermost_pin_extents[extents_before:]
+        del ctx.outermost_surfaces[surfaces_before:]
         results.append((_only_surfaces(objects), _only_cells(objects)))
 
     return results
@@ -953,12 +1138,14 @@ def _merge_children(
         return _merge_with_rotated(children, op, name, material_filter, ctx)
 
     kept_materials: list[str | None] = []
+    kept_count = 0
 
     for child_surfaces, child_cells in children:
         surfaces.extend(child_surfaces)
         kept = [c for c in child_cells if _keeps_material(c, material_filter)]
         if not kept:
             continue
+        kept_count += len(kept)
         if material is None:
             material = kept[0].material_id
         for cell in kept:
@@ -971,6 +1158,7 @@ def _merge_children(
     if not child_regions:
         return list(surfaces)
 
+    _warn_if_heavy(ctx, name, kept_count)
     if len(kept_materials) > 1:
         ctx.warnings.append(
             f"BooleanPlacement '{name}' ({op}) merges cells of several materials "
@@ -1074,6 +1262,10 @@ def _merge_with_rotated(
 
     material = contributors[0][2]
     plain = [r for is_rot, r, _m in contributors if not is_rot and r is not None]
+    _warn_if_heavy(ctx, name, len(x_cells) + sum(
+        len([c for c in child[1] if _keeps_material(c, material_filter)])
+        for child in children if not isinstance(child, _RotatedOperand)
+    ))
 
     def any_of(regions: list[Region]) -> Region:
         return regions[0] if len(regions) == 1 else Union(list(regions))
