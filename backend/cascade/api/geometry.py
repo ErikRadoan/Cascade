@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -214,8 +216,26 @@ async def delete_geometry(geometry_id: str, db: Session = Depends(get_db)) -> De
     return DeletedResponse(id=geometry_id)
 
 
+@lru_cache(maxsize=16)
+def _expand_csg_cached(text: str) -> dict:
+    """Expand editor text into the CSG dict, remembering the last few results.
+
+    Several panels ask for the same text, and a re-request after an unrelated
+    UI change is common, so repeats are free. Failures raise and are not
+    cached. The returned dict is shared: callers must treat it as read-only.
+    """
+    errors = sweep.validate_preview(text)
+    if errors:
+        raise ValueError(errors[0]["message"])
+    schemas = sweep.preview_load(text)
+    return geometry_to_csg_dict(expander.expand(schemas))
+
+
+# A plain `def`, not `async def`: expansion is CPU-bound, and FastAPI runs a
+# sync endpoint in its thread pool, so a big lattice no longer freezes every
+# other request while it expands.
 @router.post("/csg")
-async def build_csg(body: SceneRequest) -> dict:
+def build_csg(body: SceneRequest) -> dict:
     """Fully-expanded CSG (surfaces + cells + region trees) for live editor
     text — the general-purpose counterpart to /scene's template-aware
     SceneBuilder output. Renders arbitrary surfaces/regions, including
@@ -224,12 +244,7 @@ async def build_csg(body: SceneRequest) -> dict:
     Mirrors GET /jobs/{job_id}/csg for a job that hasn't been submitted yet.
     Phase C: response also includes lattice_instances (additive field).
     """
-    errors = sweep.validate_preview(body.text)
-    if errors:
-        raise HTTPException(status_code=422, detail=errors[0]["message"])
     try:
-        schemas = sweep.preview_load(body.text)
-        geometry = expander.expand(schemas)
+        return _expand_csg_cached(body.text)
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
-    return geometry_to_csg_dict(geometry)

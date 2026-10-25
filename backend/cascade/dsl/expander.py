@@ -54,7 +54,7 @@ from ..domain.geometry import (
 from . import primitives, templates
 from .primitives import translate_params
 from .schema.base import BaseComponentSchema
-from ..domain.bounds import Bounds, bounds_overlap, region_bounds
+from ..domain.bounds import Bounds, BoundsIndex, region_bounds
 from .schema.boolean import BooleanPlacementSchema
 from .schema.box import BoxSchema
 from .schema.cell import CellSchema
@@ -1009,7 +1009,7 @@ def _clipped(region: Region, blockers: list[Region]) -> Region | None:
     """``region`` minus ``blockers``; None when a blocker is the region itself."""
     if not blockers:
         return region
-    if any(b == region for b in blockers):
+    if any(b is region or b == region for b in blockers):
         return None
     return intersection_of([region, Complement(union_of(blockers))])
 
@@ -1030,27 +1030,38 @@ def _resolve_overlaps(
       others only define the space they are confined to.
 
     ``bounds`` prune the work: a cell is only clipped against cells whose bounds
-    could overlap it, so children that don't touch pass through untouched.
+    could overlap it, so children that don't touch pass through untouched. The
+    overlapping cells are found with a ``BoundsIndex`` rather than by testing
+    every pair, so the cost grows with the number of cells, not its square.
     """
     pieces: list[tuple[Region, str | None]] = []
     clip_terms = 0
 
     if op == "union":
-        placed: list[_Part] = []
+        # One index over every cell in operand order. A cell is clipped only
+        # against cells of EARLIER operands, i.e. indices below its operand's start.
+        all_parts = [part for parts in operands for part in parts]
+        index = BoundsIndex([part.bounds for part in all_parts])
+        start = 0
         for parts in operands:
             for part in parts:
-                blockers = [p.region for p in placed if bounds_overlap(part.bounds, p.bounds)]
+                blockers = [
+                    all_parts[i].region
+                    for i in index.overlapping(part.bounds)
+                    if i < start
+                ]
                 clip_terms += len(blockers)
                 region = _clipped(part.region, blockers)
                 if region is not None:
                     pieces.append((region, part.material_id))
-            placed.extend(parts)
+            start += len(parts)
 
     elif op == "subtraction":
         kept, *cutters = operands
         cut_parts = [p for parts in cutters for p in parts]
+        index = BoundsIndex([p.bounds for p in cut_parts])
         for part in kept:
-            blockers = [p.region for p in cut_parts if bounds_overlap(part.bounds, p.bounds)]
+            blockers = [cut_parts[i].region for i in index.overlapping(part.bounds)]
             clip_terms += len(blockers)
             region = _clipped(part.region, blockers)
             if region is not None:
@@ -1058,10 +1069,11 @@ def _resolve_overlaps(
 
     elif op == "intersection":
         first, *others = operands
+        indexes = [BoundsIndex([p.bounds for p in other]) for other in others]
         for part in first:
             region: Region | None = part.region
-            for other in others:
-                hits = [p.region for p in other if bounds_overlap(part.bounds, p.bounds)]
+            for other, index in zip(others, indexes):
+                hits = [other[i].region for i in index.overlapping(part.bounds)]
                 if not hits:
                     region = None  # nothing of this cell lies inside that operand
                     break

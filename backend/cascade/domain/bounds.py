@@ -13,7 +13,9 @@ that is provably empty.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from statistics import median
 
 from .geometry import (
     Complement,
@@ -119,10 +121,15 @@ def surface_outside_bounds(surface: Surface) -> Bounds:
 def intersect_bounds(a: Bounds | None, b: Bounds | None) -> Bounds | None:
     if a is None or b is None:
         return None
-    merged = tuple(max(a[i], b[i]) if i % 2 == 0 else min(a[i], b[i]) for i in range(6))
-    if any(merged[2 * i] > merged[2 * i + 1] for i in range(3)):
+    x0 = a[0] if a[0] > b[0] else b[0]
+    x1 = a[1] if a[1] < b[1] else b[1]
+    y0 = a[2] if a[2] > b[2] else b[2]
+    y1 = a[3] if a[3] < b[3] else b[3]
+    z0 = a[4] if a[4] > b[4] else b[4]
+    z1 = a[5] if a[5] < b[5] else b[5]
+    if x0 > x1 or y0 > y1 or z0 > z1:
         return None
-    return merged  # type: ignore[return-value]
+    return (x0, x1, y0, y1, z0, z1)
 
 
 def hull_bounds(a: Bounds | None, b: Bounds | None) -> Bounds | None:
@@ -130,7 +137,11 @@ def hull_bounds(a: Bounds | None, b: Bounds | None) -> Bounds | None:
         return b
     if b is None:
         return a
-    return tuple(min(a[i], b[i]) if i % 2 == 0 else max(a[i], b[i]) for i in range(6))  # type: ignore[return-value]
+    return (
+        a[0] if a[0] < b[0] else b[0], a[1] if a[1] > b[1] else b[1],
+        a[2] if a[2] < b[2] else b[2], a[3] if a[3] > b[3] else b[3],
+        a[4] if a[4] < b[4] else b[4], a[5] if a[5] > b[5] else b[5],
+    )
 
 
 def region_bounds(region: Region, surfaces: Mapping[str, Surface]) -> Bounds | None:
@@ -167,4 +178,95 @@ def bounds_overlap(a: Bounds | None, b: Bounds | None, tol: float = OVERLAP_TOLE
     """Whether two bounds share volume (merely touching faces do not count)."""
     if a is None or b is None:
         return False
-    return all(a[2 * i] < b[2 * i + 1] - tol and b[2 * i] < a[2 * i + 1] - tol for i in range(3))
+    return (
+        a[0] < b[1] - tol and b[0] < a[1] - tol
+        and a[2] < b[3] - tol and b[2] < a[3] - tol
+        and a[4] < b[5] - tol and b[4] < a[5] - tol
+    )
+
+
+def _is_finite(bounds: Bounds) -> bool:
+    return all(math.isfinite(v) for v in bounds)
+
+
+# An item whose bounds span more grid cells than this is not registered in the
+# grid; it is tested directly against every query instead (see BoundsIndex).
+_MAX_CELLS_PER_ITEM = 64
+
+
+class BoundsIndex:
+    """Which of a fixed list of bounds overlap a query box, without testing all of them.
+
+    Finding every overlapping pair of N boxes by testing each pair costs N^2
+    checks, which is what made lattice booleans slow down quadratically. This
+    index hashes each box into a uniform grid, so a query only looks at the
+    boxes that share a grid cell with it. For lattices and other evenly spread
+    shapes that is a handful of boxes, so N queries cost about N in total.
+
+    ``overlapping`` returns exactly the indices a plain scan with
+    ``bounds_overlap`` would, in ascending order. Boxes the grid can't hold
+    (unbounded, or much larger than a typical box) are checked directly on
+    every query, so the result is never a subset.
+    """
+
+    def __init__(self, bounds: Sequence[Bounds | None]) -> None:
+        self._bounds = bounds
+        self._direct: list[int] = []
+        self._cells: dict[tuple[int, int, int], list[int]] = defaultdict(list)
+
+        gridded = [b for b in bounds if b is not None and _is_finite(b)]
+        # The median extent keeps one huge box (a moderator body) from stretching
+        # the cells so far that every pin lands in the same one.
+        self._size = [
+            max(median(b[2 * axis + 1] - b[2 * axis] for b in gridded), 1e-6) if gridded else 1.0
+            for axis in range(3)
+        ]
+
+        for index, b in enumerate(bounds):
+            if b is None:
+                continue
+            if not _is_finite(b):
+                self._direct.append(index)
+                continue
+            ranges = self._ranges(b)
+            count = len(ranges[0]) * len(ranges[1]) * len(ranges[2])
+            if count > _MAX_CELLS_PER_ITEM:
+                self._direct.append(index)
+                continue
+            for i in ranges[0]:
+                for j in ranges[1]:
+                    for k in ranges[2]:
+                        self._cells[(i, j, k)].append(index)
+
+    def _ranges(self, b: Bounds) -> tuple[range, range, range]:
+        size = self._size
+        return (
+            range(math.floor(b[0] / size[0]), math.floor(b[1] / size[0]) + 1),
+            range(math.floor(b[2] / size[1]), math.floor(b[3] / size[1]) + 1),
+            range(math.floor(b[4] / size[2]), math.floor(b[5] / size[2]) + 1),
+        )
+
+    def overlapping(self, query: Bounds | None) -> list[int]:
+        """Indices of the stored bounds that share volume with ``query``, ascending."""
+        if query is None:
+            return []
+        bounds = self._bounds
+
+        if not _is_finite(query):
+            return [i for i, b in enumerate(bounds) if bounds_overlap(query, b)]
+
+        ranges = self._ranges(query)
+        if len(ranges[0]) * len(ranges[1]) * len(ranges[2]) > _MAX_CELLS_PER_ITEM * 8:
+            # A query much larger than the grid cells would visit thousands of
+            # cells; a straight scan is cheaper.
+            return [i for i, b in enumerate(bounds) if bounds_overlap(query, b)]
+
+        candidates: set[int] = set(self._direct)
+        cells = self._cells
+        for i in ranges[0]:
+            for j in ranges[1]:
+                for k in ranges[2]:
+                    found = cells.get((i, j, k))
+                    if found:
+                        candidates.update(found)
+        return sorted(i for i in candidates if bounds_overlap(query, bounds[i]))

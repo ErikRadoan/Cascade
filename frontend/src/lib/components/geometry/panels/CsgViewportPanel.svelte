@@ -4,10 +4,10 @@
   // Phase C: lattice instancing. Phase B: analytic ray intervals for primary hit.
   // Phase A: BVH, root AABB, tetrahedron normals, adaptive DPR, perf logs.
 
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
   import * as THREE from 'three';
-  import * as api from '$lib/api';
   import { activeProject } from '../stores/projects.svelte.js';
+  import { csgState, requestCsgRefresh } from '../stores/csg.svelte.js';
   // Same store ObjectPanel writes — keys are `${projectId}:${placementName}`
   // inside isVisible/toggleVisibility. Must match ObjectPanel's import path.
   import { isVisible, visibility } from '../stores/visibility.svelte.js';
@@ -313,8 +313,6 @@
   }
 
   let csg = $state<CsgGeometry | null>(null);
-  let loading = $state(false);
-  let loadError = $state<string | null>(null);
   let truncatedSurfaces = $state(false);
   let truncatedProtos = $state(false);
   let truncatedInstances = $state(false);
@@ -339,12 +337,27 @@
   interface DebugBoxEntry { name: string; aabb: AxisBounds; color: string; }
   let lastDebugBoxes: DebugBoxEntry[] = [];
 
+  // The CSG comes from the shared store (the same request ObjectPanel makes),
+  // so one edit costs one backend expansion instead of one per panel.
   const projectText = $derived(activeProject().text);
-  let fetchHandle: ReturnType<typeof setTimeout> | undefined;
   $effect(() => {
-    const text = projectText;
-    clearTimeout(fetchHandle);
-    fetchHandle = setTimeout(() => load(text), 400);
+    requestCsgRefresh(projectText);
+  });
+
+  const loading = $derived(csgState.loading);
+  const loadError = $derived(csgState.error);
+
+  // Repack the GPU buffers whenever the store delivers new geometry (or an error
+  // clears it). untrack: rebuildAndRender reads a lot of state that must not
+  // become a dependency of this effect.
+  $effect(() => {
+    const data = csgState.data;
+    untrack(() => {
+      csg = data;
+      const t1 = performance.now();
+      rebuildAndRender();
+      console.log(`[perf] rebuildAndRender: ${(performance.now() - t1).toFixed(1)}ms`);
+    });
   });
 
   // Re-pack protos/instances when an Objects-panel eye toggle flips.
@@ -356,23 +369,6 @@
     void Object.keys(visibility).length;
     if (shaderMaterial && csg) rebuildAndRender();
   });
-
-  async function load(text: string) {
-    const t0 = performance.now();
-    loading = true; loadError = null;
-    try {
-      csg = await api.geometry.csg(text);
-      console.log(`[perf] /geometry/csg fetch: ${(performance.now() - t0).toFixed(1)}ms`);
-    } catch (e) {
-      loadError = e instanceof Error ? e.message : String(e);
-      csg = null;
-    } finally {
-      loading = false;
-      const t1 = performance.now();
-      rebuildAndRender();
-      console.log(`[perf] rebuildAndRender: ${(performance.now() - t1).toFixed(1)}ms`);
-    }
-  }
 
   let canvasEl: HTMLCanvasElement;
   let containerEl: HTMLDivElement;
