@@ -13,6 +13,7 @@ editor CSG path keeps working, and record a warning on ctx.warnings.
 
 from __future__ import annotations
 
+import math
 from typing import Protocol
 
 from ..domain.geometry import (
@@ -80,6 +81,24 @@ def _build_fuel_pin_cells(
     return cells
 
 
+def _shared_floor_matches(ctx: ExpansionContext, z: float) -> bool:
+    """True when the shared Box floor plane sits at height ``z``.
+
+    If the plane's height can't be read from the context, assume it matches:
+    that keeps the pre-existing "share the Box floor" behaviour rather than
+    guessing a different one.
+    """
+    surfaces = getattr(ctx, "shared_surfaces", None)
+    bot_id = getattr(ctx, "axial_bot_id", None)
+    surface = surfaces.get(bot_id) if isinstance(surfaces, dict) else None
+    if surface is None:
+        return True
+    floor_z = surface.params.get("z", surface.params.get("z0"))
+    if floor_z is None:
+        return True
+    return math.isclose(float(floor_z), float(z), rel_tol=0.0, abs_tol=1e-9)
+
+
 def _warn(ctx: ExpansionContext, message: str) -> None:
     """Append a soft warning if the expansion context supports it."""
     warnings = getattr(ctx, "warnings", None)
@@ -121,8 +140,12 @@ class _FuelPinTemplateExpander:
         else:
             new_outermost = None
 
-        # Axial bounds: bottom is Box-shared when available (so pins in the
-        # same box snap to a common floor); local fallback for editor UX
+        # Axial bounds: the bottom reuses the Box's floor plane ONLY when the
+        # pin actually starts on that floor (so pins standing on the floor
+        # share one coincident surface); a pin placed higher gets its own
+        # plane at its placement z. Reusing the floor unconditionally
+        # stretched every raised pin down to the Box floor, so its bottom
+        # was drawn on the Box's bottom wall. Local fallback for editor UX
         # when no Box exists yet. The TOP is always derived from the pin's
         # own pellet_height — it must never be silently replaced by the
         # Box's top surface, or pellet_height becomes meaningless the moment
@@ -137,7 +160,8 @@ class _FuelPinTemplateExpander:
         # its own local frame, where the fill-cell's rotation applies to
         # them correctly along with everything else.
         has_axial = getattr(ctx, "has_axial_bounds", None)
-        use_shared = callable(has_axial) and has_axial() and not force_local_axial
+        has_shared_bounds = callable(has_axial) and has_axial() and not force_local_axial
+        use_shared = has_shared_bounds and _shared_floor_matches(ctx, dz)
         extra_surfaces: list[Surface] = []
 
         if use_shared:
@@ -152,7 +176,9 @@ class _FuelPinTemplateExpander:
             )
             extra_surfaces.append(bot)
             bot_id = bot.id
-            if not force_local_axial:
+            # Only warn when there is genuinely no Box to share with; a pin
+            # that merely starts above the Box floor is a valid placement.
+            if not force_local_axial and not has_shared_bounds:
                 _warn(
                     ctx,
                     "FuelPin placed without a Box for shared axial bounds; "
