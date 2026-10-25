@@ -54,6 +54,7 @@ from ..domain.geometry import (
 from . import primitives, templates
 from .primitives import translate_params
 from .schema.base import BaseComponentSchema
+from ..domain.bounds import Bounds, bounds_overlap, region_bounds
 from .schema.boolean import BooleanPlacementSchema
 from .schema.box import BoxSchema
 from .schema.cell import CellSchema
@@ -100,6 +101,12 @@ class Context:
     # Tier-1 primitive name -> its surface id, so Tier-2 cells can refer to
     # primitives by name.
     primitive_ids: dict[str, str] = field(default_factory=dict)
+
+    # Surfaces that cells may reference without owning them (the universe Box's
+    # planes, which fuel pins share). A BooleanPlacement looks surfaces up here
+    # when it estimates where its cells are; an id that isn't known is treated
+    # as unbounded, which is always safe.
+    shared_surfaces: dict[str, Surface] = field(default_factory=dict)
 
     lattice_instances: list[LatticeInstance] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -260,21 +267,6 @@ def _translate(
             ))
 
     return new_surfaces + new_cells, id_map
-
-
-def _combine_regions(op: str, regions: list[Region]) -> Region:
-    """Fold regions left to right with a binary boolean op."""
-    if not regions:
-        raise ValueError("Cannot combine empty region list")
-    if op == "union":
-        # Flat n-ary union rather than a left-nested chain of binary unions.
-        return union_of(regions)
-    if op == "intersection":
-        return intersection_of(regions)
-    if op == "subtraction":
-        kept, *cutters = regions
-        return intersection_of([kept, *[Complement(c) for c in cutters]])
-    raise ValueError(f"Unknown boolean op '{op}'")
 
 
 # ---------------------------------------------------------------------------
@@ -685,10 +677,12 @@ def _place_boolean_placement(
     BooleanPlacements) with a boolean op.
 
     Children are expanded like standalone placements, shifted by this
-    placement's x/y/z, and then merged into ONE cell whatever the op. A union
-    used to keep one cell per child, which left overlapping children as
-    overlapping cells (undefined in OpenMC) and made the union not behave as
-    a single object.
+    placement's x/y/z, and then combined with the op. Each child's cells keep
+    their own materials. Where children overlap the cells are clipped so that
+    nothing overlaps (OpenMC and Serpent treat overlapping cells as undefined):
+    for a union the earlier child wins, a subtraction keeps the first child's
+    cells minus the others, and an intersection keeps the first child's cells
+    inside the others. ``materials`` selects which child cells take part.
     """
     if name in visiting:
         chain = " -> ".join((*visiting, name))
@@ -820,8 +814,21 @@ def _rotated_operand(
 _MERGE_CELL_WARN = 64
 
 
+_CLIP_TERMS_WARN = 2000
+
+
+def _warn_if_clip_heavy(ctx: Context, name: str, clip_terms: int) -> None:
+    """Clipping cells against many overlapping cells (big lattices) makes long regions."""
+    if clip_terms > _CLIP_TERMS_WARN:
+        ctx.warnings.append(
+            f"BooleanPlacement '{name}' clips its cells against {clip_terms} overlapping cells. "
+            f"Regions this long slow down viewport rendering and transport; combine fewer or "
+            f"smaller lattices, or narrow it with `materials`."
+        )
+
+
 def _warn_if_heavy(ctx: Context, name: str, cell_count: int) -> None:
-    """Merging many cells (a lattice of pins) yields one huge region."""
+    """Merging many cells (a lattice of pins) into one region."""
     if cell_count > _MERGE_CELL_WARN:
         ctx.warnings.append(
             f"BooleanPlacement '{name}' merges {cell_count} cells into one region. Large "
@@ -989,6 +996,86 @@ def _empties_result(op: str, position: int) -> bool:
     return op == "intersection" or (op == "subtraction" and position == 0)
 
 
+@dataclass(frozen=True, slots=True)
+class _Part:
+    """One cell that takes part in a boolean, with where it can possibly be."""
+
+    region: Region
+    material_id: str | None
+    bounds: Bounds | None
+
+
+def _clipped(region: Region, blockers: list[Region]) -> Region | None:
+    """``region`` minus ``blockers``; None when a blocker is the region itself."""
+    if not blockers:
+        return region
+    if any(b == region for b in blockers):
+        return None
+    return intersection_of([region, Complement(union_of(blockers))])
+
+
+def _resolve_overlaps(
+    op: str, operands: list[list[_Part]],
+) -> tuple[list[tuple[Region, str | None]], int]:
+    """The (region, material) pieces of a boolean, plus how many cells were clipped against.
+
+    Every operand is a list of cells (a FuelPin is several). The result keeps
+    each surviving cell's own material, and the pieces never overlap:
+
+    * union: operands are applied in order and an earlier operand wins where
+      they overlap, so a later cell loses the part an earlier cell covers.
+    * subtraction: the first operand is the kept body; the others only define
+      what is cut away and contribute no material.
+    * intersection: the first operand supplies the cells and materials; the
+      others only define the space they are confined to.
+
+    ``bounds`` prune the work: a cell is only clipped against cells whose bounds
+    could overlap it, so children that don't touch pass through untouched.
+    """
+    pieces: list[tuple[Region, str | None]] = []
+    clip_terms = 0
+
+    if op == "union":
+        placed: list[_Part] = []
+        for parts in operands:
+            for part in parts:
+                blockers = [p.region for p in placed if bounds_overlap(part.bounds, p.bounds)]
+                clip_terms += len(blockers)
+                region = _clipped(part.region, blockers)
+                if region is not None:
+                    pieces.append((region, part.material_id))
+            placed.extend(parts)
+
+    elif op == "subtraction":
+        kept, *cutters = operands
+        cut_parts = [p for parts in cutters for p in parts]
+        for part in kept:
+            blockers = [p.region for p in cut_parts if bounds_overlap(part.bounds, p.bounds)]
+            clip_terms += len(blockers)
+            region = _clipped(part.region, blockers)
+            if region is not None:
+                pieces.append((region, part.material_id))
+
+    elif op == "intersection":
+        first, *others = operands
+        for part in first:
+            region: Region | None = part.region
+            for other in others:
+                hits = [p.region for p in other if bounds_overlap(part.bounds, p.bounds)]
+                if not hits:
+                    region = None  # nothing of this cell lies inside that operand
+                    break
+                clip_terms += len(hits)
+                region = intersection_of([region, union_of(hits)])
+            if region is not None:
+                pieces.append((region, part.material_id))
+
+    else:
+        raise ValueError(f"Unknown boolean op '{op}'")
+
+    return pieces, clip_terms
+
+
 def _merge_children(
     children: list[_BooleanOperand],
     op: str,
@@ -996,15 +1083,17 @@ def _merge_children(
     material_filter: set[str] | None,
     ctx: Context,
 ) -> list[SceneObject]:
-    """Merge the children into one cell using the first kept child's material.
+    """Combine the children with ``op``, keeping each cell's own material.
 
-    Each child's kept cells are first joined by union into a single region,
-    and those per-child regions are then combined with ``op``.
+    ``material_filter`` (the BooleanPlacement's ``materials``) selects which
+    child cells take part. A child with no selected cell is the empty set: a
+    union ignores it, a subtraction's cutter cuts nothing, and an empty
+    intersection operand or an empty kept body empties the result. See
+    ``_resolve_overlaps`` for how the remaining cells are combined.
+
+    A rotated child can't share a frame with its siblings, so that case is
+    delegated to ``_merge_with_rotated``, which still builds one material.
     """
-    surfaces: list[Surface] = []
-    child_regions: list[Region] = []
-    material: str | None = None
-
     rotated = [c for c in children if isinstance(c, _RotatedOperand)]
     if len(rotated) > 1:
         raise NotImplementedError(
@@ -1015,48 +1104,41 @@ def _merge_children(
     if rotated:
         return _merge_with_rotated(children, op, name, material_filter, ctx)
 
-    kept_materials: list[str | None] = []
-    kept_count = 0
-    result_is_empty = False
-
-    for position, (child_surfaces, child_cells) in enumerate(children):
+    surfaces: list[Surface] = []
+    selected: list[list[Cell]] = []
+    for child_surfaces, child_cells in children:
         surfaces.extend(child_surfaces)
-        kept = [c for c in child_cells if _keeps_material(c, material_filter)]
-        if not kept:
-            # An operand with nothing kept is the empty set. A union can ignore
-            # it, but it empties an intersection and a subtraction's kept body.
-            # (A subtraction just skips an empty cutter: nothing is cut.)
-            if _empties_result(op, position):
-                result_is_empty = True
-            continue
-        kept_count += len(kept)
-        if material is None:
-            material = kept[0].material_id
-        for cell in kept:
-            if cell.material_id not in kept_materials:
-                kept_materials.append(cell.material_id)
-        region = _union_of_cell_regions(kept)
-        if region is not None:
-            child_regions.append(region)
+        selected.append([c for c in child_cells if _keeps_material(c, material_filter)])
 
-    if result_is_empty or not child_regions:
+    if not any(selected) or any(
+        not cells and _empties_result(op, position) for position, cells in enumerate(selected)
+    ):
         return list(surfaces)
 
-    _warn_if_heavy(ctx, name, kept_count)
-    if len(kept_materials) > 1:
-        ctx.warnings.append(
-            f"BooleanPlacement '{name}' ({op}) merges cells of several materials "
-            f"({', '.join(str(m) for m in kept_materials)}) into one cell of material "
-            f"'{material}'. Set `materials` on '{name}' to choose which materials it keeps."
-        )
+    known = {**ctx.shared_surfaces, **{surface.id: surface for surface in surfaces}}
+    operands = [
+        [_Part(c.region, c.material_id, region_bounds(c.region, known)) for c in cells]
+        for cells in selected
+    ]
+    pieces, clip_terms = _resolve_overlaps(op, operands)
+    if not pieces:
+        return list(surfaces)
 
-    cell = Cell(
-        id=ctx.fresh_id("c"),
-        region=_combine_regions(op, child_regions),
-        material_id=material,
-        name=name,
-    )
-    return [*surfaces, cell]
+    _warn_if_clip_heavy(ctx, name, clip_terms)
+
+    # Several cells get "<name>_layer<k>" names: tallies and the viewer match a
+    # result back to its cell by name, and the viewer groups "_layerN" cells
+    # under the placement (csgCellGrouping.ts).
+    cells = [
+        Cell(
+            id=ctx.fresh_id("c"),
+            region=region,
+            material_id=material,
+            name=name if len(pieces) == 1 else f"{name}_layer{k}",
+        )
+        for k, (region, material) in enumerate(pieces)
+    ]
+    return [*surfaces, *cells]
 
 
 def _piece_universe(
@@ -1102,8 +1184,11 @@ def _merge_with_rotated(
     region R there. X's confining sphere S is then partitioned by R: each
     part is a fill cell that instances a small universe holding X's cells
     (with the composite's material, or the Box's for a cutter) over a
-    background. Nothing overlaps, and the result is the same single-material
-    object the unrotated merge produces. With m the first kept child's material:
+    background. Nothing overlaps. Unlike the unrotated merge, which keeps every
+    cell's own material, this builds ONE material: siblings can't be drawn inside
+    X's rotated universe, so only X's cells and a single sibling region exist
+    there. A warning says so when more than one material is being collapsed.
+    With m the first kept child's material:
 
       union          R-S: m            S&R: X=m, bg=m      S&~R: X=m, bg=Box
       intersection                     S&R: X=m, bg=Box    S&~R: empty (Box)
@@ -1118,6 +1203,7 @@ def _merge_with_rotated(
     # (is_rotated, region, material) for every operand that kept a cell.
     contributors: list[tuple[bool, Region | None, str | None]] = []
     x_cells: list[Cell] = []
+    kept_materials: list[str | None] = []
     rotated = next(c for c in children if isinstance(c, _RotatedOperand))
     result_is_empty = False
 
@@ -1125,6 +1211,7 @@ def _merge_with_rotated(
         if isinstance(child, _RotatedOperand):
             surfaces.extend(child.surfaces)
             x_cells = [c for c in child.cells if _keeps_material(c, material_filter)]
+            kept_materials.extend(c.material_id for c in x_cells)
             if x_cells:
                 contributors.append((True, None, x_cells[0].material_id))
             elif _empties_result(op, position):
@@ -1133,6 +1220,7 @@ def _merge_with_rotated(
         child_surfaces, child_cells = child
         surfaces.extend(child_surfaces)
         kept = [c for c in child_cells if _keeps_material(c, material_filter)]
+        kept_materials.extend(c.material_id for c in kept)
         if kept:
             contributors.append((False, _union_of_cell_regions(kept), kept[0].material_id))
         elif _empties_result(op, position):
@@ -1153,6 +1241,15 @@ def _merge_with_rotated(
         )]
 
     material = contributors[0][2]
+    distinct = list(dict.fromkeys(kept_materials))
+    if len(distinct) > 1:
+        ctx.warnings.append(
+            f"BooleanPlacement '{name}' ({op}) has a rotated child, so it is built as a single "
+            f"material: '{material}' ({', '.join(str(m) for m in distinct)} were combined). A "
+            f"rotated child lives in its own universe and can't share cells with its siblings. "
+            f"Rotate the whole composite instead to keep every material, or set `materials` "
+            f"on '{name}' to choose which one is kept."
+        )
     plain = [r for is_rot, r, _m in contributors if not is_rot and r is not None]
     _warn_if_heavy(ctx, name, len(x_cells) + sum(
         len([c for c in child[1] if _keeps_material(c, material_filter)])
@@ -1655,6 +1752,7 @@ def _place_universe_boxes(
 
         box_surfaces, labels = _place_universe_box(tpl, schema.position(), ctx)
         surfaces.extend(box_surfaces)
+        ctx.shared_surfaces.update({surface.id: surface for surface in box_surfaces})
         if not boxes:
             ctx.axial_bot_id = labels["bot"]
             ctx.axial_top_id = labels["top"]

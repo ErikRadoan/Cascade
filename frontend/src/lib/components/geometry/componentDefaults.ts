@@ -110,7 +110,10 @@ export const PLACEMENT_DEFAULTS: Record<string, (templateName: string) => Record
    * for API uniformity; callers should pass the selected child names via the
    * returned object's `children` field after creation.
    *
-   * materials: [] means "all materials present in the children".
+   * materials restricts which child cells take part (every child cell keeps
+   * its own material in the result). [] means all cells take part; cells of
+   * an unlisted material are treated as absent. See
+   * docs/Decisions/004-boolean-placement.md.
    * The Parameters panel computes the available set from the children.
    */
   BooleanPlacement: (_templateName: string) => ({

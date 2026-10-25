@@ -59,7 +59,8 @@ def _removed_boolean_message(component_type: str, name: str) -> str:
         f"    type: BooleanPlacement\n"
         f"    op: {op}\n"
         f"    children: [<placement_a>, <placement_b>]\n"
-        f"The first child is the kept body for a subtraction."
+        f"Each child keeps its own material; the first child is the kept body for a "
+        f"subtraction, and the earlier child wins where a union overlaps."
     )
 
 

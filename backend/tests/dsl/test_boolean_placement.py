@@ -43,6 +43,10 @@ ball:
   type: Sphere
   radius: 2.0
   material: UO2
+ball2:
+  type: Sphere
+  radius: 2.0
+  material: Zr4
 cutter:
   type: Sphere
   radius: 1.0
@@ -53,7 +57,7 @@ a:
   x: -1.0
 b:
   type: SinglePlacement
-  template: ball
+  template: ball2
   x: 1.5
 c:
   type: SinglePlacement
@@ -69,7 +73,56 @@ cut:
 """
 
 
-def test_nested_boolean_placement_still_expands():
+def _cells_of(geometry, prefix):
+    return [c for c in geometry.cells if c.name == prefix or (c.name or "").startswith(f"{prefix}_layer")]
+
+
+def test_union_keeps_both_materials_and_the_cutter_adds_none():
     geometry = expand(load(WORLD + SPHERES))
-    cut = [c for c in geometry.cells if c.name == "cut"]
-    assert cut, [c.name for c in geometry.cells]
+    cut = _cells_of(geometry, "cut")
+    assert [c.name for c in cut] == ["cut_layer0", "cut_layer1"]
+    assert {c.material_id for c in cut} == {"UO2", "Zr4"}   # He (the cutter) is gone
+    assert geometry.warnings == []                          # nothing is collapsed
+
+
+def test_a_nested_boolean_keeps_its_materials_and_is_renamed_by_its_parent():
+    nested = SPHERES + """
+far:
+  type: SinglePlacement
+  template: ball2
+  x: 40.0
+outer:
+  type: BooleanPlacement
+  op: union
+  children: [cut, far]
+"""
+    geometry = expand(load(WORLD + nested))
+    outer = _cells_of(geometry, "outer")
+    assert [c.name for c in outer] == ["outer_layer0", "outer_layer1", "outer_layer2"]
+    assert [c.material_id for c in outer] == ["UO2", "Zr4", "Zr4"]
+    assert _cells_of(geometry, "cut") == []
+
+
+def test_materials_picks_which_cells_take_part():
+    only_fuel = SPHERES.replace("  children: [a, b]\n", "  children: [a, b]\n  materials: [UO2]\n", 1)
+    geometry = expand(load(WORLD + only_fuel))
+    assert {c.material_id for c in _cells_of(geometry, "cut")} == {"UO2"}
+
+
+def test_a_rotated_child_still_collapses_to_one_material_and_says_so():
+    rotated = WORLD + SPHERES.split("u:\n")[0] + """
+r:
+  type: SinglePlacement
+  template: ball2
+  x: 1.5
+  ry: 30.0
+w:
+  type: SinglePlacement
+  template: world
+mix:
+  type: BooleanPlacement
+  op: union
+  children: [a, r]
+"""
+    geometry = expand(load(rotated))
+    assert any("'mix'" in w and "rotated child" in w and "single material" in w for w in geometry.warnings), geometry.warnings
