@@ -47,6 +47,10 @@
   // scene scale: small enough never to blur real features, big enough that
   // float noise cannot flip a tie. The per-pixel tolerance is screen-relative.
   const EPS_MIN_FRACTION = 1e-5;
+  // Minimum per-axis padding of a cell's AABB, as a fraction of scene span: 10x the
+  // depth-tolerance floor, so a box always clears float noise but stays far tighter
+  // than the cell on tall thin objects (see cellAABB).
+  const AABB_PAD_FLOOR_FRACTION = 10 * EPS_MIN_FRACTION;
   const IDLE_DPR = Math.min(typeof window !== 'undefined' ? window.devicePixelRatio : 1.5, 1.5);
 
   const OP_INSIDE = 0, OP_OUTSIDE = 1, OP_AND = 2, OP_OR = 3, OP_NOT = 4;
@@ -327,8 +331,18 @@
     if (!isFinite(b.xMin) || !isFinite(b.xMax)) { b.xMin = fallback.xMin; b.xMax = fallback.xMax; }
     if (!isFinite(b.yMin) || !isFinite(b.yMax)) { b.yMin = fallback.yMin; b.yMax = fallback.yMax; }
     if (!isFinite(b.zMin) || !isFinite(b.zMax)) { b.zMin = fallback.zMin; b.zMax = fallback.zMax; }
-    const pad = 0.02 * Math.max(b.xMax - b.xMin, b.yMax - b.yMin, b.zMax - b.zMin, 1);
-    return { xMin: b.xMin - pad, xMax: b.xMax + pad, yMin: b.yMin - pad, yMax: b.yMax + pad, zMin: b.zMin - pad, zMax: b.zMax + pad };
+    // Pad PER AXIS, not by 2% of the largest axis. A reactor pin is ~0.95 cm wide and
+    // ~365 cm tall: padding every axis by 2% of the height gave each pin an XY box
+    // ~7.3 cm larger on every side (16x the pin), so neighbouring boxes overlapped
+    // heavily, the BVH could not prune, and every ray ran leafExact on 100+ pins.
+    // Hit depths are exact (leafExact), so the box only has to contain the cell; the
+    // floor keeps flat/degenerate axes and float noise from producing a zero-width slab.
+    const floor = AABB_PAD_FLOOR_FRACTION * Math.max(
+      fallback.xMax - fallback.xMin, fallback.yMax - fallback.yMin, fallback.zMax - fallback.zMin, 1);
+    const padX = Math.max(0.02 * (b.xMax - b.xMin), floor);
+    const padY = Math.max(0.02 * (b.yMax - b.yMin), floor);
+    const padZ = Math.max(0.02 * (b.zMax - b.zMin), floor);
+    return { xMin: b.xMin - padX, xMax: b.xMax + padX, yMin: b.yMin - padY, yMax: b.yMax + padY, zMin: b.zMin - padZ, zMax: b.zMax + padZ };
   }
 
   function translateAABB(b: AxisBounds, dx: number, dy: number, dz: number): AxisBounds {
@@ -1344,10 +1358,29 @@
       truncatedSurfaces = truncatedProtos = truncatedInstances = truncatedTokens = truncatedBvh = false;
       render(); return;
     }
-    const surfacesUsed = csg.surfaces.slice(0, MAX_SURFACES);
-    truncatedSurfaces = csg.surfaces.length > MAX_SURFACES;
-    const surfIndex = new Map(surfacesUsed.map((s, i) => [s.id, i]));
-    const surfaceById = new Map(surfacesUsed.map((s) => [s.id, s]));
+    // Shader surface table. It used to be csg.surfaces.slice(0, MAX_SURFACES), i.e. the
+    // first 256 surfaces BY POSITION. A big lattice contributes ~4 surfaces per pin to
+    // csg.surfaces, so anything placed after it (a second lattice's prototype, later
+    // cells) landed past index 255, its tokens resolved to surface -1, and the cell
+    // silently vanished. Now only surfaces that a visible proto/fill region actually
+    // references are registered (registerRegion), so the table holds what the shader
+    // can use, and overflow is reported only when it genuinely drops something.
+    const surfaceById = new Map(csg.surfaces.map((s) => [s.id, s]));
+    const surfacesUsed: CsgSurface[] = [];
+    const surfIndex = new Map<string, number>();
+    let surfOverflow = false;
+    const registerRegion = (region: RegionNode, lookup: Map<string, CsgSurface>) => {
+      const ids: string[] = [];
+      surfaceIdsInRegion(region, ids);
+      for (const id of ids) {
+        if (surfIndex.has(id)) continue;
+        const s = lookup.get(id);
+        if (!s) continue;
+        if (surfacesUsed.length >= MAX_SURFACES) { surfOverflow = true; continue; }
+        surfIndex.set(id, surfacesUsed.length);
+        surfacesUsed.push(s);
+      }
+    };
     const sceneBounds = computeBounds(csg);
     // Pad root AABB slightly so grazing rays / tight plane bounds don't miss.
     {
@@ -1363,12 +1396,6 @@
         sceneBounds.xMax - sceneBounds.xMin, sceneBounds.yMax - sceneBounds.yMin,
         sceneBounds.zMax - sceneBounds.zMin, 1);
     }
-
-    const surfMeta = u.uSurfMeta.value as THREE.Vector4[];
-    const surfParams = u.uSurfParams.value as THREE.Vector4[];
-    surfacesUsed.forEach((s, i) => { const packed = packSurface(s); surfMeta[i].set(packed.type, packed.b, packed.c, 0); surfParams[i].copy(packed.v); });
-    for (let i = surfacesUsed.length; i < MAX_SURFACES; i++) { surfMeta[i].set(-1, 0, 0, 0); surfParams[i].set(0, 0, 0, 0); }
-    u.uSurfCount.value = surfacesUsed.length;
 
     interface ProtoEntry { region: RegionNode; material_id: string; aabb: AxisBounds; isFill?: boolean; name?: string; }
     const protos: ProtoEntry[] = [];
@@ -1388,6 +1415,7 @@
         for (const cell of protoCells) {
           if (protos.length >= MAX_PROTOTYPES) break;
           protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, protoSurfById, sceneBounds), isFill: false });
+          registerRegion(cell.region, protoSurfById);
         }
         const numLayers = protos.length - baseProtoIdx;
         // Phase D: inner_offsets non-empty → nested lattice
@@ -1438,6 +1466,7 @@
           isFill: true,
           name: cell.name ?? undefined,
         });
+        registerRegion(region, surfaceById);
         if (instances.length < MAX_INSTANCES) instances.push({ dx: 0, dy: 0, dz: 0, protoIdx });
       }
     } else {
@@ -1447,9 +1476,18 @@
         if (protos.length >= MAX_PROTOTYPES) break;
         const protoIdx = protos.length;
         protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, surfaceById, sceneBounds), isFill: false, name: cell.name ?? undefined });
+        registerRegion(cell.region, surfaceById);
         if (instances.length < MAX_INSTANCES) instances.push({ dx: 0, dy: 0, dz: 0, protoIdx });
       }
     }
+
+    // Pack the surface table now that every visible proto/fill has registered what it uses.
+    const surfMeta = u.uSurfMeta.value as THREE.Vector4[];
+    const surfParams = u.uSurfParams.value as THREE.Vector4[];
+    surfacesUsed.forEach((s, i) => { const packed = packSurface(s); surfMeta[i].set(packed.type, packed.b, packed.c, 0); surfParams[i].copy(packed.v); });
+    for (let i = surfacesUsed.length; i < MAX_SURFACES; i++) { surfMeta[i].set(-1, 0, 0, 0); surfParams[i].set(0, 0, 0, 0); }
+    u.uSurfCount.value = surfacesUsed.length;
+    truncatedSurfaces = surfOverflow;
 
     // Snapshot every named proto's AABB + resolved color for the wall-debug
     // logger (see debugWalls below). Instance offsets are folded in so this

@@ -6,6 +6,13 @@ template (FuelPin) or the legacy Box (position-free, wrapped in a
 SinglePlacement), a primitive carries its own x/y/z directly — matching how
 a real OpenMC Surface works.
 
+EXCEPTION: CylinderZ is shape-only (radius, optional height). Its position
+and rotation come from the SinglePlacement that places it; see
+schema/cylinder.py. With `height` it expands to THREE surfaces (two caps and
+the cylinder) and a finite region. The cylinder surface is always LAST in the
+returned list, because expander._expand_primitives registers the last surface
+as the name a Tier-2 Cell refers to.
+
 This module owns:
     - the PrimitiveExpander protocol every primitive schema implements
       (plan §3.1)
@@ -30,7 +37,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from ..domain.geometry import Inside, Region, Surface, SurfaceType
+from ..domain.geometry import Inside, Intersection, Outside, Region, Surface, SurfaceType
 from .schema.base import BaseComponentSchema
 from .schema.cone import ConeZSchema
 from .schema.cylinder import CylinderXSchema, CylinderYSchema, CylinderZSchema
@@ -172,13 +179,30 @@ class _CylinderYExpander:
 
 
 class _CylinderZExpander:
+    """Shape-only: built on the z axis at x0 = y0 = 0; the placement moves it."""
+
     def expand_primitive(self, ctx: ExpansionContext, schema: CylinderZSchema, name: str):
         s = Surface(
             id=ctx.fresh_id("s"), type_=SurfaceType.CYLINDER_Z,
-            params={"x0": schema.x, "y0": schema.y, "r": schema.radius},
+            params={"x0": 0.0, "y0": 0.0, "r": schema.radius},
             boundary_type=schema.boundary_type,
         )
-        return [s], Inside(s.id)
+        if schema.height is None:
+            return [s], Inside(s.id)          # bare infinite cylinder
+        # Finite solid standing on z = 0 (Box/FuelPin convention). Plane_z
+        # Inside = below the plane, so the body is Outside(bottom) AND
+        # Inside(top) AND Inside(cylinder). The caps carry the same boundary
+        # condition so a vacuum/reflective cylinder is sealed at both ends.
+        bottom = Surface(
+            id=ctx.fresh_id("s"), type_=SurfaceType.PLANE_Z,
+            params={"z0": 0.0}, boundary_type=schema.boundary_type,
+        )
+        top = Surface(
+            id=ctx.fresh_id("s"), type_=SurfaceType.PLANE_Z,
+            params={"z0": schema.height}, boundary_type=schema.boundary_type,
+        )
+        region = Intersection([Outside(bottom.id), Inside(top.id), Inside(s.id)])
+        return [bottom, top, s], region      # cylinder LAST (see module docstring)
 
 
 class _ConeZExpander:

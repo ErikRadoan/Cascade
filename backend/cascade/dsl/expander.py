@@ -58,6 +58,7 @@ from ..domain.bounds import Bounds, BoundsIndex, region_bounds
 from .schema.boolean import BooleanPlacementSchema
 from .schema.box import BoxSchema
 from .schema.cell import CellSchema
+from .schema.cylinder import CylinderZSchema
 from .schema.fuel_pin import FuelPinSchema
 from .schema.lattice import HexLatticeSchema, SquareLatticeSchema
 from .schema.single_placement import SinglePlacementSchema
@@ -290,7 +291,12 @@ _UNBOUNDED_ROTATION_MSG = (
     "there's no finite bounding volume to confine the rotated local "
     "universe within. Combine it with bounding surfaces in a boolean "
     "composite (so the composite as a whole is finite), or place it "
-    "without rotation."
+    "without rotation.{hint}"
+)
+
+_CYLINDER_HEIGHT_HINT = (
+    " For a CylinderZ the simplest fix is to set `height` on the template, "
+    "which makes it a finite solid that can be rotated."
 )
 
 
@@ -328,11 +334,19 @@ def _local_bounding_radius(
     if isinstance(schema, SphereSchema):
         return schema.radius
 
+    if isinstance(schema, CylinderZSchema) and schema.height is not None:
+        # Local origin is the centre of the BASE (stands on z = 0), so the
+        # farthest point is the rim of the top cap.
+        return math.hypot(schema.radius, schema.height)
+
     if isinstance(schema, TorusSchema):
         tube_height = schema.tube_height if schema.tube_height is not None else schema.tube_radius
         return schema.ring_radius + max(schema.tube_radius, tube_height)
 
-    raise ValueError(_UNBOUNDED_ROTATION_MSG.format(name=name, type_name=type(schema).__name__))
+    hint = _CYLINDER_HEIGHT_HINT if isinstance(schema, CylinderZSchema) else ""
+    raise ValueError(_UNBOUNDED_ROTATION_MSG.format(
+        name=name, type_name=type(schema).__name__, hint=hint,
+    ))
 
 
 def _fill_instance(
@@ -1691,7 +1705,10 @@ def _expand_primitives(index: _SchemaIndex, ctx: Context) -> list[Surface]:
     surfaces: list[Surface] = []
     for name, schema in index.primitives.items():
         primitive_surfaces, _region = primitives.expand_primitive(ctx, schema, name)
-        surfaces.extend(primitive_surfaces)
+        # A Tier-2 Cell names the PRIMARY surface, which expand_primitive puts
+        # last. Anything before it (a finite CylinderZ's end caps) only exists
+        # for placements, so keep it out of the global surface list.
+        surfaces.append(primitive_surfaces[-1])
         ctx.primitive_ids[name] = primitive_surfaces[-1].id
     return surfaces
 
