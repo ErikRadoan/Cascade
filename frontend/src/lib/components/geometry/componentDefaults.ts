@@ -34,11 +34,14 @@ export const TEMPLATE_DEFAULTS: Record<string, Record<string, unknown>> = {
     boundary_type: 'none',
     material: 'H2O',
   },
+  // CylinderZ is SHAPE ONLY (radius, height): where it sits and how it is rotated
+  // belong to the SinglePlacement (Parameters panel). `height` makes it a finite
+  // solid standing on z = 0, which is what allows rotation; remove it only for a
+  // bare infinite cylinder (see docs/Decisions/005).
   CylinderZ: {
     type: 'CylinderZ',
     radius: 0.5,
-    x: 0.0,
-    y: 0.0,
+    height: 1.0,
     boundary_type: 'none',
     material: 'H2O',
   },

@@ -1,0 +1,8 @@
+<!-- Compound: starts backend + frontend together. Names/types must match the two configs above. -->
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Cascade Full Stack" type="CompoundRunConfigurationType">
+    <toRun name="Cascade Backend" type="PythonConfigurationType" />
+    <toRun name="Cascade Frontend" type="js.build_tools.npm" />
+    <method v="2" />
+  </configuration>
+</component>

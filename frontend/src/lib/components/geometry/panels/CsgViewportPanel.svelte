@@ -3,12 +3,23 @@
   // Phase D: nested lattices (inner_offsets) + lattice-aware fill (plane-only).
   // Phase C: lattice instancing. Phase B: analytic ray intervals for primary hit.
   // Phase A: BVH, root AABB, tetrahedron normals, adaptive DPR, perf logs.
+  //
+  // SURFACE TYPES the shader understands (keep packSurface(), accumulateSurfaceBounds(),
+  // and the GLSL surfaceSDF/surfaceInterval/surfaceCrossings in sync when adding one):
+  //   0-2 plane_x/y/z   3-5 cylinder_x/y/z   6 sphere
+  //   7 cone_z   (double-napped, Inside = both nappes; params x0,y0,z0,r2 = slope^2)
+  //   8 torus    (z-axis; params x0,y0,z0,a,b,c; Inside = ((rho-a)/b)^2 + ((z-z0)/c)^2 < 1)
+  // Per-surface data is packed into TWO uniform arrays: uSurfParams (vec4) and
+  // uSurfMeta (vec4: x = type id, y/z = extra scalars; torus b and c). The type used to be
+  // its own `int uSurfType[]`, which cost one uniform row per surface; folding it into
+  // uSurfMeta keeps the total uniform-vector budget unchanged (WebGL guarantees only
+  // MAX_FRAGMENT_UNIFORM_VECTORS >= 221, desktop GPUs expose ~1024, and we are close).
 
   import { onMount, onDestroy, untrack } from 'svelte';
   import * as THREE from 'three';
   import { activeProject } from '../stores/projects.svelte.js';
   import { csgState, requestCsgRefresh } from '../stores/csg.svelte.js';
-  // Same store ObjectPanel writes — keys are `${projectId}:${placementName}`
+  // Same store ObjectPanel writes — keyns are `${projectId}:${placementName}`
   // inside isVisible/toggleVisibility. Must match ObjectPanel's import path.
   import { isVisible, visibility } from '../stores/visibility.svelte.js';
   import { baseGroupName } from '../csgCellGrouping';
@@ -138,17 +149,35 @@
     return fallback;
   }
 
-  function packSurface(s: CsgSurface): { type: number; v: THREE.Vector4 } {
+  /** Packed surface: `type` id + `v` (uSurfParams) + `b`/`c` extras (uSurfMeta.yz). */
+  interface PackedSurface { type: number; v: THREE.Vector4; b: number; c: number; }
+
+  function packSurface(s: CsgSurface): PackedSurface {
     const p = s.params;
+    const mk = (type: number, v: THREE.Vector4, b = 0, c = 0): PackedSurface => ({ type, v, b, c });
+    // cone_z (type 7): v = (x0, y0, z0, r2). r2 is already the SQUARED slope (the backend
+    // squares radius_slope exactly once in primitives.py), so it is passed through as-is;
+    // the shader takes sqrt only where it needs the un-squared slope (surfaceSDF).
+    if (s.type === 'cone_z') {
+      return mk(7, new THREE.Vector4(num(p, 'x0', 'x'), num(p, 'y0', 'y'), num(p, 'z0', 'z'), Math.max(num(p, 'r2', 'r2', 1), 0)));
+    }
+    // torus (type 8): v = (x0, y0, z0, a), extras b (radial tube semi-axis) and c (axial
+    // tube semi-axis). The backend always emits c (defaults it to b for a circular tube).
+    // b/c are clamped away from 0 because the shader divides by them.
+    if (s.type === 'torus') {
+      const b = Math.max(Math.abs(num(p, 'b', 'b', 0.5)), 1e-6);
+      const c = Math.max(Math.abs(num(p, 'c', 'c', b)), 1e-6);
+      return mk(8, new THREE.Vector4(num(p, 'x0', 'x'), num(p, 'y0', 'y'), num(p, 'z0', 'z'), Math.abs(num(p, 'a', 'a', 1))), b, c);
+    }
     switch (s.type) {
-      case 'plane_x': return { type: 0, v: new THREE.Vector4(num(p, 'x0', 'x'), 0, 0, 0) };
-      case 'plane_y': return { type: 1, v: new THREE.Vector4(0, num(p, 'y0', 'y'), 0, 0) };
-      case 'plane_z': return { type: 2, v: new THREE.Vector4(0, 0, num(p, 'z0', 'z'), 0) };
-      case 'cylinder_x': return { type: 3, v: new THREE.Vector4(0, num(p, 'y0', 'y'), num(p, 'z0', 'z'), num(p, 'r', 'r', 1)) };
-      case 'cylinder_y': return { type: 4, v: new THREE.Vector4(num(p, 'x0', 'x'), 0, num(p, 'z0', 'z'), num(p, 'r', 'r', 1)) };
-      case 'cylinder_z': return { type: 5, v: new THREE.Vector4(num(p, 'x0', 'x'), num(p, 'y0', 'y'), 0, num(p, 'r', 'r', 1)) };
-      case 'sphere': return { type: 6, v: new THREE.Vector4(num(p, 'x0', 'x'), num(p, 'y0', 'y'), num(p, 'z0', 'z'), num(p, 'r', 'r', 1)) };
-      default: return { type: -1, v: new THREE.Vector4(0, 0, 0, 0) };
+      case 'plane_x': return mk(0, new THREE.Vector4(num(p, 'x0', 'x'), 0, 0, 0));
+      case 'plane_y': return mk(1, new THREE.Vector4(0, num(p, 'y0', 'y'), 0, 0));
+      case 'plane_z': return mk(2, new THREE.Vector4(0, 0, num(p, 'z0', 'z'), 0));
+      case 'cylinder_x': return mk(3, new THREE.Vector4(0, num(p, 'y0', 'y'), num(p, 'z0', 'z'), num(p, 'r', 'r', 1)));
+      case 'cylinder_y': return mk(4, new THREE.Vector4(num(p, 'x0', 'x'), 0, num(p, 'z0', 'z'), num(p, 'r', 'r', 1)));
+      case 'cylinder_z': return mk(5, new THREE.Vector4(num(p, 'x0', 'x'), num(p, 'y0', 'y'), 0, num(p, 'r', 'r', 1)));
+      case 'sphere': return mk(6, new THREE.Vector4(num(p, 'x0', 'x'), num(p, 'y0', 'y'), num(p, 'z0', 'z'), num(p, 'r', 'r', 1)));
+      default: return mk(-1, new THREE.Vector4(0, 0, 0, 0));
     }
   }
 
@@ -228,12 +257,49 @@
       const x0 = num(p, 'x0', 'x'), y0 = num(p, 'y0', 'y'), z0 = num(p, 'z0', 'z'), r = num(p, 'r', 'r', 1);
       return { ...b, xMin: Math.min(b.xMin, x0 - r), xMax: Math.max(b.xMax, x0 + r), yMin: Math.min(b.yMin, y0 - r), yMax: Math.max(b.yMax, y0 + r), zMin: Math.min(b.zMin, z0 - r), zMax: Math.max(b.zMax, z0 + r) };
     }
+    // z-torus: finite in all three axes. Radial reach is ring radius + radial tube
+    // semi-axis (a + b); axial reach is the axial semi-axis c. (Mirrors
+    // backend/cascade/domain/bounds.py so viewport AABBs agree with the backend.)
+    if (s.type === 'torus') {
+      const x0 = num(p, 'x0', 'x'), y0 = num(p, 'y0', 'y'), z0 = num(p, 'z0', 'z');
+      const a = Math.abs(num(p, 'a', 'a', 1)), tb = Math.abs(num(p, 'b', 'b', 0.5));
+      const tc = Math.abs(num(p, 'c', 'c', tb));
+      const reach = a + tb;
+      return { xMin: Math.min(b.xMin, x0 - reach), xMax: Math.max(b.xMax, x0 + reach), yMin: Math.min(b.yMin, y0 - reach), yMax: Math.max(b.yMax, y0 + reach), zMin: Math.min(b.zMin, z0 - tc), zMax: Math.max(b.zMax, z0 + tc) };
+    }
+    // cone_z is unbounded on its own (both nappes run to +/-infinity along z), so it adds
+    // nothing here; applyConeBounds() clips its xy extent to whatever z range the
+    // OTHER surfaces in the same set establish.
     return b;
+  }
+
+  /**
+   * Give cone_z surfaces a finite xy extent once the z range is known.
+   *
+   * A cone cell is only finite when something else (usually two plane_z) caps it.
+   * Without this its AABB would fall back to the whole-scene xy bounds, which is
+   * wasteful at best and, for a scene made of just a capped cone, falls to the +/-5 default
+   * and clips the cone. The cone radius grows linearly from the apex, so the widest
+   * point inside [zMin, zMax] is at whichever z end is farther from the apex.
+   * No-op while z is still unbounded (nothing to clip against).
+   */
+  function applyConeBounds(b: AxisBounds, cones: CsgSurface[]): AxisBounds {
+    if (!isFinite(b.zMin) || !isFinite(b.zMax)) return b;
+    let out = b;
+    for (const s of cones) {
+      const p = s.params;
+      const x0 = num(p, 'x0', 'x'), y0 = num(p, 'y0', 'y'), z0 = num(p, 'z0', 'z');
+      const slope = Math.sqrt(Math.max(num(p, 'r2', 'r2', 1), 0));
+      const R = slope * Math.max(Math.abs(out.zMin - z0), Math.abs(out.zMax - z0));
+      out = { ...out, xMin: Math.min(out.xMin, x0 - R), xMax: Math.max(out.xMax, x0 + R), yMin: Math.min(out.yMin, y0 - R), yMax: Math.max(out.yMax, y0 + R) };
+    }
+    return out;
   }
 
   function computeBounds(csg: CsgGeometry): AxisBounds {
     let b: AxisBounds = { xMin: Infinity, xMax: -Infinity, yMin: Infinity, yMax: -Infinity, zMin: Infinity, zMax: -Infinity };
     for (const s of csg.surfaces) b = accumulateSurfaceBounds(b, s);
+    b = applyConeBounds(b, csg.surfaces.filter((s) => s.type === 'cone_z'));
     // Per-axis fallback — a missing plane_y must not leave yMin/yMax at ±Infinity
     // (that breaks cameraDistance and the shader root AABB).
     if (!isFinite(b.xMin) || !isFinite(b.xMax)) { b.xMin = -5; b.xMax = 5; }
@@ -250,7 +316,14 @@
     const names: string[] = [];
     surfaceIdsInRegion(region, names);
     let b: AxisBounds = { xMin: Infinity, xMax: -Infinity, yMin: Infinity, yMax: -Infinity, zMin: Infinity, zMax: -Infinity };
-    for (const n of names) { const s = surfaceById.get(n); if (s) b = accumulateSurfaceBounds(b, s); }
+    const cones: CsgSurface[] = [];
+    for (const n of names) {
+      const s = surfaceById.get(n);
+      if (!s) continue;
+      b = accumulateSurfaceBounds(b, s);
+      if (s.type === 'cone_z') cones.push(s);
+    }
+    b = applyConeBounds(b, cones);
     if (!isFinite(b.xMin) || !isFinite(b.xMax)) { b.xMin = fallback.xMin; b.xMax = fallback.xMax; }
     if (!isFinite(b.yMin) || !isFinite(b.yMax)) { b.yMin = fallback.yMin; b.yMax = fallback.yMax; }
     if (!isFinite(b.zMin) || !isFinite(b.zMax)) { b.zMin = fallback.zMin; b.zMax = fallback.zMax; }
@@ -411,7 +484,9 @@
     uniform vec3 uCamPos, uCamForward, uCamRight, uCamUp;
     uniform float uTanHalfFov, uAspect;
     uniform int uSurfCount;
-    uniform int uSurfType[MAX_SURFACES];
+    // Per-surface data. uSurfMeta.x = surface type id (see header of this file; -1 = unused),
+    // uSurfMeta.yz = extra scalars (torus b, c). uSurfParams = main vec4 (center / radius).
+    uniform vec4 uSurfMeta[MAX_SURFACES];
     uniform vec4 uSurfParams[MAX_SURFACES];
     uniform int uProtoCount;
     uniform vec3 uProtoColor[MAX_PROTOTYPES];
@@ -426,9 +501,149 @@
     uniform float uMarkOverlaps;  // >0.5 tints pixels where two solid cells genuinely overlap
     varying vec2 vUv;
 
+    float boxSDF(vec3 p, vec3 bmin, vec3 bmax) {
+      vec3 c = (bmin + bmax) * 0.5; vec3 h = (bmax - bmin) * 0.5;
+      vec3 q = abs(p - c) - h;
+      return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+    }
+    // Ray vs AABB slab → (tEnter, tExit); empty if miss.
+    // Guard against rd components near 0 (1/rd → Inf/NaN on some GPUs).
+    vec2 boxInterval(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {
+      vec3 rdd = rd;
+      if (abs(rdd.x) < 1e-8) rdd.x = (rdd.x >= 0.0) ? 1e-8 : -1e-8;
+      if (abs(rdd.y) < 1e-8) rdd.y = (rdd.y >= 0.0) ? 1e-8 : -1e-8;
+      if (abs(rdd.z) < 1e-8) rdd.z = (rdd.z >= 0.0) ? 1e-8 : -1e-8;
+      vec3 inv = 1.0 / rdd;
+      vec3 t0 = (bmin - ro) * inv;
+      vec3 t1 = (bmax - ro) * inv;
+      vec3 tsm = min(t0, t1);
+      vec3 tlg = max(t0, t1);
+      float tEnter = max(max(tsm.x, tsm.y), tsm.z);
+      float tExit = min(min(tlg.x, tlg.y), tlg.z);
+      if (tEnter > tExit) return vec2(INF, NEG_INF);
+      return vec2(tEnter, tExit);
+    }
+
+    // Surface type id of slot idx. floor(x + 0.5) rather than int(x + 0.5): int() truncates
+    // toward zero, which would turn the "unused" id -1 into 0 (plane_x).
+    int surfTypeOf(int idx) { return int(floor(uSurfMeta[idx].x + 0.5)); }
+
+    // ---- Torus (type 8) helpers -------------------------------------------------
+    // Field: f = (|(q_r, q_z)| - 1) * min(b, c), q_r = (rho - a)/b, q_z = dz/c.
+    // f <= 0 is inside. It is exactly the Euclidean distance for a circular tube
+    // (b == c) and a 1-Lipschitz LOWER BOUND on distance for an elliptical one, so
+    // |f| is always a safe sphere-tracing step in both cases.
+    float torusF(vec3 p, vec4 pr, vec2 bc) {
+      vec3 d = p - pr.xyz;
+      vec2 q = vec2((length(d.xy) - pr.w) / bc.x, d.z / bc.y);
+      return (length(q) - 1.0) * min(bc.x, bc.y);
+    }
+
+    #define TORUS_MARCH_STEPS 72
+    // The march always covers the window in at most TORUS_MIN_STRIDES strides (see below).
+    #define TORUS_MIN_STRIDES 64.0
+    #define TORUS_BISECT_STEPS 20
+    // Up to four ray/torus crossings (ascending t) inside the window [tA, tB]; unused
+    // slots hold INF. A ray can cross a torus 4 times (through both tube walls twice), so
+    // returning only 2 would lose the far wall when a cell clips the near one away.
+    //
+    // WHY NOT A QUARTIC SOLVE: the closed form is badly conditioned in float32 at
+    // reactor scale (a ~ 600 cm, b ~ 100 cm gives coefficients ~1e12 with catastrophic
+    // cancellation). Instead we march with the distance bound: stepping |f| + delta
+    // can never jump OVER a crossing (|f| bounds the distance to the surface) and the
+    // +delta overshoot guarantees we step THROUGH it so the sign change is detected;
+    // each bracket is then bisected. delta is half the scene's depth tolerance, so
+    // features thinner than that are below rendering resolution anyway.
+    //
+    // GRAZING RAYS: |f| shrinks geometrically for a ray skimming a surface (each step
+    // is only ~|f|*cos(angle) of real progress), so a pure distance-bound march burns its
+    // whole step budget before reaching the far wall and silently loses the LAST
+    // crossing (measured on a CPU port: ~10% of random rays lost an exit crossing).
+    // Fix: every step is at least window/TORUS_MIN_STRIDES long, so the march ALWAYS
+    // covers the window within TORUS_MARCH_STEPS iterations. Trade-off: where that
+    // minimum stride is the one used, a tube chord shorter than a stride can be skipped,
+    // but that only erodes the silhouette by ~stride^2/(8 r) (about 0.4% of the tube
+    // radius at 64 strides), well under a pixel.
+    vec4 torusCrossings(vec3 ro, vec3 rd, vec4 pr, vec2 bc, float tA, float tB) {
+      vec4 res = vec4(INF);
+      // Clip to the torus bounding box first: outside it nothing can be crossed.
+      float reach = abs(pr.w) + bc.x;
+      vec2 span = boxInterval(ro, rd, pr.xyz - vec3(reach, reach, bc.y), pr.xyz + vec3(reach, reach, bc.y));
+      // Pad the window by one depth tolerance on each side. A ray that touches the torus
+      // exactly where it enters the bounding box (the tube's extreme circle) would
+      // otherwise START the march "inside" by float noise and never register that entry.
+      float t = max(tA, span.x - uEpsMin);
+      float tEnd = min(tB, span.y + uEpsMin);
+      if (span.x > span.y || t >= tEnd) return res;
+      float delta = 0.5 * uEpsMin;
+      float minStep = (tEnd - t) / TORUS_MIN_STRIDES;
+      int n = 0;
+      float fPrev = torusF(ro + rd * t, pr, bc);
+      for (int i = 0; i < TORUS_MARCH_STEPS; i++) {
+        if (t >= tEnd || n >= 4) break;
+        float tNext = min(t + max(abs(fPrev) + delta, minStep), tEnd);
+        float fNext = torusF(ro + rd * tNext, pr, bc);
+        if ((fPrev <= 0.0) != (fNext <= 0.0)) {
+          float lo = t, hi = tNext;
+          bool loIn = fPrev <= 0.0;
+          for (int j = 0; j < TORUS_BISECT_STEPS; j++) {
+            float mid = 0.5 * (lo + hi);
+            if ((torusF(ro + rd * mid, pr, bc) <= 0.0) == loIn) lo = mid; else hi = mid;
+          }
+          float tc = 0.5 * (lo + hi);
+          // vec4 components cannot be indexed by a loop-varying int in GLSL ES 1.00.
+          if (n == 0) res.x = tc; else if (n == 1) res.y = tc; else if (n == 2) res.z = tc; else res.w = tc;
+          n++;
+        }
+        t = tNext; fPrev = fNext;
+      }
+      return res;
+    }
+
+    // ---- Quadratic helpers (cone_z, type 7) ---------------------------------------
+    // In the cone's local frame the surface is q(t) = a t^2 + b t + c = 0 with
+    //   a = dx^2 + dy^2 - r2 dz^2 (ray direction), b = 2 (ox dx + oy dy - r2 oz dz), c = same in o.
+    // Inside <=> q <= 0. a > 0: inside is the span between the roots (ray flatter than the
+    // cone wall). a < 0: inside is OUTSIDE the roots, i.e. two half-lines, which one
+    // interval cannot hold.
+    vec3 coneQuad(vec3 ro, vec3 rd, vec4 pr, out float a) {
+      vec3 o = ro - pr.xyz;
+      a = rd.x * rd.x + rd.y * rd.y - pr.w * rd.z * rd.z;
+      float b = 2.0 * (o.x * rd.x + o.y * rd.y - pr.w * o.z * rd.z);
+      float c = o.x * o.x + o.y * o.y - pr.w * o.z * o.z;
+      return vec3(a, b, c);
+    }
+    // Hull interval of {t : a t^2 + b t + c <= 0}. For a < 0 with real roots the true set
+    // is two half-lines, whose hull is the whole line; that is only a SEED (see
+    // evalIntervalEntry), and the exact crossings below are what leafExact relies on.
+    vec2 quadInsideHull(float a, float b, float c) {
+      if (abs(a) < 1e-9) {
+        if (abs(b) < 1e-12) return c <= 0.0 ? vec2(NEG_INF, INF) : vec2(INF, NEG_INF);
+        float tl = -c / b;
+        return b > 0.0 ? vec2(NEG_INF, tl) : vec2(tl, INF);
+      }
+      float disc = b * b - 4.0 * a * c;
+      if (disc < 0.0) return a < 0.0 ? vec2(NEG_INF, INF) : vec2(INF, NEG_INF);
+      float sq = sqrt(disc);
+      float r0 = (-b - sq) / (2.0 * a), r1 = (-b + sq) / (2.0 * a);
+      return a > 0.0 ? vec2(min(r0, r1), max(r0, r1)) : vec2(NEG_INF, INF);
+    }
+    // The (up to two) real roots of the quadratic, ascending; INF when absent.
+    vec4 quadCrossings(float a, float b, float c) {
+      if (abs(a) < 1e-9) {
+        if (abs(b) < 1e-12) return vec4(INF);
+        return vec4(-c / b, INF, INF, INF);
+      }
+      float disc = b * b - 4.0 * a * c;
+      if (disc < 0.0) return vec4(INF);
+      float sq = sqrt(disc);
+      float r0 = (-b - sq) / (2.0 * a), r1 = (-b + sq) / (2.0 * a);
+      return vec4(min(r0, r1), max(r0, r1), INF, INF);
+    }
+
     float surfaceSDF(int idx, vec3 p) {
       if (idx < 0) return INF;
-      int t = uSurfType[idx]; vec4 pr = uSurfParams[idx];
+      int t = surfTypeOf(idx); vec4 pr = uSurfParams[idx];
       if (t == 0) return p.x - pr.x;
       if (t == 1) return p.y - pr.y;
       if (t == 2) return p.z - pr.z;
@@ -436,13 +651,24 @@
       if (t == 4) return length(vec2(p.x - pr.x, p.z - pr.z)) - pr.w;
       if (t == 5) return length(vec2(p.x - pr.x, p.y - pr.y)) - pr.w;
       if (t == 6) return length(p - pr.xyz) - pr.w;
+      if (t == 7) {
+        // Double-napped cone: inside <=> rho <= k |dz| with k = sqrt(r2). The field
+        // (rho - k|dz|) / sqrt(1 + k^2) is the distance to the nearer nappe's generatrix
+        // LINE, which never exceeds the true distance to the cone (the nappe is only a
+        // ray of that line, and the other nappe is farther), so it is a safe lower bound
+        // for sphere tracing. Its gradient at the surface is the surface normal, which is
+        // all calcNormal needs. Not smooth at the apex (|dz|); harmless.
+        vec3 d = p - pr.xyz;
+        return (length(d.xy) - sqrt(pr.w) * abs(d.z)) * inversesqrt(1.0 + pr.w);
+      }
+      if (t == 8) return torusF(p, pr, uSurfMeta[idx].yz);
       return INF;
     }
 
     // Analytic ray ∩ inside-of-surface → (tEnter, tExit). Empty if miss.
     vec2 surfaceInterval(int idx, vec3 ro, vec3 rd) {
       if (idx < 0) return vec2(INF, NEG_INF);
-      int t = uSurfType[idx]; vec4 pr = uSurfParams[idx];
+      int t = surfTypeOf(idx); vec4 pr = uSurfParams[idx];
       // Planes: half-space surfaceSDF <= 0 is "inside"
       if (t == 0) {
         float denom = rd.x;
@@ -468,6 +694,25 @@
         float th = (pr.z - ro.z) / denom;
         return denom > 0.0 ? vec2(NEG_INF, th) : vec2(th, INF);
       }
+      // cone_z: a single interval cannot represent a double-napped cone in general (see
+      // quadInsideHull), so this returns a conservative HULL. Exact crossings come from
+      // surfaceCrossings(), which is what leafExact() uses.
+      if (t == 7) {
+        float qa; vec3 q = coneQuad(ro, rd, pr, qa);
+        return quadInsideHull(q.x, q.y, q.z);
+      }
+      // torus: the inside is up to two intervals along a ray (two tube walls); return the
+      // hull (first entry .. last exit) found by the crossing march. A hull only ever
+      // starts EARLY, which is the safe direction for the entry seed.
+      if (t == 8) {
+        vec4 cr = torusCrossings(ro, rd, pr, uSurfMeta[idx].yz, NEG_INF, INF);
+        if (cr.x >= INF * 0.5) return vec2(INF, NEG_INF);
+        float last = cr.x;
+        if (cr.y < INF * 0.5) last = cr.y;
+        if (cr.z < INF * 0.5) last = cr.z;
+        if (cr.w < INF * 0.5) last = cr.w;
+        return vec2(cr.x, last);
+      }
       // Infinite cylinders + sphere: quadratic in the perpendicular plane / 3D
       vec3 o, d; float r;
       if (t == 3) { o = vec3(0.0, ro.y - pr.y, ro.z - pr.z); d = vec3(0.0, rd.y, rd.z); r = pr.w; }
@@ -489,6 +734,20 @@
       return vec2(min(t0, t1), max(t0, t1));
     }
 
+    // Every point where the ray crosses surface idx's boundary inside the window [tA, tB],
+    // ascending, INF in unused slots. This is what leafExact() consumes. It is NOT the
+    // same thing as surfaceInterval(): an interval answers "where is the ray inside", and
+    // for the double-napped cone and the torus that is not a single span, whereas the
+    // crossings are always exactly the boundary points the entering-test needs.
+    vec4 surfaceCrossings(int idx, vec3 ro, vec3 rd, float tA, float tB) {
+      if (idx < 0) return vec4(INF);
+      int t = surfTypeOf(idx); vec4 pr = uSurfParams[idx];
+      if (t == 7) { float qa; vec3 q = coneQuad(ro, rd, pr, qa); return quadCrossings(q.x, q.y, q.z); }
+      if (t == 8) return torusCrossings(ro, rd, pr, uSurfMeta[idx].yz, tA, tB);
+      vec2 iv = surfaceInterval(idx, ro, rd);   // planes / cylinders / sphere: <= 2 crossings
+      return vec4(iv.x, iv.y, INF, INF);
+    }
+
     vec2 fetchToken(int protoIdx, int pairIdx) {
       return texture2D(uTokenTex, vec2((float(pairIdx)+0.5)/TOK_TEX_W, (float(protoIdx)+0.5)/TOK_TEX_H)).rg;
     }
@@ -498,29 +757,6 @@
     vec4 fetchBvhTexel(int nodeIdx, int col) {
       return texture2D(uBvhTex, vec2((float(col)+0.5)/3.0, (float(nodeIdx)+0.5)/BVH_TEX_H));
     }
-    float boxSDF(vec3 p, vec3 bmin, vec3 bmax) {
-      vec3 c = (bmin + bmax) * 0.5; vec3 h = (bmax - bmin) * 0.5;
-      vec3 q = abs(p - c) - h;
-      return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
-    }
-    // Ray vs AABB slab → (tEnter, tExit); empty if miss.
-    // Guard against rd components near 0 (1/rd → Inf/NaN on some GPUs).
-    vec2 boxInterval(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax) {
-      vec3 rdd = rd;
-      if (abs(rdd.x) < 1e-8) rdd.x = (rdd.x >= 0.0) ? 1e-8 : -1e-8;
-      if (abs(rdd.y) < 1e-8) rdd.y = (rdd.y >= 0.0) ? 1e-8 : -1e-8;
-      if (abs(rdd.z) < 1e-8) rdd.z = (rdd.z >= 0.0) ? 1e-8 : -1e-8;
-      vec3 inv = 1.0 / rdd;
-      vec3 t0 = (bmin - ro) * inv;
-      vec3 t1 = (bmax - ro) * inv;
-      vec3 tsm = min(t0, t1);
-      vec3 tlg = max(t0, t1);
-      float tEnter = max(max(tsm.x, tsm.y), tsm.z);
-      float tExit = min(min(tlg.x, tlg.y), tlg.z);
-      if (tEnter > tExit) return vec2(INF, NEG_INF);
-      return vec2(tEnter, tExit);
-    }
-
     float evalRegion(int protoIdx, vec3 pLocal) {
       int tokenCount = uProtoTokenCount[protoIdx];
       // Deep AND-chains (fill cell vs many pins) need more than 16 slots.
@@ -552,7 +788,7 @@
         else if (op == 1) {
           // Outside = complement of inside interval, clipped to ray domain
           vec2 inn = surfaceInterval(operand, ro, rd);
-          int st = uSurfType[operand];
+          int st = surfTypeOf(operand);
           if (st == 0 || st == 1 || st == 2) {
             // Planes: surfaceInterval always returns an exact unbounded
             // half-line, either (-INF, th) or (th, INF), depending on the
@@ -710,9 +946,11 @@
         if (op > 1) continue;                    // only Inside/Outside tokens name a surface
         int sIdx = int(tok.y + 0.5);
         if (sIdx < 0) continue;
-        vec2 iv = surfaceInterval(sIdx, roL, rd);  // (INF, NEG_INF) = no crossing; +/-INF = open end
-        for (int k = 0; k < 2; k++) {
-          float tc = (k == 0) ? iv.x : iv.y;
+        // Up to 4 crossings (a torus can have 4; everything else <= 2). Unused slots and
+        // open-ended half-lines are +/-INF and are skipped just below.
+        vec4 cr = surfaceCrossings(sIdx, roL, rd, tStart, min(tEnd, best));
+        for (int k = 0; k < 4; k++) {
+          float tc = (k == 0) ? cr.x : (k == 1) ? cr.y : (k == 2) ? cr.z : cr.w;
           if (abs(tc) >= INF * 0.5 || tc < tStart || tc >= min(tEnd, best)) continue;
           // Entering test: outside just before the crossing, inside just after.
           // Rejects crossings of internal faces that are not part of the cell boundary.
@@ -913,7 +1151,8 @@
       uTanHalfFov: { value: Math.tan(THREE.MathUtils.degToRad(25)) },
       uAspect: { value: 1 },
       uSurfCount: { value: 0 },
-      uSurfType: { value: new Array(MAX_SURFACES).fill(-1) },
+      // x = type id (-1 unused), y/z = extra scalars (torus b, c). See file header.
+      uSurfMeta: { value: Array.from({ length: MAX_SURFACES }, () => new THREE.Vector4(-1, 0, 0, 0)) },
       uSurfParams: { value: Array.from({ length: MAX_SURFACES }, () => new THREE.Vector4()) },
       uProtoCount: { value: 0 },
       uProtoColor: { value: Array.from({ length: MAX_PROTOTYPES }, () => new THREE.Color(0, 0, 0)) },
@@ -1125,10 +1364,10 @@
         sceneBounds.zMax - sceneBounds.zMin, 1);
     }
 
-    const surfType = u.uSurfType.value as number[];
+    const surfMeta = u.uSurfMeta.value as THREE.Vector4[];
     const surfParams = u.uSurfParams.value as THREE.Vector4[];
-    surfacesUsed.forEach((s, i) => { const packed = packSurface(s); surfType[i] = packed.type; surfParams[i].copy(packed.v); });
-    for (let i = surfacesUsed.length; i < MAX_SURFACES; i++) { surfType[i] = -1; surfParams[i].set(0, 0, 0, 0); }
+    surfacesUsed.forEach((s, i) => { const packed = packSurface(s); surfMeta[i].set(packed.type, packed.b, packed.c, 0); surfParams[i].copy(packed.v); });
+    for (let i = surfacesUsed.length; i < MAX_SURFACES; i++) { surfMeta[i].set(-1, 0, 0, 0); surfParams[i].set(0, 0, 0, 0); }
     u.uSurfCount.value = surfacesUsed.length;
 
     interface ProtoEntry { region: RegionNode; material_id: string; aabb: AxisBounds; isFill?: boolean; name?: string; }
