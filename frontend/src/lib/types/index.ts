@@ -374,6 +374,14 @@ export interface CsgCell {
   material_id: string | null;
   name: string | null;
   region: RegionNode;
+  // Universe instancing (additive; absent for ordinary root cells). A cell with a
+  // `universe_id` is expressed in that universe's LOCAL frame; a cell with `fill`
+  // stamps universe `fill` into its own universe at `translation` (cm) / `rotation`
+  // ((rx, ry, rz) degrees, OpenMC convention). See components/geometry/csgUniverses.ts.
+  universe_id?: string;
+  fill?: string;
+  translation?: [number, number, number];
+  rotation?: [number, number, number];
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,12 @@
   //   0-2 plane_x/y/z   3-5 cylinder_x/y/z   6 sphere
   //   7 cone_z   (double-napped, Inside = both nappes; params x0,y0,z0,r2 = slope^2)
   //   8 torus    (z-axis; params x0,y0,z0,a,b,c; Inside = ((rho-a)/b)^2 + ((z-z0)/c)^2 < 1)
+  // ROTATED / INSTANCED PLACEMENTS: the backend exports universe_id/fill/translation/rotation
+  // per cell; csgUniverses.resolveWorldCells() turns them into (cell, offset, quaternion)
+  // and every such cell becomes an instance whose transform is stored in the instance
+  // texture (row 0 = offset + proto, row 1 = quaternion). The shader inverse-rotates the
+  // ray into the cell's local frame and rotates the normal back.
+  //
   // Per-surface data is packed into TWO uniform arrays: uSurfParams (vec4) and
   // uSurfMeta (vec4: x = type id, y/z = extra scalars; torus b and c). The type used to be
   // its own `int uSurfType[]`, which cost one uniform row per surface; folding it into
@@ -23,6 +29,7 @@
   // inside isVisible/toggleVisibility. Must match ObjectPanel's import path.
   import { isVisible, visibility } from '../stores/visibility.svelte.js';
   import { baseGroupName } from '../csgCellGrouping';
+  import { resolveWorldCells, transformAABB, QUAT_IDENTITY, type Quat } from '../csgUniverses';
   import type { CsgGeometry, CsgSurface, RegionNode, LatticeInstance } from '$lib/types';
 
   /** Placement key for visibility — same grouping as ObjectPanel rows. */
@@ -765,8 +772,21 @@
     vec2 fetchToken(int protoIdx, int pairIdx) {
       return texture2D(uTokenTex, vec2((float(pairIdx)+0.5)/TOK_TEX_W, (float(protoIdx)+0.5)/TOK_TEX_H)).rg;
     }
+    // Instance texture is MAX_INSTANCES wide and 2 rows tall: row 0 = (offset.xyz, protoIdx),
+    // row 1 = rotation quaternion (x, y, z, w), local -> world. Texel centres at y = 0.25 / 0.75.
     vec4 fetchInstance(int instIdx) {
-      return texture2D(uInstanceTex, vec2((float(instIdx)+0.5)/float(MAX_INSTANCES), 0.5));
+      return texture2D(uInstanceTex, vec2((float(instIdx)+0.5)/float(MAX_INSTANCES), 0.25));
+    }
+    vec4 fetchInstanceQuat(int instIdx) {
+      return texture2D(uInstanceTex, vec2((float(instIdx)+0.5)/float(MAX_INSTANCES), 0.75));
+    }
+    // v + 2 u x (u x v + w v)   (unit quaternion; rotates local -> world)
+    vec3 qRot(vec4 q, vec3 v) { vec3 u = q.xyz; return v + 2.0 * cross(u, cross(u, v) + q.w * v); }
+    // inverse rotation = conjugate (world -> local)
+    vec3 qRotInv(vec4 q, vec3 v) { return qRot(vec4(-q.xyz, q.w), v); }
+    // World point -> the instance's local frame (rigid, so ray parameters t are unchanged).
+    vec3 instToLocal(int instIdx, vec3 pWorld) {
+      return qRotInv(fetchInstanceQuat(instIdx), pWorld - fetchInstance(instIdx).xyz);
     }
     vec4 fetchBvhTexel(int nodeIdx, int col) {
       return texture2D(uBvhTex, vec2((float(col)+0.5)/3.0, (float(nodeIdx)+0.5)/BVH_TEX_H));
@@ -984,9 +1004,9 @@
     // Collects every hit within tieAt() of the nearest one, then resolves ties
     // by containment. Returns best t; outs proto + instance offset for shading
     // and whether two solid (non-fill) cells genuinely overlap at this pixel.
-    float sceneHit(vec3 ro, vec3 rd, out int hitProto, out vec3 hitOff, out bool hitOverlap) {
-      hitProto = -1; hitOff = vec3(0.0); hitOverlap = false;
-      float candT[MAX_CAND]; int candProto[MAX_CAND]; vec3 candOff[MAX_CAND];
+    float sceneHit(vec3 ro, vec3 rd, out int hitProto, out int hitInst, out bool hitOverlap) {
+      hitProto = -1; hitInst = -1; hitOverlap = false;
+      float candT[MAX_CAND]; int candProto[MAX_CAND]; int candInst[MAX_CAND];
       int candCount = 0;
       float tBest = INF;   // nearest hit found so far (tie group is [tBest, tBest + tieAt])
       if (uBvhNodeCount <= 0) return INF;
@@ -1009,7 +1029,10 @@
           vec4 inst = fetchInstance(instIdx);
           int protoIdx = int(inst.w + 0.5);
           if (protoIdx < 0 || protoIdx >= uProtoCount) continue;
-          vec3 roL = ro - inst.xyz;
+          // Ray in the instance's local frame. The transform is rigid, so t is shared.
+          vec4 iq = fetchInstanceQuat(instIdx);
+          vec3 roL = qRotInv(iq, ro - inst.xyz);
+          vec3 rdL = qRotInv(iq, rd);
           float tStart = max(bi.x, 0.0);
           float tEnd = min(bi.y, tBest + tTol);
           if (tStart >= tEnd) continue;
@@ -1017,16 +1040,16 @@
           // hitT = depth of the first entry into this cell, or INF.
           float hitT = INF;
           if (uProtoTokenCount[protoIdx] <= MAX_EXACT_TOKENS) {
-            hitT = leafExact(protoIdx, roL, rd, tStart, tEnd);
+            hitT = leafExact(protoIdx, roL, rdL, tStart, tEnd);
           } else {
             // Fallback for huge token streams: analytic seed + SDF sphere-trace.
             // Can still run out of steps at grazing angles (known limitation).
-            float tHit = evalIntervalEntry(protoIdx, roL, rd);
+            float tHit = evalIntervalEntry(protoIdx, roL, rdL);
             if (tHit < tStart || tHit >= tEnd) tHit = tStart;
             for (int k = 0; k < LEAF_MARCH_STEPS; k++) {
               if (tHit >= tEnd) break;
               float eps = epsAt(tHit);
-              float d = evalRegion(protoIdx, roL + rd * tHit);
+              float d = evalRegion(protoIdx, roL + rdL * tHit);
               if (d < eps) { hitT = tHit; break; }
               tHit += max(d, eps);
             }
@@ -1047,7 +1070,7 @@
               } else {
                 candCount++;
               }
-              if (slot >= 0) { candT[slot] = tHit; candProto[slot] = protoIdx; candOff[slot] = inst.xyz; }
+              if (slot >= 0) { candT[slot] = tHit; candProto[slot] = protoIdx; candInst[slot] = instIdx; }
               tBest = min(tBest, tHit);
             }
           }
@@ -1082,7 +1105,7 @@
         if (c >= candCount) break;
         if (candT[c] <= tBest + tFinalTol) { inWindow++; only = c; }
       }
-      if (inWindow == 1) { hitProto = candProto[only]; hitOff = candOff[only]; return candT[only]; }
+      if (inWindow == 1) { hitProto = candProto[only]; hitInst = candInst[only]; return candT[only]; }
 
       // ---- Tie resolution by exact containment ----
       // Probe slightly PAST the surface along the ray (deeper than the march's
@@ -1095,7 +1118,7 @@
         if (c >= candCount) break;
         if (candT[c] > tBest + tFinalTol) continue;
         int pc = candProto[c];
-        float d2 = evalRegion(pc, pProbe - candOff[c]);
+        float d2 = evalRegion(pc, instToLocal(candInst[c], pProbe));
         bool contains = d2 <= 0.0;
         bool isFill = uProtoIsFill[pc] > 0;
         if (contains && !isFill) solidContaining++;
@@ -1113,7 +1136,7 @@
         if (better) { win = c; winContains = contains; winD = d2; winFill = isFill; winProto = pc; }
       }
       if (win < 0) return INF;
-      hitProto = candProto[win]; hitOff = candOff[win];
+      hitProto = candProto[win]; hitInst = candInst[win];
       // Fill-vs-solid overlap is expected (fill is a deliberate stand-in under
       // instancing); only flag two *solid* cells occupying the same volume.
       hitOverlap = solidContaining >= 2;
@@ -1141,11 +1164,12 @@
       // Phase A: root AABB pre-test
       vec2 rootHit = boxInterval(ro, rd, uSceneBMin, uSceneBMax);
       if (rootHit.x <= rootHit.y && rootHit.y >= 0.0) {
-        int hitProto; vec3 hitOff; bool hitOverlap;
-        float t = sceneHit(ro, rd, hitProto, hitOff, hitOverlap);
+        int hitProto; int hitInst; bool hitOverlap;
+        float t = sceneHit(ro, rd, hitProto, hitInst, hitOverlap);
         if (hitProto >= 0 && t < INF) {
           vec3 p = ro + rd * t;
-          vec3 n = calcNormal(p - hitOff, hitProto);
+          // Normal is computed in the instance's local frame, then rotated back to world.
+          vec3 n = qRot(fetchInstanceQuat(hitInst), calcNormal(instToLocal(hitInst, p), hitProto));
           float diff = max(dot(n, normalize(vec3(0.4, 0.6, 0.8))), 0.0);
           col = uProtoColor[hitProto] * (0.35 + 0.65 * diff);
           // Genuine solid-on-solid overlap (OpenMC would reject this geometry).
@@ -1399,7 +1423,9 @@
 
     interface ProtoEntry { region: RegionNode; material_id: string; aabb: AxisBounds; isFill?: boolean; name?: string; }
     const protos: ProtoEntry[] = [];
-    const instances: { dx: number; dy: number; dz: number; protoIdx: number }[] = [];
+    const instances: { dx: number; dy: number; dz: number; protoIdx: number; q?: Quat }[] = [];
+    // Drawable cells with the transform that places each in the world (identity for root cells).
+    const worldCells = resolveWorldCells(csg.cells);
     const lis = csg.lattice_instances ?? [];
     usingInstancing = lis.length > 0;
 
@@ -1442,7 +1468,8 @@
         }
       }
       const latticeNames = latticeCellNameSet(lis);
-      for (const cell of csg.cells) {
+      for (const wc of worldCells) {
+        const cell = wc.cell;
         if (cell.material_id == null) continue;
         if (cell.name && latticeNames.has(cell.name)) continue;
         // Hide Box / fill / SinglePlacement cells when their placement is toggled off.
@@ -1456,28 +1483,31 @@
         // solid lid hid every pin). Always strip to plane half-spaces when
         // instancing; pin-vs-fill priority in the shader restores visibility.
         let region = cell.region;
-        const simplified = planeOnlyRegion(region, surfaceById);
+        // The plane-only stand-in is for the root moderator fill. An instanced (rotated)
+        // cell is a real object in its own local frame: keep its exact region.
+        const simplified = wc.instanced ? null : planeOnlyRegion(region, surfaceById);
         if (simplified) region = simplified;
         const protoIdx = protos.length;
         protos.push({
           region,
           material_id: cell.material_id,
           aabb: cellAABB(region, surfaceById, sceneBounds),
-          isFill: true,
+          isFill: !wc.instanced,
           name: cell.name ?? undefined,
         });
         registerRegion(region, surfaceById);
-        if (instances.length < MAX_INSTANCES) instances.push({ dx: 0, dy: 0, dz: 0, protoIdx });
+        if (instances.length < MAX_INSTANCES) instances.push({ dx: wc.offset[0], dy: wc.offset[1], dz: wc.offset[2], protoIdx, q: wc.quat });
       }
     } else {
-      for (const cell of csg.cells.filter((c) => c.material_id != null)) {
+      for (const wc of worldCells) {
+        const cell = wc.cell;
         const key = visibilityKey(cell.name);
         if (key && !isVisible(key)) continue;
         if (protos.length >= MAX_PROTOTYPES) break;
         const protoIdx = protos.length;
         protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, surfaceById, sceneBounds), isFill: false, name: cell.name ?? undefined });
         registerRegion(cell.region, surfaceById);
-        if (instances.length < MAX_INSTANCES) instances.push({ dx: 0, dy: 0, dz: 0, protoIdx });
+        if (instances.length < MAX_INSTANCES) instances.push({ dx: wc.offset[0], dy: wc.offset[1], dz: wc.offset[2], protoIdx, q: wc.quat });
       }
     }
 
@@ -1500,7 +1530,7 @@
         return {
           name: p.name ?? `${p.isFill ? 'fill' : 'cell'}#${pi}`,
           color: `#${Math.round(r * 255).toString(16).padStart(2, '0')}${Math.round(g * 255).toString(16).padStart(2, '0')}${Math.round(b * 255).toString(16).padStart(2, '0')}`,
-          aabb: translateAABB(p.aabb, offset.dx, offset.dy, offset.dz),
+          aabb: transformAABB(p.aabb, [offset.dx, offset.dy, offset.dz], inst?.q ?? QUAT_IDENTITY),
         };
       })
       .filter((b) => Number.isFinite(b.aabb.xMin) && Number.isFinite(b.aabb.xMax));
@@ -1542,14 +1572,21 @@
     tokenTexture.generateMipmaps = false; tokenTexture.needsUpdate = true;
     u.uTokenTex.value = tokenTexture;
 
-    const instData = new Float32Array(MAX_INSTANCES * 4);
+    const instData = new Float32Array(MAX_INSTANCES * 4 * 2);   // 2 rows: offset+proto, quaternion
     const instanceBoxes: AxisBounds[] = [];
+    // Row 1 (second MAX_INSTANCES*4 floats) holds each instance's rotation quaternion.
+    // Default it to identity for EVERY slot so unused/unrotated instances are no-ops.
+    const quatRow = MAX_INSTANCES * 4;
+    for (let i = 0; i < MAX_INSTANCES; i++) instData[quatRow + i * 4 + 3] = 1;
     instances.forEach((inst, i) => {
       instData[i * 4] = inst.dx; instData[i * 4 + 1] = inst.dy; instData[i * 4 + 2] = inst.dz; instData[i * 4 + 3] = inst.protoIdx;
-      instanceBoxes.push(translateAABB(protos[inst.protoIdx].aabb, inst.dx, inst.dy, inst.dz));
+      const q = inst.q ?? QUAT_IDENTITY;
+      instData[quatRow + i * 4] = q[0]; instData[quatRow + i * 4 + 1] = q[1]; instData[quatRow + i * 4 + 2] = q[2]; instData[quatRow + i * 4 + 3] = q[3];
+      // The BVH needs the WORLD box of the (possibly rotated) local AABB.
+      instanceBoxes.push(transformAABB(protos[inst.protoIdx].aabb, [inst.dx, inst.dy, inst.dz], q));
     });
     instanceTexture?.dispose();
-    instanceTexture = new THREE.DataTexture(instData, MAX_INSTANCES, 1, THREE.RGBAFormat, THREE.FloatType);
+    instanceTexture = new THREE.DataTexture(instData, MAX_INSTANCES, 2, THREE.RGBAFormat, THREE.FloatType);
     instanceTexture.magFilter = THREE.NearestFilter; instanceTexture.minFilter = THREE.NearestFilter;
     instanceTexture.generateMipmaps = false; instanceTexture.needsUpdate = true;
     u.uInstanceTex.value = instanceTexture; u.uInstanceCount.value = instances.length;

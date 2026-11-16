@@ -7,6 +7,7 @@
   import { isVisible, toggleVisibility } from '../stores/visibility.svelte.js';
   import { csgState, requestCsgRefresh } from '../stores/csg.svelte.js';
   import { baseGroupName } from '../csgCellGrouping';
+  import { isBackgroundCell } from '../csgUniverses';
   import yaml from '../yamlParseHelper';
   import {dump} from 'js-yaml';
   import PanelHeader from '../dock/PanelHeader.svelte';
@@ -87,6 +88,8 @@
 
     for (const cell of cells) {
       if (cell.material_id == null) continue;
+      // A rotated placement's moderator "background" is bookkeeping, not an object.
+      if (isBackgroundCell(cell)) continue;
       const rawName = cell.name ?? cell.id;
       const groupName = baseGroupName(rawName);
       const existing = map.get(groupName);
