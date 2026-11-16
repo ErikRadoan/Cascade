@@ -272,6 +272,35 @@ class Surface:
         }
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class GridBlocker:
+    """A regular xy grid of identical pins that cuts a cell, for the viewer only.
+
+    Describing the grid (rather than listing every pin in the cell's region)
+    keeps the region the same size however large the lattice is: the viewer
+    folds a point into the nearest grid cell and tests one pin.
+
+    ``envelope`` is ONE pin's whole volume, expressed on the surfaces of the
+    pin at ``origin`` (grid index (0, 0)). The pin at index (i, j) is that same
+    volume shifted by (i * pitch_x, j * pitch_y).
+    """
+    origin: tuple[float, float]
+    pitch: tuple[float, float]
+    count: tuple[int, int]
+    envelope: Region
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class ViewerCut:
+    """A cell as the viewer draws it: ``region`` minus every grid in ``grids``.
+
+    Same volume as the cell's exact ``region`` (which OpenMC and Serpent use),
+    in a form whose size does not grow with the number of pins cut away.
+    """
+    region: Region
+    grids: tuple[GridBlocker, ...]
+
+
 @dataclass(slots=True)
 class Cell:
     """Region of space with a material — OR a fill cell that instances
@@ -300,6 +329,9 @@ class Cell:
     fill: str | None = None
     rotation: tuple[float, float, float] | None = None
     translation: tuple[float, float, float] | None = None
+    # Viewer-only compact form of ``region`` (see ViewerCut). Never persisted
+    # and never read by the adapters; anything that copies a cell may drop it.
+    viewer: ViewerCut | None = None
 
     def to_dict(self) -> dict[str, object]:
         d: dict[str, object] = {

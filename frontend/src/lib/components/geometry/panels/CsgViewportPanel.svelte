@@ -15,11 +15,16 @@
   // texture (row 0 = offset + proto, row 1 = quaternion). The shader inverse-rotates the
   // ray into the cell's local frame and rotates the normal back.
   //
-  // Per-surface data is packed into TWO uniform arrays: uSurfParams (vec4) and
-  // uSurfMeta (vec4: x = type id, y/z = extra scalars; torus b and c). The type used to be
-  // its own `int uSurfType[]`, which cost one uniform row per surface; folding it into
-  // uSurfMeta keeps the total uniform-vector budget unchanged (WebGL guarantees only
-  // MAX_FRAGMENT_UNIFORM_VECTORS >= 221, desktop GPUs expose ~1024, and we are close).
+  // Everything the shader looks up by index lives in float data textures, NOT uniform arrays
+  // (WebGL only guarantees MAX_FRAGMENT_UNIFORM_VECTORS >= 221, desktop GPUs expose ~1024, and
+  // the old uniform tables used ~700 of those, which capped surfaces at 256 and prototypes at 64):
+  //   surface table   2 texels each: params (vec4 centre/radius) | meta (x = type id, y/z = torus b, c)
+  //   prototype table 2 texels each: colour rgb + isFill | token count, first grid, grid count
+  //   grid table      2 texels each: origin.xy + pitch.xy | nx, ny, envelope prototype
+  //   instances       2 texels each: offset + first prototype/layer count | rotation quaternion
+  //   BVH nodes       3 texels each; tokens: one row per prototype
+  // Tables are laid out as a linear array wrapped at a fixed texture width, so the only limit is
+  // memory. Only a few scalars (counts, texture heights, camera) remain uniforms.
 
   import { onMount, onDestroy, untrack } from 'svelte';
   import * as THREE from 'three';
@@ -29,8 +34,8 @@
   // inside isVisible/toggleVisibility. Must match ObjectPanel's import path.
   import { isVisible, visibility } from '../stores/visibility.svelte.js';
   import { baseGroupName } from '../csgCellGrouping';
-  import { resolveWorldCells, transformAABB, QUAT_IDENTITY, type Quat } from '../csgUniverses';
-  import type { CsgGeometry, CsgSurface, RegionNode, LatticeInstance } from '$lib/types';
+  import { resolveWorldCells, transformAABB, QUAT_IDENTITY, type Quat, type WorldCell } from '../csgUniverses';
+  import type { CsgCell, CsgGeometry, CsgSurface, RegionNode, LatticeInstance } from '$lib/types';
 
   /** Placement key for visibility — same grouping as ObjectPanel rows. */
   function visibilityKey(name: string | null | undefined): string | null {
@@ -38,14 +43,27 @@
     return baseGroupName(name);
   }
 
-  const MAX_SURFACES = 256;
-  const MAX_PROTOTYPES = 64;
-  const MAX_INSTANCES = 4096;
+  const MAX_SURFACES = 4096;
+  const MAX_PROTOTYPES = 1024;
+  const MAX_INSTANCES = 16384;
   // Fill cell = 6 box planes + Outside(each pin outer). A 10×10 lattice needs
   // ~200 RPN pairs; 17×17 needs ~600. Cap of 96 was truncating the AND chain
   // so the water solid lost constraints and pins appeared to punch through sides.
   const MAX_TOKENS_PER_PROTO = 256;
-  const MAX_BVH_NODES = 8192;
+  const MAX_BVH_NODES = 2 * MAX_INSTANCES;   // a binary tree over N leaves has 2N - 1 nodes
+  // Pin grids a cell is cut by (see GridBlocker).
+  // Longest token stream the exact leaf test handles (longer ones fall back to marching).
+  const MAX_EXACT_TOKENS = 48;
+  // A pin's layers (pellet, gap, clad ...) share ONE instance and BVH leaf: an instance names
+  // its first prototype and how many consecutive ones it covers. Pins with more layers than
+  // this are split into several instances. The count rides in the instance's w, above the id.
+  const MAX_GROUP = 8;
+  const GROUP_STRIDE = 4096;
+  const MAX_GRIDS = 256;
+  const MAX_GRIDS_PER_PROTO = 4;
+  // Wrap widths (texels) of the linear tables above. BVH_TEX_W is a multiple of 3 so a node's
+  // three texels never straddle a row.
+  const SURF_TEX_W = 1024, PROTO_TEX_W = 1024, GRID_TEX_W = 1024, INST_TEX_W = 2048, BVH_TEX_W = 1536;
   const INTERACT_DPR = 0.65;
   // Tint pixels where two solid (non-fill) cells genuinely overlap. Overlaps are
   // invalid in OpenMC, so this doubles as a cheap geometry sanity check.
@@ -160,7 +178,7 @@
     return fallback;
   }
 
-  /** Packed surface: `type` id + `v` (uSurfParams) + `b`/`c` extras (uSurfMeta.yz). */
+  /** Packed surface: `type` id + `v` (surface table params texel) + `b`/`c` extras (meta texel .yz). */
   interface PackedSurface { type: number; v: THREE.Vector4; b: number; c: number; }
 
   function packSurface(s: CsgSurface): PackedSurface {
@@ -412,6 +430,7 @@
   let truncatedInstances = $state(false);
   let truncatedTokens = $state(false);
   let truncatedBvh = $state(false);
+  let truncatedGrids = $state(false);
   let instanceCount = $state(0);
   let prototypeCount = $state(0);
   let materialLegend = $state<{ id: string; color: string }[]>([]);
@@ -473,6 +492,21 @@
   let tokenTexture: THREE.DataTexture | null = null;
   let bvhTexture: THREE.DataTexture | null = null;
   let instanceTexture: THREE.DataTexture | null = null;
+  let surfTexture: THREE.DataTexture | null = null;
+  let protoTexture: THREE.DataTexture | null = null;
+  let gridTexture: THREE.DataTexture | null = null;
+
+  /** A zeroed float buffer for `texels` RGBA texels of a table wrapped at `width`. */
+  function allocTable(width: number, texels: number): { data: Float32Array; width: number; height: number } {
+    const height = Math.max(1, Math.ceil(texels / width));
+    return { data: new Float32Array(width * height * 4), width, height };
+  }
+  function tableTexture(t: { data: Float32Array; width: number; height: number }): THREE.DataTexture {
+    const tex = new THREE.DataTexture(t.data, t.width, t.height, THREE.RGBAFormat, THREE.FloatType);
+    tex.magFilter = THREE.NearestFilter; tex.minFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false; tex.needsUpdate = true;
+    return tex;
+  }
 
   let cameraTheta = $state(Math.PI / 4);
   let cameraPhi = $state(Math.PI / 3);
@@ -486,18 +520,22 @@
   // Phase B: analytic intervals for primary hit; SDF tetrahedron normals; Phase C instancing.
   const FRAGMENT_SHADER = `
     precision highp float;
-    #define MAX_SURFACES ${MAX_SURFACES}
     #define MAX_PROTOTYPES ${MAX_PROTOTYPES}
-    #define MAX_INSTANCES ${MAX_INSTANCES}
+    #define SURF_TEX_W ${SURF_TEX_W}.0
+    #define PROTO_TEX_W ${PROTO_TEX_W}.0
+    #define GRID_TEX_W ${GRID_TEX_W}.0
+    #define INST_TEX_W ${INST_TEX_W}.0
+    #define BVH_TEX_W ${BVH_TEX_W}.0
     #define TOK_TEX_W ${MAX_TOKENS_PER_PROTO}.0
-    #define TOK_TEX_H ${MAX_PROTOTYPES}.0
     #define MAX_TOKEN_ITERS ${MAX_TOKENS_PER_PROTO}
-    #define MAX_BVH_NODES ${MAX_BVH_NODES}
-    #define BVH_TEX_H ${MAX_BVH_NODES}.0
+    #define MAX_GRIDS ${MAX_GRIDS}
+    #define MAX_GROUP ${MAX_GROUP}
+    #define GROUP_STRIDE ${GROUP_STRIDE}
+    #define MAX_GRIDS_PER_PROTO ${MAX_GRIDS_PER_PROTO}
     // Large lattices (e.g. 17x17 x layers) need a high iter budget; 256 was
     // aborting traversal mid-tree and caused angle-dependent missing pins.
     #define MAX_BVH_STACK 64
-    #define MAX_BVH_ITERS 4096
+    #define MAX_BVH_ITERS 8192
     #define INF 1.0e6
     #define NEG_INF -1.0e6
     #define LEAF_MARCH_STEPS 96
@@ -505,15 +543,10 @@
     uniform vec3 uCamPos, uCamForward, uCamRight, uCamUp;
     uniform float uTanHalfFov, uAspect;
     uniform int uSurfCount;
-    // Per-surface data. uSurfMeta.x = surface type id (see header of this file; -1 = unused),
-    // uSurfMeta.yz = extra scalars (torus b, c). uSurfParams = main vec4 (center / radius).
-    uniform vec4 uSurfMeta[MAX_SURFACES];
-    uniform vec4 uSurfParams[MAX_SURFACES];
     uniform int uProtoCount;
-    uniform vec3 uProtoColor[MAX_PROTOTYPES];
-    uniform int uProtoTokenCount[MAX_PROTOTYPES];
-    uniform int uProtoIsFill[MAX_PROTOTYPES];
-    uniform sampler2D uTokenTex, uInstanceTex, uBvhTex;
+    uniform sampler2D uTokenTex, uInstanceTex, uBvhTex, uSurfTex, uProtoTex, uGridTex;
+    // Heights (rows) of the tables above; their widths are the *_TEX_W defines.
+    uniform float uTokTexH, uInstTexH, uBvhTexH, uSurfTexH, uProtoTexH, uGridTexH;
     uniform int uInstanceCount, uBvhNodeCount;
     uniform vec3 uSceneBMin, uSceneBMax;
     // Phase 1 (coincident faces). See epsAt()/sceneHit(). All three are set from JS.
@@ -521,6 +554,27 @@
     uniform float uPixelAngle;    // half a pixel, in radians: 0.5 * 2*tan(fov/2) / drawingBufferHeight
     uniform float uMarkOverlaps;  // >0.5 tints pixels where two solid cells genuinely overlap
     varying vec2 vUv;
+
+    // Element idx of a linear table wrapped at width w (texels), h rows.
+    vec4 fetchLinear(sampler2D tex, int idx, float w, float h) {
+      float fi = float(idx);
+      float row = floor((fi + 0.5) / w);
+      return texture2D(tex, vec2((fi - row * w + 0.5) / w, (row + 0.5) / h));
+    }
+    // Surface table: params = main vec4 (centre / radius); meta.x = type id (-1 unused),
+    // meta.yz = extra scalars (torus b, c).
+    vec4 surfParams(int i) { return fetchLinear(uSurfTex, 2 * i, SURF_TEX_W, uSurfTexH); }
+    vec4 surfMeta(int i) { return fetchLinear(uSurfTex, 2 * i + 1, SURF_TEX_W, uSurfTexH); }
+    // Prototype table.
+    vec4 protoA(int p) { return fetchLinear(uProtoTex, 2 * p, PROTO_TEX_W, uProtoTexH); }
+    vec4 protoB(int p) { return fetchLinear(uProtoTex, 2 * p + 1, PROTO_TEX_W, uProtoTexH); }
+    vec3 protoColor(int p) { return protoA(p).rgb; }
+    bool protoIsFill(int p) { return protoA(p).w > 0.5; }
+    int protoTokenCount(int p) { return int(protoB(p).x + 0.5); }
+    vec2 protoGrid(int p) { return protoB(p).yz; }   // (first grid, grid count)
+    // Grid table: A = (origin.xy, pitch.xy), B = (nx, ny, envelope prototype, unused).
+    vec4 gridA(int g) { return fetchLinear(uGridTex, 2 * g, GRID_TEX_W, uGridTexH); }
+    vec4 gridB(int g) { return fetchLinear(uGridTex, 2 * g + 1, GRID_TEX_W, uGridTexH); }
 
     float boxSDF(vec3 p, vec3 bmin, vec3 bmax) {
       vec3 c = (bmin + bmax) * 0.5; vec3 h = (bmax - bmin) * 0.5;
@@ -547,7 +601,7 @@
 
     // Surface type id of slot idx. floor(x + 0.5) rather than int(x + 0.5): int() truncates
     // toward zero, which would turn the "unused" id -1 into 0 (plane_x).
-    int surfTypeOf(int idx) { return int(floor(uSurfMeta[idx].x + 0.5)); }
+    int surfTypeOf(int idx) { return int(floor(surfMeta(idx).x + 0.5)); }
 
     // ---- Torus (type 8) helpers -------------------------------------------------
     // Field: f = (|(q_r, q_z)| - 1) * min(b, c), q_r = (rho - a)/b, q_z = dz/c.
@@ -664,7 +718,7 @@
 
     float surfaceSDF(int idx, vec3 p) {
       if (idx < 0) return INF;
-      int t = surfTypeOf(idx); vec4 pr = uSurfParams[idx];
+      int t = surfTypeOf(idx); vec4 pr = surfParams(idx);
       if (t == 0) return p.x - pr.x;
       if (t == 1) return p.y - pr.y;
       if (t == 2) return p.z - pr.z;
@@ -682,14 +736,14 @@
         vec3 d = p - pr.xyz;
         return (length(d.xy) - sqrt(pr.w) * abs(d.z)) * inversesqrt(1.0 + pr.w);
       }
-      if (t == 8) return torusF(p, pr, uSurfMeta[idx].yz);
+      if (t == 8) return torusF(p, pr, surfMeta(idx).yz);
       return INF;
     }
 
     // Analytic ray ∩ inside-of-surface → (tEnter, tExit). Empty if miss.
     vec2 surfaceInterval(int idx, vec3 ro, vec3 rd) {
       if (idx < 0) return vec2(INF, NEG_INF);
-      int t = surfTypeOf(idx); vec4 pr = uSurfParams[idx];
+      int t = surfTypeOf(idx); vec4 pr = surfParams(idx);
       // Planes: half-space surfaceSDF <= 0 is "inside"
       if (t == 0) {
         float denom = rd.x;
@@ -726,7 +780,7 @@
       // hull (first entry .. last exit) found by the crossing march. A hull only ever
       // starts EARLY, which is the safe direction for the entry seed.
       if (t == 8) {
-        vec4 cr = torusCrossings(ro, rd, pr, uSurfMeta[idx].yz, NEG_INF, INF);
+        vec4 cr = torusCrossings(ro, rd, pr, surfMeta(idx).yz, NEG_INF, INF);
         if (cr.x >= INF * 0.5) return vec2(INF, NEG_INF);
         float last = cr.x;
         if (cr.y < INF * 0.5) last = cr.y;
@@ -762,23 +816,23 @@
     // crossings are always exactly the boundary points the entering-test needs.
     vec4 surfaceCrossings(int idx, vec3 ro, vec3 rd, float tA, float tB) {
       if (idx < 0) return vec4(INF);
-      int t = surfTypeOf(idx); vec4 pr = uSurfParams[idx];
+      int t = surfTypeOf(idx); vec4 pr = surfParams(idx);
       if (t == 7) { float qa; vec3 q = coneQuad(ro, rd, pr, qa); return quadCrossings(q.x, q.y, q.z); }
-      if (t == 8) return torusCrossings(ro, rd, pr, uSurfMeta[idx].yz, tA, tB);
+      if (t == 8) return torusCrossings(ro, rd, pr, surfMeta(idx).yz, tA, tB);
       vec2 iv = surfaceInterval(idx, ro, rd);   // planes / cylinders / sphere: <= 2 crossings
       return vec4(iv.x, iv.y, INF, INF);
     }
 
     vec2 fetchToken(int protoIdx, int pairIdx) {
-      return texture2D(uTokenTex, vec2((float(pairIdx)+0.5)/TOK_TEX_W, (float(protoIdx)+0.5)/TOK_TEX_H)).rg;
+      return texture2D(uTokenTex, vec2((float(pairIdx)+0.5)/TOK_TEX_W, (float(protoIdx)+0.5)/uTokTexH)).rg;
     }
-    // Instance texture is MAX_INSTANCES wide and 2 rows tall: row 0 = (offset.xyz, protoIdx),
-    // row 1 = rotation quaternion (x, y, z, w), local -> world. Texel centres at y = 0.25 / 0.75.
+    // Instance i is two texels: 2i = (offset.xyz, first prototype + GROUP_STRIDE * layer count),
+    // 2i+1 = rotation quaternion (x, y, z, w), local -> world.
     vec4 fetchInstance(int instIdx) {
-      return texture2D(uInstanceTex, vec2((float(instIdx)+0.5)/float(MAX_INSTANCES), 0.25));
+      return fetchLinear(uInstanceTex, 2 * instIdx, INST_TEX_W, uInstTexH);
     }
     vec4 fetchInstanceQuat(int instIdx) {
-      return texture2D(uInstanceTex, vec2((float(instIdx)+0.5)/float(MAX_INSTANCES), 0.75));
+      return fetchLinear(uInstanceTex, 2 * instIdx + 1, INST_TEX_W, uInstTexH);
     }
     // v + 2 u x (u x v + w v)   (unit quaternion; rotates local -> world)
     vec3 qRot(vec4 q, vec3 v) { vec3 u = q.xyz; return v + 2.0 * cross(u, cross(u, v) + q.w * v); }
@@ -789,10 +843,10 @@
       return qRotInv(fetchInstanceQuat(instIdx), pWorld - fetchInstance(instIdx).xyz);
     }
     vec4 fetchBvhTexel(int nodeIdx, int col) {
-      return texture2D(uBvhTex, vec2((float(col)+0.5)/3.0, (float(nodeIdx)+0.5)/BVH_TEX_H));
+      return fetchLinear(uBvhTex, nodeIdx * 3 + col, BVH_TEX_W, uBvhTexH);
     }
-    float evalRegion(int protoIdx, vec3 pLocal) {
-      int tokenCount = uProtoTokenCount[protoIdx];
+    float evalTokens(int protoIdx, vec3 pLocal) {
+      int tokenCount = protoTokenCount(protoIdx);
       // Deep AND-chains (fill cell vs many pins) need more than 16 slots.
       float stack[32]; int sp = 0;
       for (int i = 0; i < MAX_TOKEN_ITERS; i++) {
@@ -809,9 +863,33 @@
       return sp > 0 ? stack[0] : INF;
     }
 
+    // Signed distance (<= 0 inside) to the pins of grid g. A grid is a regular xy
+    // array, so only the pin nearest the point matters: fold the point into that
+    // grid cell and test a single pin. Cost is independent of the pin count.
+    float gridSDF(int g, vec3 p) {
+      vec4 ga = gridA(g); vec4 gb = gridB(g);
+      vec2 c = clamp(floor((p.xy - ga.xy) / ga.zw + 0.5), vec2(0.0), gb.xy - 1.0);
+      return evalTokens(int(gb.z + 0.5), p - vec3(c * ga.zw, 0.0));
+    }
+
+    // A cell's region: its tokens, minus the pins of its grids (max(a, -b) = a AND NOT b).
+    float evalRegion(int protoIdx, vec3 pLocal) {
+      float d = evalTokens(protoIdx, pLocal);
+      vec2 gr = protoGrid(protoIdx);
+      int gn = int(gr.y + 0.5);
+      if (gn > 0) {
+        int g0 = int(gr.x + 0.5);
+        for (int k = 0; k < MAX_GRIDS_PER_PROTO; k++) {
+          if (k >= gn) break;
+          d = max(d, -gridSDF(g0 + k, pLocal));
+        }
+      }
+      return d;
+    }
+
     // Phase B: interval CSG along ray in local frame → entry t (or INF)
     float evalIntervalEntry(int protoIdx, vec3 ro, vec3 rd) {
-      int tokenCount = uProtoTokenCount[protoIdx];
+      int tokenCount = protoTokenCount(protoIdx);
       vec2 stack[32]; int sp = 0;
       for (int i = 0; i < MAX_TOKEN_ITERS; i++) {
         if (i >= tokenCount) break;
@@ -966,12 +1044,70 @@
     //
     // Falls back to the old march only for oversized token streams (> MAX_EXACT_TOKENS),
     // where trying every crossing would be too expensive.
-    #define MAX_EXACT_TOKENS 48
+    #define MAX_EXACT_TOKENS ${MAX_EXACT_TOKENS}
+    // Entries into a cell through the pins of one of its grids. The pins' surfaces are
+    // too many to test one by one, so walk the ray through the grid cells it crosses
+    // (a 2D DDA) and test only the pin in each: O(cells crossed), not O(pins).
+    #define MAX_GRID_STEPS 192
+    float gridEntry(int protoIdx, int g, vec3 roL, vec3 rd, float tStart, float tEnd, float best) {
+      vec4 ga = gridA(g); vec4 gb = gridB(g);
+      int env = int(gb.z + 0.5);
+      int envTokens = min(protoTokenCount(env), MAX_EXACT_TOKENS);
+      vec2 pit = ga.zw; vec2 cnt = gb.xy;
+      float pad = 4.0 * uEpsMin;
+      vec2 gLo = ga.xy - 0.5 * pit;            // lower corner of grid cell [0, 0]
+      vec2 lo = gLo - pad; vec2 hi = gLo + cnt * pit + pad;
+      float tA = tStart; float tB = min(tEnd, best);
+      // Clip the ray to the grid's xy footprint.
+      if (abs(rd.x) < 1.0e-9) { if (roL.x < lo.x || roL.x > hi.x) return best; }
+      else { float a = (lo.x - roL.x) / rd.x; float b = (hi.x - roL.x) / rd.x; tA = max(tA, min(a, b)); tB = min(tB, max(a, b)); }
+      if (abs(rd.y) < 1.0e-9) { if (roL.y < lo.y || roL.y > hi.y) return best; }
+      else { float a = (lo.y - roL.y) / rd.y; float b = (hi.y - roL.y) / rd.y; tA = max(tA, min(a, b)); tB = min(tB, max(a, b)); }
+      if (tA >= tB) return best;
+
+      vec2 cell = clamp(floor((roL.xy + rd.xy * tA - gLo) / pit), vec2(0.0), cnt - 1.0);
+      vec2 stp = vec2(rd.x >= 0.0 ? 1.0 : -1.0, rd.y >= 0.0 ? 1.0 : -1.0);
+      vec2 nextB = gLo + (cell + vec2(rd.x >= 0.0 ? 1.0 : 0.0, rd.y >= 0.0 ? 1.0 : 0.0)) * pit;
+      vec2 tMax = vec2(abs(rd.x) < 1.0e-9 ? INF : (nextB.x - roL.x) / rd.x,
+                       abs(rd.y) < 1.0e-9 ? INF : (nextB.y - roL.y) / rd.y);
+      vec2 tDelta = vec2(abs(rd.x) < 1.0e-9 ? INF : pit.x / abs(rd.x),
+                         abs(rd.y) < 1.0e-9 ? INF : pit.y / abs(rd.y));
+      float tCur = tA;
+      for (int s = 0; s < MAX_GRID_STEPS; s++) {
+        float tNext = min(min(tMax.x, tMax.y), tB);
+        // This grid cell's pin is the shared envelope shifted by cell * pitch.
+        vec3 roP = roL - vec3(cell * pit, 0.0);
+        float wLo = max(tCur - pad, tStart);
+        float wHi = min(tNext + pad, min(tEnd, best));
+        for (int i = 0; i < MAX_EXACT_TOKENS; i++) {
+          if (i >= envTokens) break;
+          vec2 tok = fetchToken(env, i);
+          if (tok.x > 1.5) continue;
+          int sIdx = int(tok.y + 0.5);
+          if (sIdx < 0) continue;
+          vec4 cr = surfaceCrossings(sIdx, roP, rd, wLo, wHi);
+          for (int k = 0; k < 4; k++) {
+            float tc = (k == 0) ? cr.x : (k == 1) ? cr.y : (k == 2) ? cr.z : cr.w;
+            if (abs(tc) >= INF * 0.5 || tc < wLo || tc >= min(wHi, best)) continue;
+            float dl = max(0.1 * epsAt(tc), 1.0e-6);
+            if (evalRegion(protoIdx, roL + rd * (tc - dl)) > 0.0 &&
+                evalRegion(protoIdx, roL + rd * (tc + dl)) <= 0.0) best = tc;
+          }
+        }
+        if (tNext >= tB) break;
+        if (tMax.x < tMax.y) { cell.x += stp.x; tMax.x += tDelta.x; }
+        else { cell.y += stp.y; tMax.y += tDelta.y; }
+        if (cell.x < 0.0 || cell.y < 0.0 || cell.x >= cnt.x || cell.y >= cnt.y) break;
+        tCur = tNext;
+      }
+      return best;
+    }
+
     // Returns the first t in [tStart, tEnd) where the ray enters the region, else INF.
     float leafExact(int protoIdx, vec3 roL, vec3 rd, float tStart, float tEnd) {
       // Ray already inside the cell at the window start (camera inside geometry).
       if (evalRegion(protoIdx, roL + rd * tStart) <= 0.0) return tStart;
-      int tokenCount = uProtoTokenCount[protoIdx];
+      int tokenCount = protoTokenCount(protoIdx);
       float best = INF;
       for (int i = 0; i < MAX_EXACT_TOKENS; i++) {
         if (i >= tokenCount) break;
@@ -993,6 +1129,11 @@
           if (evalRegion(protoIdx, roL + rd * (tc - dl)) > 0.0 &&
               evalRegion(protoIdx, roL + rd * (tc + dl)) <= 0.0) best = tc;
         }
+      }
+      vec2 gr = protoGrid(protoIdx);
+      for (int k = 0; k < MAX_GRIDS_PER_PROTO; k++) {
+        if (k >= int(gr.y + 0.5)) break;
+        best = gridEntry(protoIdx, int(gr.x + 0.5) + k, roL, rd, tStart, tEnd, best);
       }
       return best;
     }
@@ -1027,51 +1168,60 @@
           int instIdx = int(t1.w + 0.5);
           if (instIdx < 0 || instIdx >= uInstanceCount) continue;
           vec4 inst = fetchInstance(instIdx);
-          int protoIdx = int(inst.w + 0.5);
-          if (protoIdx < 0 || protoIdx >= uProtoCount) continue;
+          // An instance covers groupN consecutive prototypes (a pin's layers).
+          int packedW = int(inst.w + 0.5);
+          int groupN = max(packedW / GROUP_STRIDE, 1);
+          int baseProto = packedW - (packedW / GROUP_STRIDE) * GROUP_STRIDE;
           // Ray in the instance's local frame. The transform is rigid, so t is shared.
           vec4 iq = fetchInstanceQuat(instIdx);
           vec3 roL = qRotInv(iq, ro - inst.xyz);
           vec3 rdL = qRotInv(iq, rd);
           float tStart = max(bi.x, 0.0);
-          float tEnd = min(bi.y, tBest + tTol);
-          if (tStart >= tEnd) continue;
+          for (int m = 0; m < MAX_GROUP; m++) {
+            if (m >= groupN) break;
+            int protoIdx = baseProto + m;
+            if (protoIdx < 0 || protoIdx >= uProtoCount) break;
+            // tBest may have improved on an earlier layer: re-derive the window.
+            float tTolM = (tBest < INF) ? tieAt(tBest) : 0.0;
+            float tEnd = min(bi.y, tBest + tTolM);
+            if (tStart >= tEnd) break;
 
-          // hitT = depth of the first entry into this cell, or INF.
-          float hitT = INF;
-          if (uProtoTokenCount[protoIdx] <= MAX_EXACT_TOKENS) {
-            hitT = leafExact(protoIdx, roL, rdL, tStart, tEnd);
-          } else {
-            // Fallback for huge token streams: analytic seed + SDF sphere-trace.
-            // Can still run out of steps at grazing angles (known limitation).
-            float tHit = evalIntervalEntry(protoIdx, roL, rdL);
-            if (tHit < tStart || tHit >= tEnd) tHit = tStart;
-            for (int k = 0; k < LEAF_MARCH_STEPS; k++) {
-              if (tHit >= tEnd) break;
-              float eps = epsAt(tHit);
-              float d = evalRegion(protoIdx, roL + rdL * tHit);
-              if (d < eps) { hitT = tHit; break; }
-              tHit += max(d, eps);
-            }
-          }
-
-          if (hitT < INF && hitT >= 0.0) {
-            float tHit = hitT;
-            // Clearly nearer than the whole current group -> start a new group.
-            if (tHit < tBest - tTol) { candCount = 0; tBest = tHit; }
-            // Within the tie window -> keep as a candidate (never first-wins).
-            if (tHit <= tBest + tTol) {
-              int slot = candCount;
-              if (candCount >= MAX_CAND) {
-                // Full: evict the farthest candidate if this one is nearer.
-                slot = 0; float worst = candT[0];
-                for (int c = 1; c < MAX_CAND; c++) { if (candT[c] > worst) { worst = candT[c]; slot = c; } }
-                if (tHit >= worst) slot = -1;
-              } else {
-                candCount++;
+            // hitT = depth of the first entry into this cell, or INF.
+            float hitT = INF;
+            if (protoTokenCount(protoIdx) <= MAX_EXACT_TOKENS) {
+              hitT = leafExact(protoIdx, roL, rdL, tStart, tEnd);
+            } else {
+              // Fallback for huge token streams: analytic seed + SDF sphere-trace.
+              // Can still run out of steps at grazing angles (known limitation).
+              float tHit = evalIntervalEntry(protoIdx, roL, rdL);
+              if (tHit < tStart || tHit >= tEnd) tHit = tStart;
+              for (int k = 0; k < LEAF_MARCH_STEPS; k++) {
+                if (tHit >= tEnd) break;
+                float eps = epsAt(tHit);
+                float d = evalRegion(protoIdx, roL + rdL * tHit);
+                if (d < eps) { hitT = tHit; break; }
+                tHit += max(d, eps);
               }
-              if (slot >= 0) { candT[slot] = tHit; candProto[slot] = protoIdx; candInst[slot] = instIdx; }
-              tBest = min(tBest, tHit);
+            }
+
+            if (hitT < INF && hitT >= 0.0) {
+              float tHit = hitT;
+              // Clearly nearer than the whole current group -> start a new group.
+              if (tHit < tBest - tTolM) { candCount = 0; tBest = tHit; }
+              // Within the tie window -> keep as a candidate (never first-wins).
+              if (tHit <= tBest + tTolM) {
+                int slot = candCount;
+                if (candCount >= MAX_CAND) {
+                  // Full: evict the farthest candidate if this one is nearer.
+                  slot = 0; float worst = candT[0];
+                  for (int c = 1; c < MAX_CAND; c++) { if (candT[c] > worst) { worst = candT[c]; slot = c; } }
+                  if (tHit >= worst) slot = -1;
+                } else {
+                  candCount++;
+                }
+                if (slot >= 0) { candT[slot] = tHit; candProto[slot] = protoIdx; candInst[slot] = instIdx; }
+                tBest = min(tBest, tHit);
+              }
             }
           }
         } else {
@@ -1120,7 +1270,7 @@
         int pc = candProto[c];
         float d2 = evalRegion(pc, instToLocal(candInst[c], pProbe));
         bool contains = d2 <= 0.0;
-        bool isFill = uProtoIsFill[pc] > 0;
+        bool isFill = protoIsFill(pc);
         if (contains && !isFill) solidContaining++;
         bool better;
         if (win < 0) better = true;
@@ -1171,7 +1321,7 @@
           // Normal is computed in the instance's local frame, then rotated back to world.
           vec3 n = qRot(fetchInstanceQuat(hitInst), calcNormal(instToLocal(hitInst, p), hitProto));
           float diff = max(dot(n, normalize(vec3(0.4, 0.6, 0.8))), 0.0);
-          col = uProtoColor[hitProto] * (0.35 + 0.65 * diff);
+          col = protoColor(hitProto) * (0.35 + 0.65 * diff);
           // Genuine solid-on-solid overlap (OpenMC would reject this geometry).
           if (uMarkOverlaps > 0.5 && hitOverlap) col = mix(col, vec3(1.0, 0.1, 0.8), 0.5);
         }
@@ -1189,18 +1339,17 @@
       uTanHalfFov: { value: Math.tan(THREE.MathUtils.degToRad(25)) },
       uAspect: { value: 1 },
       uSurfCount: { value: 0 },
-      // x = type id (-1 unused), y/z = extra scalars (torus b, c). See file header.
-      uSurfMeta: { value: Array.from({ length: MAX_SURFACES }, () => new THREE.Vector4(-1, 0, 0, 0)) },
-      uSurfParams: { value: Array.from({ length: MAX_SURFACES }, () => new THREE.Vector4()) },
       uProtoCount: { value: 0 },
-      uProtoColor: { value: Array.from({ length: MAX_PROTOTYPES }, () => new THREE.Color(0, 0, 0)) },
-      uProtoTokenCount: { value: new Array(MAX_PROTOTYPES).fill(0) },
-      uProtoIsFill: { value: new Array(MAX_PROTOTYPES).fill(0) },
       uTokenTex: { value: null as THREE.DataTexture | null },
       uInstanceTex: { value: null as THREE.DataTexture | null },
       uInstanceCount: { value: 0 },
       uBvhTex: { value: null as THREE.DataTexture | null },
       uBvhNodeCount: { value: 0 },
+      uSurfTex: { value: null as THREE.DataTexture | null },
+      uProtoTex: { value: null as THREE.DataTexture | null },
+      uGridTex: { value: null as THREE.DataTexture | null },
+      uTokTexH: { value: 1 }, uInstTexH: { value: 1 }, uBvhTexH: { value: 1 },
+      uSurfTexH: { value: 1 }, uProtoTexH: { value: 1 }, uGridTexH: { value: 1 },
       uSceneBMin: { value: new THREE.Vector3(-1e3, -1e3, -1e3) },
       uSceneBMax: { value: new THREE.Vector3(1e3, 1e3, 1e3) },
       // Phase 1 coincident-face tolerance (see epsAt() in the shader).
@@ -1376,10 +1525,14 @@
       tokenTexture?.dispose(); tokenTexture = null;
       instanceTexture?.dispose(); instanceTexture = null;
       bvhTexture?.dispose(); bvhTexture = null;
+      surfTexture?.dispose(); surfTexture = null;
+      protoTexture?.dispose(); protoTexture = null;
+      gridTexture?.dispose(); gridTexture = null;
       u.uTokenTex.value = null; u.uInstanceTex.value = null; u.uBvhTex.value = null;
+      u.uSurfTex.value = null; u.uProtoTex.value = null; u.uGridTex.value = null;
       u.uProtoCount.value = 0; u.uInstanceCount.value = 0; u.uSurfCount.value = 0; u.uBvhNodeCount.value = 0;
       instanceCount = 0; prototypeCount = 0; materialLegend = []; usingInstancing = false;
-      truncatedSurfaces = truncatedProtos = truncatedInstances = truncatedTokens = truncatedBvh = false;
+      truncatedSurfaces = truncatedProtos = truncatedInstances = truncatedTokens = truncatedBvh = truncatedGrids = false;
       render(); return;
     }
     // Shader surface table. It used to be csg.surfaces.slice(0, MAX_SURFACES), i.e. the
@@ -1421,13 +1574,45 @@
         sceneBounds.zMax - sceneBounds.zMin, 1);
     }
 
-    interface ProtoEntry { region: RegionNode; material_id: string; aabb: AxisBounds; isFill?: boolean; name?: string; }
+    interface ProtoEntry {
+      region: RegionNode; material_id: string; aabb: AxisBounds; isFill?: boolean; name?: string;
+      /** Holds one pin's envelope for a grid; never instanced or drawn itself. */
+      isEnvelope?: boolean;
+      gridStart?: number; gridCount?: number;
+    }
     const protos: ProtoEntry[] = [];
-    const instances: { dx: number; dy: number; dz: number; protoIdx: number; q?: Quat }[] = [];
+    interface GridEntry { origin: [number, number]; pitch: [number, number]; count: [number, number]; envProto: number; }
+    const grids: GridEntry[] = [];
+    let gridOverflow = false;
+    const instances: { dx: number; dy: number; dz: number; protoIdx: number; count: number; q?: Quat }[] = [];
     // Drawable cells with the transform that places each in the world (identity for root cells).
     const worldCells = resolveWorldCells(csg.cells);
     const lis = csg.lattice_instances ?? [];
     usingInstancing = lis.length > 0;
+
+    // One non-lattice cell: its own prototype plus, for each pin grid it is cut by, a
+    // prototype holding that grid's single-pin envelope (see GridBlocker).
+    const addCell = (wc: WorldCell<CsgCell>, region: RegionNode, isFill: boolean) => {
+      const cell = wc.cell;
+      const protoIdx = protos.length;
+      const entry: ProtoEntry = {
+        region, material_id: cell.material_id!, aabb: cellAABB(region, surfaceById, sceneBounds),
+        isFill, name: cell.name ?? undefined,
+      };
+      protos.push(entry);
+      registerRegion(region, surfaceById);
+      for (const gb of cell.grid_blockers ?? []) {
+        // A grid we cannot hold would silently leave its pins filled in: report it instead.
+        if (grids.length >= MAX_GRIDS || (entry.gridCount ?? 0) >= MAX_GRIDS_PER_PROTO
+            || protos.length >= MAX_PROTOTYPES) { gridOverflow = true; continue; }
+        if (entry.gridCount === undefined) { entry.gridStart = grids.length; entry.gridCount = 0; }
+        grids.push({ origin: gb.origin, pitch: gb.pitch, count: gb.count, envProto: protos.length });
+        entry.gridCount++;
+        protos.push({ region: gb.envelope, material_id: '', aabb: sceneBounds, isEnvelope: true });
+        registerRegion(gb.envelope, surfaceById);
+      }
+      if (instances.length < MAX_INSTANCES) instances.push({ dx: wc.offset[0], dy: wc.offset[1], dz: wc.offset[2], protoIdx, count: 1, q: wc.quat });
+    };
 
     if (usingInstancing) {
       for (const li of lis) {
@@ -1448,23 +1633,19 @@
         // world = assembly_offset + pin_offset; prototype stays one pin.
         const innerOffs = (li as LatticeInstance & { inner_offsets?: [number, number, number][] }).inner_offsets ?? [];
         const outerOffs = li.instances;
+        // One instance per pin covers all of its layers (see MAX_GROUP).
+        const pushPin = (dx: number, dy: number, dz: number) => {
+          for (let k = 0; k < numLayers; k += MAX_GROUP) {
+            if (instances.length >= MAX_INSTANCES) return;
+            instances.push({ dx, dy, dz, protoIdx: baseProtoIdx + k, count: Math.min(MAX_GROUP, numLayers - k) });
+          }
+        };
         if (innerOffs.length > 0) {
           for (const a of outerOffs) {
-            for (const pin of innerOffs) {
-              const dx = a[0] + pin[0], dy = a[1] + pin[1], dz = a[2] + pin[2];
-              for (let k = 0; k < numLayers; k++) {
-                if (instances.length >= MAX_INSTANCES) break;
-                instances.push({ dx, dy, dz, protoIdx: baseProtoIdx + k });
-              }
-            }
+            for (const pin of innerOffs) pushPin(a[0] + pin[0], a[1] + pin[1], a[2] + pin[2]);
           }
         } else {
-          for (const off of outerOffs) {
-            for (let k = 0; k < numLayers; k++) {
-              if (instances.length >= MAX_INSTANCES) break;
-              instances.push({ dx: off[0], dy: off[1], dz: off[2], protoIdx: baseProtoIdx + k });
-            }
-          }
+          for (const off of outerOffs) pushPin(off[0], off[1], off[2]);
         }
       }
       const latticeNames = latticeCellNameSet(lis);
@@ -1484,19 +1665,13 @@
         // instancing; pin-vs-fill priority in the shader restores visibility.
         let region = cell.region;
         // The plane-only stand-in is for the root moderator fill. An instanced (rotated)
-        // cell is a real object in its own local frame: keep its exact region.
-        const simplified = wc.instanced ? null : planeOnlyRegion(region, surfaceById);
+        // cell is a real object in its own local frame: keep its exact region. So is a
+        // cell cut by pin grids.
+        const gridded = (cell.grid_blockers?.length ?? 0) > 0;
+        const standIn = !wc.instanced && !gridded;
+        const simplified = standIn ? planeOnlyRegion(region, surfaceById) : null;
         if (simplified) region = simplified;
-        const protoIdx = protos.length;
-        protos.push({
-          region,
-          material_id: cell.material_id,
-          aabb: cellAABB(region, surfaceById, sceneBounds),
-          isFill: !wc.instanced,
-          name: cell.name ?? undefined,
-        });
-        registerRegion(region, surfaceById);
-        if (instances.length < MAX_INSTANCES) instances.push({ dx: wc.offset[0], dy: wc.offset[1], dz: wc.offset[2], protoIdx, q: wc.quat });
+        addCell(wc, region, standIn);
       }
     } else {
       for (const wc of worldCells) {
@@ -1504,18 +1679,20 @@
         const key = visibilityKey(cell.name);
         if (key && !isVisible(key)) continue;
         if (protos.length >= MAX_PROTOTYPES) break;
-        const protoIdx = protos.length;
-        protos.push({ region: cell.region, material_id: cell.material_id!, aabb: cellAABB(cell.region, surfaceById, sceneBounds), isFill: false, name: cell.name ?? undefined });
-        registerRegion(cell.region, surfaceById);
-        if (instances.length < MAX_INSTANCES) instances.push({ dx: wc.offset[0], dy: wc.offset[1], dz: wc.offset[2], protoIdx, q: wc.quat });
+        addCell(wc, cell.region, false);
       }
     }
 
     // Pack the surface table now that every visible proto/fill has registered what it uses.
-    const surfMeta = u.uSurfMeta.value as THREE.Vector4[];
-    const surfParams = u.uSurfParams.value as THREE.Vector4[];
-    surfacesUsed.forEach((s, i) => { const packed = packSurface(s); surfMeta[i].set(packed.type, packed.b, packed.c, 0); surfParams[i].copy(packed.v); });
-    for (let i = surfacesUsed.length; i < MAX_SURFACES; i++) { surfMeta[i].set(-1, 0, 0, 0); surfParams[i].set(0, 0, 0, 0); }
+    const surfTab = allocTable(SURF_TEX_W, 2 * surfacesUsed.length);
+    surfacesUsed.forEach((sf, i) => {
+      const packed = packSurface(sf);
+      surfTab.data.set([packed.v.x, packed.v.y, packed.v.z, packed.v.w], 2 * i * 4);
+      surfTab.data.set([packed.type, packed.b, packed.c, 0], (2 * i + 1) * 4);
+    });
+    surfTexture?.dispose();
+    surfTexture = tableTexture(surfTab);
+    u.uSurfTex.value = surfTexture; u.uSurfTexH.value = surfTab.height;
     u.uSurfCount.value = surfacesUsed.length;
     truncatedSurfaces = surfOverflow;
 
@@ -1524,7 +1701,8 @@
     // is world-space, matching what the shader actually renders.
     lastDebugBoxes = protos
       .map((p, pi) => {
-        const inst = instances.find((ins) => ins.protoIdx === pi);
+        if (p.isEnvelope) return null;
+        const inst = instances.find((ins) => pi >= ins.protoIdx && pi < ins.protoIdx + ins.count);
         const offset = inst ? { dx: inst.dx, dy: inst.dy, dz: inst.dz } : { dx: 0, dy: 0, dz: 0 };
         const [r, g, b] = resolveMaterialColor(p.material_id);
         return {
@@ -1533,66 +1711,76 @@
           aabb: transformAABB(p.aabb, [offset.dx, offset.dy, offset.dz], inst?.q ?? QUAT_IDENTITY),
         };
       })
-      .filter((b) => Number.isFinite(b.aabb.xMin) && Number.isFinite(b.aabb.xMax));
+      .filter((b): b is DebugBoxEntry => b !== null && Number.isFinite(b.aabb.xMin) && Number.isFinite(b.aabb.xMax));
 
     truncatedProtos = protos.length >= MAX_PROTOTYPES;
     truncatedInstances = instances.length >= MAX_INSTANCES;
 
-    const protoColor = u.uProtoColor.value as THREE.Color[];
-    const protoTokenCount = u.uProtoTokenCount.value as number[];
-    const protoIsFill = u.uProtoIsFill.value as number[];
-    const texData = new Float32Array(MAX_TOKENS_PER_PROTO * MAX_PROTOTYPES * 4);
+    const protoTab = allocTable(PROTO_TEX_W, 2 * protos.length);
+    const protoTokenCount: number[] = [];
+    const tokRows = Math.max(1, protos.length);
+    const texData = new Float32Array(MAX_TOKENS_PER_PROTO * tokRows * 4);
     let anyTokenTrunc = false;
     const legendSeen = new Map<string, string>();
     protos.forEach((proto, pi) => {
       const [r, g, b] = resolveMaterialColor(proto.material_id);
-      protoColor[pi].setRGB(r, g, b);
-      if (!legendSeen.has(proto.material_id)) legendSeen.set(proto.material_id, `#${protoColor[pi].getHexString()}`);
-      protoIsFill[pi] = proto.isFill ? 1 : 0;
+      if (!proto.isEnvelope && !legendSeen.has(proto.material_id)) legendSeen.set(proto.material_id, `#${new THREE.Color(r, g, b).getHexString()}`);
       const tokens: number[] = [];
       flattenRegion(proto.region, surfIndex, tokens);
       const pairCount = tokens.length / 2;
       const used = Math.min(pairCount, MAX_TOKENS_PER_PROTO);
       if (pairCount > MAX_TOKENS_PER_PROTO) anyTokenTrunc = true;
       protoTokenCount[pi] = used;
+      protoTab.data.set([r, g, b, proto.isFill ? 1 : 0], 2 * pi * 4);
+      protoTab.data.set([used, proto.gridStart ?? 0, proto.gridCount ?? 0, 0], (2 * pi + 1) * 4);
       for (let p = 0; p < used; p++) {
         const texelIdx = (pi * MAX_TOKENS_PER_PROTO + p) * 4;
         texData[texelIdx] = tokens[p * 2]; texData[texelIdx + 1] = tokens[p * 2 + 1];
       }
     });
-    for (let pi = protos.length; pi < MAX_PROTOTYPES; pi++) { protoColor[pi].setRGB(0, 0, 0); protoTokenCount[pi] = 0; protoIsFill[pi] = 0; }
     truncatedTokens = anyTokenTrunc;
+    const gridTab = allocTable(GRID_TEX_W, 2 * grids.length);
+    grids.forEach((g, i) => {
+      gridTab.data.set([g.origin[0], g.origin[1], g.pitch[0], g.pitch[1]], 2 * i * 4);
+      gridTab.data.set([g.count[0], g.count[1], g.envProto, 0], (2 * i + 1) * 4);
+      // The shader tests an envelope with at most MAX_EXACT_TOKENS tokens.
+      if (protoTokenCount[g.envProto] > MAX_EXACT_TOKENS) gridOverflow = true;
+    });
+    truncatedGrids = gridOverflow;
     prototypeCount = protos.length; instanceCount = instances.length;
     materialLegend = [...legendSeen.entries()].map(([id, color]) => ({ id, color }));
     u.uProtoCount.value = protos.length;
+    protoTexture?.dispose(); protoTexture = tableTexture(protoTab);
+    u.uProtoTex.value = protoTexture; u.uProtoTexH.value = protoTab.height;
+    gridTexture?.dispose(); gridTexture = tableTexture(gridTab);
+    u.uGridTex.value = gridTexture; u.uGridTexH.value = gridTab.height;
 
     tokenTexture?.dispose();
-    tokenTexture = new THREE.DataTexture(texData, MAX_TOKENS_PER_PROTO, MAX_PROTOTYPES, THREE.RGBAFormat, THREE.FloatType);
-    tokenTexture.magFilter = THREE.NearestFilter; tokenTexture.minFilter = THREE.NearestFilter;
-    tokenTexture.generateMipmaps = false; tokenTexture.needsUpdate = true;
-    u.uTokenTex.value = tokenTexture;
+    tokenTexture = tableTexture({ data: texData, width: MAX_TOKENS_PER_PROTO, height: tokRows });
+    u.uTokenTex.value = tokenTexture; u.uTokTexH.value = tokRows;
 
-    const instData = new Float32Array(MAX_INSTANCES * 4 * 2);   // 2 rows: offset+proto, quaternion
+    const instTab = allocTable(INST_TEX_W, 2 * instances.length);   // 2 texels per instance
+    const instData = instTab.data;
     const instanceBoxes: AxisBounds[] = [];
-    // Row 1 (second MAX_INSTANCES*4 floats) holds each instance's rotation quaternion.
-    // Default it to identity for EVERY slot so unused/unrotated instances are no-ops.
-    const quatRow = MAX_INSTANCES * 4;
-    for (let i = 0; i < MAX_INSTANCES; i++) instData[quatRow + i * 4 + 3] = 1;
+    // Texel 2i = (offset, first prototype + layer count), texel 2i+1 = rotation quaternion
+    // (identity for an unrotated instance).
     instances.forEach((inst, i) => {
-      instData[i * 4] = inst.dx; instData[i * 4 + 1] = inst.dy; instData[i * 4 + 2] = inst.dz; instData[i * 4 + 3] = inst.protoIdx;
       const q = inst.q ?? QUAT_IDENTITY;
-      instData[quatRow + i * 4] = q[0]; instData[quatRow + i * 4 + 1] = q[1]; instData[quatRow + i * 4 + 2] = q[2]; instData[quatRow + i * 4 + 3] = q[3];
-      // The BVH needs the WORLD box of the (possibly rotated) local AABB.
-      instanceBoxes.push(transformAABB(protos[inst.protoIdx].aabb, [inst.dx, inst.dy, inst.dz], q));
+      instData.set([inst.dx, inst.dy, inst.dz, inst.protoIdx + GROUP_STRIDE * inst.count], 2 * i * 4);
+      instData.set([q[0], q[1], q[2], q[3]], (2 * i + 1) * 4);
+      // The leaf box has to hold every layer the instance covers; the BVH needs the WORLD
+      // box of the (possibly rotated) local AABB.
+      let box = protos[inst.protoIdx].aabb;
+      for (let m = 1; m < inst.count; m++) box = unionAABB(box, protos[inst.protoIdx + m].aabb);
+      instanceBoxes.push(transformAABB(box, [inst.dx, inst.dy, inst.dz], q));
     });
     instanceTexture?.dispose();
-    instanceTexture = new THREE.DataTexture(instData, MAX_INSTANCES, 2, THREE.RGBAFormat, THREE.FloatType);
-    instanceTexture.magFilter = THREE.NearestFilter; instanceTexture.minFilter = THREE.NearestFilter;
-    instanceTexture.generateMipmaps = false; instanceTexture.needsUpdate = true;
-    u.uInstanceTex.value = instanceTexture; u.uInstanceCount.value = instances.length;
+    instanceTexture = tableTexture(instTab);
+    u.uInstanceTex.value = instanceTexture; u.uInstTexH.value = instTab.height; u.uInstanceCount.value = instances.length;
 
     const tBvh0 = performance.now();
-    const bvhTexData = new Float32Array(3 * MAX_BVH_NODES * 4);
+    const bvhTab = allocTable(BVH_TEX_W, 3 * Math.min(MAX_BVH_NODES, Math.max(1, 2 * instances.length)));
+    const bvhTexData = bvhTab.data;
     let bvhNodeCount = 0;
     truncatedBvh = false;
     if (instances.length > 0) {
@@ -1604,10 +1792,8 @@
     console.log(`[perf] BVH build: ${(performance.now() - tBvh0).toFixed(2)}ms, nodes=${bvhNodeCount}, protos=${protos.length}, instances=${instances.length}, instancing=${usingInstancing}`);
 
     bvhTexture?.dispose();
-    bvhTexture = new THREE.DataTexture(bvhTexData, 3, MAX_BVH_NODES, THREE.RGBAFormat, THREE.FloatType);
-    bvhTexture.magFilter = THREE.NearestFilter; bvhTexture.minFilter = THREE.NearestFilter;
-    bvhTexture.generateMipmaps = false; bvhTexture.needsUpdate = true;
-    u.uBvhTex.value = bvhTexture;
+    bvhTexture = tableTexture(bvhTab);
+    u.uBvhTex.value = bvhTexture; u.uBvhTexH.value = bvhTab.height;
 
     if (!hasFramedOnce) { resetCamera(); hasFramedOnce = true; } else render();
   }
@@ -1730,7 +1916,7 @@
   {/if}
   {#if loading}<div class="badge">Loading CSG…</div>{/if}
   {#if loadError}<div class="badge error">{loadError}</div>{/if}
-  {#if truncatedSurfaces || truncatedProtos || truncatedInstances || truncatedTokens || truncatedBvh}
+  {#if truncatedSurfaces || truncatedProtos || truncatedInstances || truncatedTokens || truncatedBvh || truncatedGrids}
     <div class="badge warning">Geometry exceeds viewer capacity (max {MAX_PROTOTYPES} prototypes / {MAX_INSTANCES} instances) — partial render.</div>
   {/if}
 </div>

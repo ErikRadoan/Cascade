@@ -31,12 +31,25 @@ def _cell_to_dict(c) -> dict:
     written to OpenMC; the viewer must apply OpenMC's convention (see
     CsgViewportPanel.svelte, eulerXyzToQuat).
     """
+    # A cell the viewer can draw compactly is sent as its smaller ``region`` plus the
+    # ``grid_blockers`` still to be cut out of it (see GridBlocker), so the payload does
+    # not grow with the number of pins removed from a body.
     d = {
         "id": c.id,
         "material_id": c.material_id,
         "name": c.name,
-        "region": region_to_json(c.region),
+        "region": region_to_json(c.viewer.region if c.viewer else c.region),
     }
+    if c.viewer and c.viewer.grids:
+        d["grid_blockers"] = [
+            {
+                "origin": list(g.origin),
+                "pitch": list(g.pitch),
+                "count": list(g.count),
+                "envelope": region_to_json(g.envelope),
+            }
+            for g in c.viewer.grids
+        ]
     if c.universe_id is not None and c.universe_id != ROOT_UNIVERSE:
         d["universe_id"] = c.universe_id
     if c.fill is not None:

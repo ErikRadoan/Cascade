@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import math
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from ..domain.geometry import (
@@ -39,6 +40,7 @@ from ..domain.geometry import (
     CascadeGeometry,
     Cell,
     Complement,
+    GridBlocker,
     Inside,
     Intersection,
     LatticeInstance,
@@ -47,6 +49,7 @@ from ..domain.geometry import (
     Surface,
     SurfaceType,
     Union,
+    ViewerCut,
     intersection_of,
     region_from_yaml_dict,
     union_of,
@@ -54,7 +57,7 @@ from ..domain.geometry import (
 from . import primitives, templates
 from .primitives import translate_params
 from .schema.base import BaseComponentSchema
-from ..domain.bounds import Bounds, BoundsIndex, region_bounds
+from ..domain.bounds import Bounds, BoundsIndex, hull_bounds, region_bounds
 from .schema.boolean import BooleanPlacementSchema
 from .schema.box import BoxSchema
 from .schema.cell import CellSchema
@@ -111,6 +114,11 @@ class Context:
 
     lattice_instances: list[LatticeInstance] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+
+    # Cell id -> the pin grid it belongs to, for cells of an unrotated
+    # SquareLattice expanded as a BooleanPlacement child. Lets a cut by that
+    # lattice be described to the viewer as one grid (see GridBlocker).
+    grid_of_cell: dict[str, "_GridInfo"] = field(default_factory=dict)
 
     # Rotated-instance bookkeeping (see _fill_instance / _finish_rotated_instances).
     # Every fill cell stamped into the ROOT universe: (confining sphere id,
@@ -923,6 +931,57 @@ def _lattice_reach(
     return max((math.sqrt(x ** 2 + y ** 2 + z ** 2) + pin_radius for x, y, z in centres), default=0.0)
 
 
+def _register_grid(
+    schema: SquareLatticeSchema | HexLatticeSchema,
+    objects: list[SceneObject],
+    offset: Vec3,
+    index: _SchemaIndex,
+    ctx: Context,
+) -> None:
+    """Remember that these cells are the pins of a regular xy grid.
+
+    Only a plain (unrotated, single-level) SquareLattice qualifies: its pins sit
+    exactly on ``origin + (i * pitch_x, j * pitch_y)``, so the viewer can find the
+    nearest pin by arithmetic. Each pin must also fit inside its own grid cell,
+    otherwise "the nearest pin" is not necessarily the one a point lies in.
+    Anything else is simply left alone and cut pin by pin, as before.
+    """
+    if not isinstance(schema, SquareLatticeSchema) or schema.template in index.lattices:
+        return
+    cells = [o for o in objects if isinstance(o, Cell)]
+    pins = schema.nx * schema.ny
+    if not cells or len(cells) % pins:
+        return
+    layers = len(cells) // pins
+
+    known = {**ctx.shared_surfaces, **{o.id: o for o in objects if isinstance(o, Surface)}}
+    first_pin = [
+        _Part(c.region, c.material_id, region_bounds(c.region, known)) for c in cells[:layers]
+    ]
+    merged = _collapse_stacks(first_pin, known)
+    if len(merged) != 1:
+        return
+    envelope = merged[0]
+
+    ox, oy = schema.origin_x + offset[0], schema.origin_y + offset[1]
+    px, py = schema.pitch_x, schema.pitch_y
+    b = envelope.bounds
+    if b is None or not all(math.isfinite(v) for v in b[:4]):
+        return
+    tol = 1e-9
+    if (b[0] < ox - px / 2 - tol or b[1] > ox + px / 2 + tol
+            or b[2] < oy - py / 2 - tol or b[3] > oy + py / 2 + tol):
+        return
+
+    info = _GridInfo(
+        GridBlocker(origin=(ox, oy), pitch=(px, py), count=(schema.nx, schema.ny),
+                    envelope=envelope.region),
+        pins=pins, layers=layers,
+    )
+    for c in cells:
+        ctx.grid_of_cell[c.id] = info
+
+
 def _expand_boolean_children(
     schema: BooleanPlacementSchema,
     name: str,
@@ -988,6 +1047,7 @@ def _expand_boolean_children(
             del ctx.lattice_instances[instances_before:]
             if any(offset):
                 objects, _ = _translate(objects, *offset, ctx)
+            _register_grid(child, objects, offset, index, ctx)
         else:
             raise TypeError(
                 f"BooleanPlacement '{name}': child '{child_name}' has unsupported type "
@@ -1012,26 +1072,200 @@ def _empties_result(op: str, position: int) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class _Part:
-    """One cell that takes part in a boolean, with where it can possibly be."""
+    """One cell that takes part in a boolean, with where it can possibly be.
+
+    ``members`` are the original cell regions this part stands for. They are
+    only more than ``(region,)`` for a collapsed stack (see ``_collapse_stacks``),
+    where ``region`` is the stack's single envelope and ``members`` are its layers.
+    """
 
     region: Region
     material_id: str | None
     bounds: Bounds | None
+    members: tuple[Region, ...] = ()
+    # The pin grid this cell belongs to, and whether this part is that pin's
+    # complete envelope (every layer merged) rather than a single layer.
+    lattice: "_GridInfo | None" = None
+    whole_pin: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.members:
+            object.__setattr__(self, "members", (self.region,))
 
 
-def _clipped(region: Region, blockers: list[Region]) -> Region | None:
+@dataclass(frozen=True, slots=True, eq=False)
+class _GridInfo:
+    """A lattice of identical pins that the viewer can fold instead of unrolling."""
+
+    blocker: GridBlocker
+    pins: int      # nx * ny
+    layers: int    # cells per pin
+
+
+# A cut is described as a grid only when it removes at least this many pins from
+# the cell; for a handful the flat region is as cheap and needs no grid support.
+_GRID_MIN_PINS = 4
+
+
+_NESTABLE = (
+    SurfaceType.CYLINDER_X, SurfaceType.CYLINDER_Y, SurfaceType.CYLINDER_Z, SurfaceType.SPHERE,
+)
+
+
+def _nested_surfaces(inner: Surface | None, outer: Surface | None) -> bool:
+    """True when Inside(inner) is certainly contained in Inside(outer).
+
+    Only concentric shapes of the same kind (same centre/axis, growing radius)
+    are recognised; anything else answers False, which is always safe.
+    """
+    if inner is None or outer is None or inner.type_ is not outer.type_:
+        return False
+    if inner.type_ not in _NESTABLE:
+        return False
+    keys = set(inner.params) | set(outer.params)
+    try:
+        for key in keys - {"r"}:
+            if float(inner.params[key]) != float(outer.params[key]):
+                return False
+        return float(inner.params["r"]) <= float(outer.params["r"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _layer_link(region: Region) -> tuple[str | None, str, list[Region]] | None:
+    """Read ``region`` as one concentric layer: ``(inner_id, outer_id, tail)``.
+
+    A layer is ``Inside(outer)`` (the innermost one, ``inner_id`` None) or
+    ``Outside(inner) Inside(outer)``, followed by shared ``tail`` terms such as
+    the axial planes. Anything else is not a layer.
+    """
+    if not isinstance(region, Intersection):
+        return None
+    items = region.regions
+    if items and isinstance(items[0], Inside):
+        return None, items[0].surface_id, items[1:]
+    if len(items) >= 2 and isinstance(items[0], Outside) and isinstance(items[1], Inside):
+        return items[0].surface_id, items[1].surface_id, items[2:]
+    return None
+
+
+def _collapse_stacks(
+    parts: list[_Part], surfaces: Mapping[str, Surface] | None,
+) -> list[_Part]:
+    """Merge each pin's concentric layers into one envelope blocker.
+
+    A FuelPin is a pellet, a gap and a clad: three cells that are nested
+    cylinders with the same axial planes. As a *blocker* (something other cells
+    are cut by) their union is just the outermost cylinder with those planes,
+    so cutting by one envelope is the same volume as cutting by every layer, at
+    about a quarter of the region length. Only a run that is verifiably nested
+    and shares its tail terms is merged; everything else passes through.
+    """
+    if not surfaces:
+        return list(parts)
+
+    out: list[_Part] = []
+    run: list[tuple[_Part, str, list[Region]]] = []   # (part, outer_id, tail)
+
+    def flush() -> None:
+        if len(run) > 1:
+            outer_id, tail = run[-1][1], run[-1][2]
+            bounds = run[0][0].bounds
+            for part, _, _ in run[1:]:
+                bounds = hull_bounds(bounds, part.bounds)
+            lattice = run[0][0].lattice
+            if any(part.lattice is not lattice for part, _, _ in run):
+                lattice = None
+            out.append(_Part(
+                Intersection([Inside(outer_id), *tail]), None, bounds,
+                tuple(m for part, _, _ in run for m in part.members),
+                lattice=lattice,
+                whole_pin=lattice is not None and len(run) == lattice.layers,
+            ))
+        else:
+            out.extend(part for part, _, _ in run)
+        run.clear()
+
+    for part in parts:
+        link = _layer_link(part.region)
+        if link is None:
+            flush()
+            out.append(part)
+            continue
+        inner_id, outer_id, tail = link
+        if run:
+            _, prev_outer, prev_tail = run[-1]
+            chained = (
+                inner_id == prev_outer
+                and [repr(t) for t in tail] == [repr(t) for t in prev_tail]
+                and _nested_surfaces(surfaces.get(prev_outer), surfaces.get(outer_id))
+            )
+            if not chained:
+                flush()
+        run.append((part, outer_id, tail))
+    flush()
+    return out
+
+
+def _clipped(region: Region, blockers: list[_Part]) -> Region | None:
     """``region`` minus ``blockers``; None when a blocker is the region itself."""
     if not blockers:
         return region
-    if any(b is region or b == region for b in blockers):
+    if any(m is region or m == region for b in blockers for m in b.members):
         return None
-    return intersection_of([region, Complement(union_of(blockers))])
+    return intersection_of([region, Complement(union_of([b.region for b in blockers]))])
+
+
+def _whole_pin_counts(blockers: list[_Part]) -> dict[int, int]:
+    """How many complete pin envelopes each grid has among ``blockers`` (keyed by id)."""
+    counts: dict[int, int] = {}
+    for b in blockers:
+        if b.whole_pin and b.lattice is not None:
+            counts[id(b.lattice)] = counts.get(id(b.lattice), 0) + 1
+    return counts
+
+
+def _clip(
+    region: Region, hits: list[_Part], whole: dict[int, int],
+) -> tuple[Region | None, ViewerCut | None]:
+    """``_clipped`` plus, when it helps, the same cut in the viewer's compact form.
+
+    The exact region always lists every blocker (OpenMC needs it). The viewer
+    form replaces the pins of a whole grid by that grid: valid only when every
+    pin of the grid is among the blockers (so the grid removes exactly the
+    pins listed) and enough of them touch this cell to be worth it. Pins that
+    don't touch the cell can't change it, so cutting all of them is the same cut.
+    """
+    exact = _clipped(region, hits)
+    if exact is None or not hits:
+        return exact, None
+
+    touching: dict[int, tuple[_GridInfo, int]] = {}
+    for h in hits:
+        if h.whole_pin and h.lattice is not None:
+            info, n = touching.get(id(h.lattice), (h.lattice, 0))
+            touching[id(h.lattice)] = (info, n + 1)
+    grids = [
+        info for info, n in touching.values()
+        if n >= _GRID_MIN_PINS and whole.get(id(info), 0) == info.pins
+    ]
+    if not grids:
+        return exact, None
+
+    gridded = {id(g) for g in grids}
+    rest = [h for h in hits if not (h.whole_pin and id(h.lattice) in gridded)]
+    view = _clipped(region, rest)
+    if view is None:
+        return exact, None
+    return exact, ViewerCut(view, tuple(g.blocker for g in grids))
 
 
 def _resolve_overlaps(
-    op: str, operands: list[list[_Part]],
-) -> tuple[list[tuple[Region, str | None]], int]:
-    """The (region, material) pieces of a boolean, plus how many cells were clipped against.
+    op: str,
+    operands: list[list[_Part]],
+    surfaces: Mapping[str, Surface] | None = None,
+) -> tuple[list[tuple[Region, str | None, ViewerCut | None]], int]:
+    """The (region, material, viewer cut) pieces of a boolean, plus how many cells were clipped against.
 
     Every operand is a list of cells (a FuelPin is several). The result keeps
     each surviving cell's own material, and the pieces never overlap:
@@ -1047,39 +1281,46 @@ def _resolve_overlaps(
     could overlap it, so children that don't touch pass through untouched. The
     overlapping cells are found with a ``BoundsIndex`` rather than by testing
     every pair, so the cost grows with the number of cells, not its square.
+
+    ``surfaces`` lets cutters be simplified: a pin's concentric layers cut the
+    same volume as one envelope, so they are merged into a single blocker
+    (``_collapse_stacks``). Without it every layer blocks on its own.
     """
-    pieces: list[tuple[Region, str | None]] = []
+    pieces: list[tuple[Region, str | None, ViewerCut | None]] = []
     clip_terms = 0
 
     if op == "union":
-        # One index over every cell in operand order. A cell is clipped only
-        # against cells of EARLIER operands, i.e. indices below its operand's start.
-        all_parts = [part for parts in operands for part in parts]
-        index = BoundsIndex([part.bounds for part in all_parts])
+        # One index over every blocker in operand order. A cell is clipped only
+        # against blockers of EARLIER operands, i.e. indices below its operand's start.
+        blockers_by_operand = [_collapse_stacks(parts, surfaces) for parts in operands]
+        all_blockers = [b for blockers in blockers_by_operand for b in blockers]
+        whole = _whole_pin_counts(all_blockers)
+        index = BoundsIndex([b.bounds for b in all_blockers])
         start = 0
-        for parts in operands:
+        for parts, blockers in zip(operands, blockers_by_operand):
             for part in parts:
-                blockers = [
-                    all_parts[i].region
+                hits = [
+                    all_blockers[i]
                     for i in index.overlapping(part.bounds)
                     if i < start
                 ]
-                clip_terms += len(blockers)
-                region = _clipped(part.region, blockers)
+                clip_terms += len(hits)
+                region, cut = _clip(part.region, hits, whole)
                 if region is not None:
-                    pieces.append((region, part.material_id))
-            start += len(parts)
+                    pieces.append((region, part.material_id, cut))
+            start += len(blockers)
 
     elif op == "subtraction":
         kept, *cutters = operands
-        cut_parts = [p for parts in cutters for p in parts]
+        cut_parts = [b for parts in cutters for b in _collapse_stacks(parts, surfaces)]
+        whole = _whole_pin_counts(cut_parts)
         index = BoundsIndex([p.bounds for p in cut_parts])
         for part in kept:
-            blockers = [cut_parts[i].region for i in index.overlapping(part.bounds)]
-            clip_terms += len(blockers)
-            region = _clipped(part.region, blockers)
+            hits = [cut_parts[i] for i in index.overlapping(part.bounds)]
+            clip_terms += len(hits)
+            region, cut = _clip(part.region, hits, whole)
             if region is not None:
-                pieces.append((region, part.material_id))
+                pieces.append((region, part.material_id, cut))
 
     elif op == "intersection":
         first, *others = operands
@@ -1094,7 +1335,7 @@ def _resolve_overlaps(
                 clip_terms += len(hits)
                 region = intersection_of([region, union_of(hits)])
             if region is not None:
-                pieces.append((region, part.material_id))
+                pieces.append((region, part.material_id, None))
 
     else:
         raise ValueError(f"Unknown boolean op '{op}'")
@@ -1143,10 +1384,14 @@ def _merge_children(
 
     known = {**ctx.shared_surfaces, **{surface.id: surface for surface in surfaces}}
     operands = [
-        [_Part(c.region, c.material_id, region_bounds(c.region, known)) for c in cells]
+        [
+            _Part(c.region, c.material_id, region_bounds(c.region, known),
+                  lattice=ctx.grid_of_cell.get(c.id))
+            for c in cells
+        ]
         for cells in selected
     ]
-    pieces, clip_terms = _resolve_overlaps(op, operands)
+    pieces, clip_terms = _resolve_overlaps(op, operands, known)
     if not pieces:
         return list(surfaces)
 
@@ -1161,8 +1406,9 @@ def _merge_children(
             region=region,
             material_id=material,
             name=name if len(pieces) == 1 else f"{name}_layer{k}",
+            viewer=cut,
         )
-        for k, (region, material) in enumerate(pieces)
+        for k, (region, material, cut) in enumerate(pieces)
     ]
     return [*surfaces, *cells]
 

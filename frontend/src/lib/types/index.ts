@@ -369,6 +369,19 @@ export type RegionNode =
   | { op: 'or'; items: RegionNode[] }
   | { op: 'not'; item: RegionNode };
 
+/**
+ * A regular xy grid of identical pins cut out of a cell (viewer-only form; the
+ * backend's ViewerCut). The cell is `region` minus every pin of every grid.
+ * `envelope` is ONE pin's whole volume on the surfaces of the pin at `origin`
+ * (grid index [0, 0]); the pin at [i, j] is that shifted by (i * pitch_x, j * pitch_y).
+ */
+export interface GridBlocker {
+  origin: [number, number];
+  pitch: [number, number];
+  count: [number, number];
+  envelope: RegionNode;
+}
+
 export interface CsgCell {
   id: string;
   material_id: string | null;
@@ -382,6 +395,8 @@ export interface CsgCell {
   fill?: string;
   translation?: [number, number, number];
   rotation?: [number, number, number];
+  /** Present when `region` leaves out pin grids that must still be cut away. */
+  grid_blockers?: GridBlocker[];
 }
 
 // ---------------------------------------------------------------------------
