@@ -97,6 +97,8 @@ def geometry_to_csg_dict(geom: CascadeGeometry) -> dict:
                 ],
                 "instances": [list(p) for p in li.instances],
                 "inner_offsets": [list(p) for p in li.inner_offsets],
+                # Absolute position of the prototype pin; null when unknown.
+                "origin": list(li.origin) if li.origin is not None else None,
             }
             for li in geom.lattice_instances
         ],

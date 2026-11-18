@@ -363,6 +363,10 @@ class LatticeInstance:
     prototype_cells: list[Cell] = field(default_factory=list)
     instances: list[tuple[float, float, float]] = field(default_factory=list)
     inner_offsets: list[tuple[float, float, float]] = field(default_factory=list)
+    # World position of the prototype pin (the first pin). ``instances`` and
+    # ``inner_offsets`` are relative to it. The viewer needs it to lay out a
+    # regular pin grid for its lattice fast path; None = unknown (older callers).
+    origin: tuple[float, float, float] | None = None
 
 
 @dataclass(slots=True)

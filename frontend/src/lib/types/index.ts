@@ -426,6 +426,12 @@ export interface LatticeInstance {
    * World placement = instances[i] + inner_offsets[j].
    */
   inner_offsets?: [number, number, number][];
+  /**
+   * World position of the prototype pin (the first pin); `instances` and
+   * `inner_offsets` are relative to it. Needed by the viewer's regular-grid
+   * lattice fast path. Absent/null = unknown, the viewer then uses per-pin instances.
+   */
+  origin?: [number, number, number] | null;
 }
 
 export interface CsgGeometry {

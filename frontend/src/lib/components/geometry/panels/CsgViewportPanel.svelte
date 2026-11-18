@@ -28,6 +28,7 @@
 
   import { onMount, onDestroy, untrack } from 'svelte';
   import * as THREE from 'three';
+  import { buildLatticeGrid, packLatticeGrid, pinEnvelope, LAT_TEXELS, type LatticeGrid } from '../latticeGrid';
   import { activeProject } from '../stores/projects.svelte.js';
   import { csgState, requestCsgRefresh } from '../stores/csg.svelte.js';
   // Same store ObjectPanel writes — keyns are `${projectId}:${placementName}`
@@ -59,6 +60,13 @@
   // this are split into several instances. The count rides in the instance's w, above the id.
   const MAX_GROUP = 8;
   const GROUP_STRIDE = 4096;
+  // Lattice leaf (see latticeGrid.ts): a rectangular pin grid is ONE BVH leaf and the shader walks
+  // the pitch cells a ray crosses. Steps bound the cells one ray may cross inside one assembly /
+  // across the assembly grid; buildLatticeGrid() refuses lattices that could exceed them.
+  const MAX_LATTICES = 64;
+  const MAX_LAT_LAYERS = MAX_GROUP;
+  const MAX_LAT_STEPS = 384;
+  const MAX_LAT_OUTER = 96;
   const MAX_GRIDS = 256;
   const MAX_GRIDS_PER_PROTO = 4;
   // Wrap widths (texels) of the linear tables above. BVH_TEX_W is a multiple of 3 so a node's
@@ -163,6 +171,28 @@
         const inner = planeOnlyRegion(node.item, surfaceById);
         return inner ? { op: 'not', item: inner } : null;
       }
+    }
+  }
+
+  /** True when a region describes a real SOLID, not a moderator fill.
+   *
+   *  planeOnlyRegion() is a stand-in for the moderator fill only (box planes minus
+   *  Outside(every pin)). Stripping is safe there because it only widens a cell that
+   *  loses every pin-vs-fill tie. For a real solid it is destructive: dropping
+   *  Inside(cylinder/sphere/cone/torus) turns a CylinderZ into a slab spanning the
+   *  whole scene footprint (the "brick"), and dropping a NOT(...) operand re-fills a
+   *  boolean subtraction. A fill never carries a positive curved-surface constraint
+   *  or a NOT, so either one means "keep the exact region".
+   */
+  function isSolidRegion(node: RegionNode, surfaceById: Map<string, CsgSurface>): boolean {
+    switch (node.op) {
+      case 'inside': {
+        const s = surfaceById.get(node.surface);
+        return !!s && s.type !== 'plane_x' && s.type !== 'plane_y' && s.type !== 'plane_z';
+      }
+      case 'outside': return false;
+      case 'not': return true;
+      case 'and': case 'or': return node.items.some((it) => isSolidRegion(it, surfaceById));
     }
   }
 
@@ -337,7 +367,9 @@
     return b;
   }
 
-  function cellAABB(region: RegionNode, surfaceById: Map<string, CsgSurface>, fallback: AxisBounds): AxisBounds {
+  /** Bounds of a cell. `padded = false` returns the exact surface extents (no safety margin); the
+   *  lattice fast path uses that to decide whether a pin really fits inside its pitch cell. */
+  function cellAABB(region: RegionNode, surfaceById: Map<string, CsgSurface>, fallback: AxisBounds, padded = true): AxisBounds {
     // Always accumulate bounds from surfaces referenced by the region (cylinders
     // give tight xy even when the cell also has Outside(...)). Only fall back
     // per-axis when that axis is missing — do NOT replace the whole box with
@@ -364,9 +396,9 @@
     // floor keeps flat/degenerate axes and float noise from producing a zero-width slab.
     const floor = AABB_PAD_FLOOR_FRACTION * Math.max(
       fallback.xMax - fallback.xMin, fallback.yMax - fallback.yMin, fallback.zMax - fallback.zMin, 1);
-    const padX = Math.max(0.02 * (b.xMax - b.xMin), floor);
-    const padY = Math.max(0.02 * (b.yMax - b.yMin), floor);
-    const padZ = Math.max(0.02 * (b.zMax - b.zMin), floor);
+    const padX = padded ? Math.max(0.02 * (b.xMax - b.xMin), floor) : 0;
+    const padY = padded ? Math.max(0.02 * (b.yMax - b.yMin), floor) : 0;
+    const padZ = padded ? Math.max(0.02 * (b.zMax - b.zMin), floor) : 0;
     return { xMin: b.xMin - padX, xMax: b.xMax + padX, yMin: b.yMin - padY, yMax: b.yMax + padY, zMin: b.zMin - padZ, zMax: b.zMax + padZ };
   }
 
@@ -402,15 +434,18 @@
     data[base] = x; data[base + 1] = y; data[base + 2] = z; data[base + 3] = w;
   }
 
-  function flattenBvh(root: BvhBuildNode, data: Float32Array): { count: number; truncated: boolean } {
+  /** Leaves with index >= latticeLeafBase are lattice leaves (kind 2); the rest are instances (kind 1).
+   *  The leaf's w in texel 1 holds the instance index, or the lattice index for a lattice leaf. */
+  function flattenBvh(root: BvhBuildNode, data: Float32Array, latticeLeafBase: number): { count: number; truncated: boolean } {
     let counter = 0;
     function assign(node: BvhBuildNode): number {
       const idx = counter++;
       if (idx >= MAX_BVH_NODES) return idx;
       const b = node.bounds;
-      writeBvhTexel(data, idx, 0, b.xMin, b.yMin, b.zMin, node.isLeaf ? 1 : 0);
+      const isLattice = node.isLeaf && node.instanceIndex >= latticeLeafBase;
+      writeBvhTexel(data, idx, 0, b.xMin, b.yMin, b.zMin, node.isLeaf ? (isLattice ? 2 : 1) : 0);
       if (node.isLeaf) {
-        writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, node.instanceIndex);
+        writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, isLattice ? node.instanceIndex - latticeLeafBase : node.instanceIndex);
         writeBvhTexel(data, idx, 2, 0, 0, 0, 0);
       } else {
         writeBvhTexel(data, idx, 1, b.xMax, b.yMax, b.zMax, 0);
@@ -495,6 +530,7 @@
   let surfTexture: THREE.DataTexture | null = null;
   let protoTexture: THREE.DataTexture | null = null;
   let gridTexture: THREE.DataTexture | null = null;
+  let latTexture: THREE.DataTexture | null = null;
 
   /** A zeroed float buffer for `texels` RGBA texels of a table wrapped at `width`. */
   function allocTable(width: number, texels: number): { data: Float32Array; width: number; height: number } {
@@ -529,6 +565,11 @@
     #define TOK_TEX_W ${MAX_TOKENS_PER_PROTO}.0
     #define MAX_TOKEN_ITERS ${MAX_TOKENS_PER_PROTO}
     #define MAX_GRIDS ${MAX_GRIDS}
+    #define LAT_TEX_W ${LAT_TEXELS}.0
+    #define LAT_STRIDE ${LAT_TEXELS}
+    #define MAX_LAT_LAYERS ${MAX_LAT_LAYERS}
+    #define MAX_LAT_STEPS ${MAX_LAT_STEPS}
+    #define MAX_LAT_OUTER ${MAX_LAT_OUTER}
     #define MAX_GROUP ${MAX_GROUP}
     #define GROUP_STRIDE ${GROUP_STRIDE}
     #define MAX_GRIDS_PER_PROTO ${MAX_GRIDS_PER_PROTO}
@@ -544,9 +585,9 @@
     uniform float uTanHalfFov, uAspect;
     uniform int uSurfCount;
     uniform int uProtoCount;
-    uniform sampler2D uTokenTex, uInstanceTex, uBvhTex, uSurfTex, uProtoTex, uGridTex;
+    uniform sampler2D uTokenTex, uInstanceTex, uBvhTex, uSurfTex, uProtoTex, uGridTex, uLatTex;
     // Heights (rows) of the tables above; their widths are the *_TEX_W defines.
-    uniform float uTokTexH, uInstTexH, uBvhTexH, uSurfTexH, uProtoTexH, uGridTexH;
+    uniform float uTokTexH, uInstTexH, uBvhTexH, uSurfTexH, uProtoTexH, uGridTexH, uLatTexH;
     uniform int uInstanceCount, uBvhNodeCount;
     uniform vec3 uSceneBMin, uSceneBMax;
     // Phase 1 (coincident faces). See epsAt()/sceneHit(). All three are set from JS.
@@ -842,6 +883,12 @@
     vec3 instToLocal(int instIdx, vec3 pWorld) {
       return qRotInv(fetchInstanceQuat(instIdx), pWorld - fetchInstance(instIdx).xyz);
     }
+    // A hit's placement is (instIdx, off): a normal instance (instIdx >= 0, off = its translation)
+    // or a lattice pin (instIdx = -1: identity rotation, off = the pin's offset from its prototype).
+    vec4 quatOf(int instIdx) { return instIdx < 0 ? vec4(0.0, 0.0, 0.0, 1.0) : fetchInstanceQuat(instIdx); }
+    vec3 candToLocal(int instIdx, vec3 off, vec3 pWorld) { return qRotInv(quatOf(instIdx), pWorld - off); }
+    // Lattice table: LAT_STRIDE texels per lattice (layout in latticeGrid.ts, packLatticeGrid).
+    vec4 latT(int l, int k) { return fetchLinear(uLatTex, l * LAT_STRIDE + k, LAT_TEX_W, uLatTexH); }
     vec4 fetchBvhTexel(int nodeIdx, int col) {
       return fetchLinear(uBvhTex, nodeIdx * 3 + col, BVH_TEX_W, uBvhTexH);
     }
@@ -1138,6 +1185,160 @@
       return best;
     }
 
+    // ======================================================================================
+    // Hit bookkeeping shared by the BVH instance leaves and the lattice leaf.
+    // ======================================================================================
+    // Candidates are every hit within tieAt() of the nearest one; ties are resolved by
+    // containment at the end of sceneHit(). Globals (not locals) so considerHit() can be shared.
+    float tBest;                    // nearest hit so far (tie group is [tBest, tBest + tieAt])
+    float candT[MAX_CAND]; int candProto[MAX_CAND]; int candInst[MAX_CAND]; vec3 candOff[MAX_CAND];
+    int candCount;
+
+    // Offer one hit: (depth, prototype, instance index or -1, translation of its frame).
+    void considerHit(float tHit, int protoIdx, int instIdx, vec3 off) {
+      float tTolM = (tBest < INF) ? tieAt(tBest) : 0.0;
+      // Clearly nearer than the whole current group -> start a new group.
+      if (tHit < tBest - tTolM) { candCount = 0; tBest = tHit; }
+      // Within the tie window -> keep as a candidate (never first-wins).
+      if (tHit <= tBest + tTolM) {
+        int slot = candCount;
+        if (candCount >= MAX_CAND) {
+          // Full: evict the farthest candidate if this one is nearer.
+          slot = 0; float worst = candT[0];
+          for (int c = 1; c < MAX_CAND; c++) { if (candT[c] > worst) { worst = candT[c]; slot = c; } }
+          if (tHit >= worst) slot = -1;
+        } else {
+          candCount++;
+        }
+        if (slot >= 0) { candT[slot] = tHit; candProto[slot] = protoIdx; candInst[slot] = instIdx; candOff[slot] = off; }
+        tBest = min(tBest, tHit);
+      }
+    }
+
+    // ======================================================================================
+    // Lattice leaf: a rectangular pin grid walked cell by cell.
+    // ======================================================================================
+    // The whole lattice is ONE BVH leaf. Instead of a BVH over every pin, the ray steps through
+    // the pitch cells it crosses (2D DDA, nearest first) and tests only the pin in each, so
+    // the cost follows the cells crossed, not the number of pins. A pin always fits inside
+    // its own cell (checked on the CPU, buildLatticeGrid), so cell (i, j) can only hold pin
+    // (i, j). Layers of one pin are tried in order and all feed considerHit(), exactly like
+    // the layers of an instance, so coincident layer faces still tie-resolve by containment.
+    //
+    // Pins of ONE assembly. [tA, tB] = depths at which the ray may be inside this assembly's
+    // xy footprint. pinLo = lower xy corner of pin cell (0,0); asmOff = offset (vs the
+    // prototype) of that cell's pin; ip = pin pitch; icnt = pin counts.
+    // bLo/bHi = one pin's exact box in the prototype frame; each cell's window is clipped to it
+    // (plus pad). env = pin envelope circle (centre xy, radius; radius 0 = none).
+    void latticePins(vec3 ro, vec3 rd, float tA, float tB, vec2 pinLo, vec2 asmOff, float offZ,
+                     vec2 ip, vec2 icnt, int baseProto, int nLayers, vec3 bLo, vec3 bHi, vec3 env) {
+      float pad = 4.0 * uEpsMin;
+      vec2 lo = pinLo - pad; vec2 hi = pinLo + icnt * ip + pad;
+      float tS = tA; float tE = tB;
+      // Clip the ray to the assembly's xy footprint.
+      if (abs(rd.x) < 1.0e-9) { if (ro.x < lo.x || ro.x > hi.x) return; }
+      else { float a = (lo.x - ro.x) / rd.x; float b = (hi.x - ro.x) / rd.x; tS = max(tS, min(a, b)); tE = min(tE, max(a, b)); }
+      if (abs(rd.y) < 1.0e-9) { if (ro.y < lo.y || ro.y > hi.y) return; }
+      else { float a = (lo.y - ro.y) / rd.y; float b = (hi.y - ro.y) / rd.y; tS = max(tS, min(a, b)); tE = min(tE, max(a, b)); }
+      if (tS >= tE) return;
+
+      vec2 cell = clamp(floor((ro.xy + rd.xy * tS - pinLo) / ip), vec2(0.0), icnt - 1.0);
+      vec2 stp = vec2(rd.x >= 0.0 ? 1.0 : -1.0, rd.y >= 0.0 ? 1.0 : -1.0);
+      vec2 nextB = pinLo + (cell + vec2(rd.x >= 0.0 ? 1.0 : 0.0, rd.y >= 0.0 ? 1.0 : 0.0)) * ip;
+      vec2 tMax = vec2(abs(rd.x) < 1.0e-9 ? INF : (nextB.x - ro.x) / rd.x,
+                       abs(rd.y) < 1.0e-9 ? INF : (nextB.y - ro.y) / rd.y);
+      vec2 tDelta = vec2(abs(rd.x) < 1.0e-9 ? INF : ip.x / abs(rd.x),
+                         abs(rd.y) < 1.0e-9 ? INF : ip.y / abs(rd.y));
+      float tCur = tS;
+      for (int s = 0; s < MAX_LAT_STEPS; s++) {
+        float tNext = min(min(tMax.x, tMax.y), tE);
+        // Front to back: once a hit is known, a cell entered beyond its tie window cannot win.
+        float tTol = (tBest < INF) ? tieAt(tBest) : 0.0;
+        if (tCur - pad > tBest + tTol) return;
+        float wLo = max(tCur - pad, tA);
+        float wHi = min(tNext + pad, tB);
+        vec3 off = vec3(asmOff + cell * ip, offZ);
+        // The ray only matters while it is inside THIS pin's box: skip cells it merely crosses
+        // (the gaps between pins) and start the exact test where it enters the box.
+        vec2 pbi = boxInterval(ro, rd, bLo + off - pad, bHi + off + pad);
+        // Then to the pin's envelope circle (env = centre xy, radius; radius 0 = none). A ray that
+        // only clips the box CORNER misses the circle and costs no exact test at all.
+        if (pbi.x <= pbi.y && env.z > 0.0) {
+          vec2 dc = ro.xy - (env.xy + off.xy);
+          float rr = env.z + 2.0 * pad;
+          float qa = dot(rd.xy, rd.xy);
+          float qc = dot(dc, dc) - rr * rr;
+          if (qa > 1.0e-12) {
+            float qb = dot(dc, rd.xy);
+            float disc = qb * qb - qa * qc;
+            if (disc < 0.0) pbi = vec2(INF, NEG_INF);
+            else { float sq = sqrt(disc); pbi = vec2(max(pbi.x, (-qb - sq) / qa), min(pbi.y, (-qb + sq) / qa)); }
+          } else if (qc > 0.0) pbi = vec2(INF, NEG_INF);
+        }
+        if (pbi.x <= pbi.y) {
+          wLo = max(wLo, pbi.x); wHi = min(wHi, pbi.y);
+          vec3 roL = ro - off;
+          for (int m = 0; m < MAX_LAT_LAYERS; m++) {
+            if (m >= nLayers) break;
+            float tTolM = (tBest < INF) ? tieAt(tBest) : 0.0;
+            float wH = min(wHi, tBest + tTolM);
+            if (wLo >= wH) break;
+            float hitT = leafExact(baseProto + m, roL, rd, wLo, wH);
+            if (hitT < INF && hitT >= 0.0) considerHit(hitT, baseProto + m, -1, off);
+          }
+        }
+        if (tNext >= tE) return;
+        if (tMax.x < tMax.y) { cell.x += stp.x; tMax.x += tDelta.x; } else { cell.y += stp.y; tMax.y += tDelta.y; }
+        if (cell.x < 0.0 || cell.y < 0.0 || cell.x >= icnt.x || cell.y >= icnt.y) return;
+        tCur = tNext;
+      }
+    }
+
+    // One lattice leaf. A flat lattice is one assembly; a nested one walks the assembly grid
+    // the same way and runs latticePins() for each assembly the ray crosses. [tS0, tE0] is the
+    // ray's span inside the leaf's box.
+    void latticeVisit(int lat, vec3 ro, vec3 rd, float tS0, float tE0) {
+      vec4 a = latT(lat, 0); vec4 b = latT(lat, 1); vec4 c = latT(lat, 2);
+      vec4 d = latT(lat, 3); vec4 e = latT(lat, 4);
+      vec2 oLo = a.xy; vec2 op = a.zw; vec2 ocnt = b.xy; vec2 ip = b.zw; vec2 icnt = c.xy;
+      int baseProto = int(c.z + 0.5); int nLayers = int(c.w + 0.5);
+      vec2 pinLo0 = d.xy; float offZ = d.z; vec2 asmOff0 = e.xy;
+      vec3 bLo = latT(lat, 5).xyz; vec3 bHi = latT(lat, 6).xyz;
+      vec3 env = vec3(e.zw, d.w);   // envelope circle: centre xy, radius
+      if (ocnt.x < 1.5 && ocnt.y < 1.5) {
+        latticePins(ro, rd, tS0, tE0, pinLo0, asmOff0, offZ, ip, icnt, baseProto, nLayers, bLo, bHi, env);
+        return;
+      }
+      float pad = 4.0 * uEpsMin;
+      vec2 lo = oLo - pad; vec2 hi = oLo + ocnt * op + pad;
+      float tS = tS0; float tE = tE0;
+      if (abs(rd.x) < 1.0e-9) { if (ro.x < lo.x || ro.x > hi.x) return; }
+      else { float u = (lo.x - ro.x) / rd.x; float v = (hi.x - ro.x) / rd.x; tS = max(tS, min(u, v)); tE = min(tE, max(u, v)); }
+      if (abs(rd.y) < 1.0e-9) { if (ro.y < lo.y || ro.y > hi.y) return; }
+      else { float u = (lo.y - ro.y) / rd.y; float v = (hi.y - ro.y) / rd.y; tS = max(tS, min(u, v)); tE = min(tE, max(u, v)); }
+      if (tS >= tE) return;
+      vec2 cell = clamp(floor((ro.xy + rd.xy * tS - oLo) / op), vec2(0.0), ocnt - 1.0);
+      vec2 stp = vec2(rd.x >= 0.0 ? 1.0 : -1.0, rd.y >= 0.0 ? 1.0 : -1.0);
+      vec2 nextB = oLo + (cell + vec2(rd.x >= 0.0 ? 1.0 : 0.0, rd.y >= 0.0 ? 1.0 : 0.0)) * op;
+      vec2 tMax = vec2(abs(rd.x) < 1.0e-9 ? INF : (nextB.x - ro.x) / rd.x,
+                       abs(rd.y) < 1.0e-9 ? INF : (nextB.y - ro.y) / rd.y);
+      vec2 tDelta = vec2(abs(rd.x) < 1.0e-9 ? INF : op.x / abs(rd.x),
+                         abs(rd.y) < 1.0e-9 ? INF : op.y / abs(rd.y));
+      float tCur = tS;
+      for (int s = 0; s < MAX_LAT_OUTER; s++) {
+        float tNext = min(min(tMax.x, tMax.y), tE);
+        float tTol = (tBest < INF) ? tieAt(tBest) : 0.0;
+        if (tCur - pad > tBest + tTol) return;
+        vec2 shift = cell * op;
+        latticePins(ro, rd, max(tCur - pad, tS0), min(tNext + pad, tE0),
+                    pinLo0 + shift, asmOff0 + shift, offZ, ip, icnt, baseProto, nLayers, bLo, bHi, env);
+        if (tNext >= tE) return;
+        if (tMax.x < tMax.y) { cell.x += stp.x; tMax.x += tDelta.x; } else { cell.y += stp.y; tMax.y += tDelta.y; }
+        if (cell.x < 0.0 || cell.y < 0.0 || cell.x >= ocnt.x || cell.y >= ocnt.y) return;
+        tCur = tNext;
+      }
+    }
+
     // Traverse BVH; for each leaf hybrid-hit in local frame:
     //   1) analytic interval as a seed (fast when CSG is simple Inside-heavy)
     //   2) SDF sphere-trace clamped to the leaf AABB interval (robust for
@@ -1145,11 +1346,10 @@
     // Collects every hit within tieAt() of the nearest one, then resolves ties
     // by containment. Returns best t; outs proto + instance offset for shading
     // and whether two solid (non-fill) cells genuinely overlap at this pixel.
-    float sceneHit(vec3 ro, vec3 rd, out int hitProto, out int hitInst, out bool hitOverlap) {
-      hitProto = -1; hitInst = -1; hitOverlap = false;
-      float candT[MAX_CAND]; int candProto[MAX_CAND]; int candInst[MAX_CAND];
-      int candCount = 0;
-      float tBest = INF;   // nearest hit found so far (tie group is [tBest, tBest + tieAt])
+    float sceneHit(vec3 ro, vec3 rd, out int hitProto, out int hitInst, out vec3 hitOff, out bool hitOverlap) {
+      hitProto = -1; hitInst = -1; hitOff = vec3(0.0); hitOverlap = false;
+      candCount = 0;
+      tBest = INF;
       if (uBvhNodeCount <= 0) return INF;
       int stack[MAX_BVH_STACK]; int sp = 0; stack[sp++] = 0;
       for (int iter = 0; iter < MAX_BVH_ITERS; iter++) {
@@ -1164,7 +1364,10 @@
         // Prune only boxes that start beyond the tie window: a box that begins
         // inside it can still hold a tied candidate.
         if (bi.x > bi.y || bi.x > tBest + tTol) continue;
-        if (t0.w > 0.5) {
+        if (t0.w > 1.5) {
+          // Lattice leaf (t1.w = lattice index): walk its pin grid.
+          latticeVisit(int(t1.w + 0.5), ro, rd, max(bi.x, 0.0), bi.y);
+        } else if (t0.w > 0.5) {
           int instIdx = int(t1.w + 0.5);
           if (instIdx < 0 || instIdx >= uInstanceCount) continue;
           vec4 inst = fetchInstance(instIdx);
@@ -1204,25 +1407,7 @@
               }
             }
 
-            if (hitT < INF && hitT >= 0.0) {
-              float tHit = hitT;
-              // Clearly nearer than the whole current group -> start a new group.
-              if (tHit < tBest - tTolM) { candCount = 0; tBest = tHit; }
-              // Within the tie window -> keep as a candidate (never first-wins).
-              if (tHit <= tBest + tTolM) {
-                int slot = candCount;
-                if (candCount >= MAX_CAND) {
-                  // Full: evict the farthest candidate if this one is nearer.
-                  slot = 0; float worst = candT[0];
-                  for (int c = 1; c < MAX_CAND; c++) { if (candT[c] > worst) { worst = candT[c]; slot = c; } }
-                  if (tHit >= worst) slot = -1;
-                } else {
-                  candCount++;
-                }
-                if (slot >= 0) { candT[slot] = tHit; candProto[slot] = protoIdx; candInst[slot] = instIdx; }
-                tBest = min(tBest, tHit);
-              }
-            }
+            if (hitT < INF && hitT >= 0.0) considerHit(hitT, protoIdx, instIdx, inst.xyz);
           }
         } else {
           vec4 t2 = fetchBvhTexel(nodeIdx, 2);
@@ -1255,7 +1440,7 @@
         if (c >= candCount) break;
         if (candT[c] <= tBest + tFinalTol) { inWindow++; only = c; }
       }
-      if (inWindow == 1) { hitProto = candProto[only]; hitInst = candInst[only]; return candT[only]; }
+      if (inWindow == 1) { hitProto = candProto[only]; hitInst = candInst[only]; hitOff = candOff[only]; return candT[only]; }
 
       // ---- Tie resolution by exact containment ----
       // Probe slightly PAST the surface along the ray (deeper than the march's
@@ -1268,7 +1453,7 @@
         if (c >= candCount) break;
         if (candT[c] > tBest + tFinalTol) continue;
         int pc = candProto[c];
-        float d2 = evalRegion(pc, instToLocal(candInst[c], pProbe));
+        float d2 = evalRegion(pc, candToLocal(candInst[c], candOff[c], pProbe));
         bool contains = d2 <= 0.0;
         bool isFill = protoIsFill(pc);
         if (contains && !isFill) solidContaining++;
@@ -1286,7 +1471,7 @@
         if (better) { win = c; winContains = contains; winD = d2; winFill = isFill; winProto = pc; }
       }
       if (win < 0) return INF;
-      hitProto = candProto[win]; hitInst = candInst[win];
+      hitProto = candProto[win]; hitInst = candInst[win]; hitOff = candOff[win];
       // Fill-vs-solid overlap is expected (fill is a deliberate stand-in under
       // instancing); only flag two *solid* cells occupying the same volume.
       hitOverlap = solidContaining >= 2;
@@ -1314,12 +1499,12 @@
       // Phase A: root AABB pre-test
       vec2 rootHit = boxInterval(ro, rd, uSceneBMin, uSceneBMax);
       if (rootHit.x <= rootHit.y && rootHit.y >= 0.0) {
-        int hitProto; int hitInst; bool hitOverlap;
-        float t = sceneHit(ro, rd, hitProto, hitInst, hitOverlap);
+        int hitProto; int hitInst; vec3 hitOff; bool hitOverlap;
+        float t = sceneHit(ro, rd, hitProto, hitInst, hitOff, hitOverlap);
         if (hitProto >= 0 && t < INF) {
           vec3 p = ro + rd * t;
           // Normal is computed in the instance's local frame, then rotated back to world.
-          vec3 n = qRot(fetchInstanceQuat(hitInst), calcNormal(instToLocal(hitInst, p), hitProto));
+          vec3 n = qRot(quatOf(hitInst), calcNormal(candToLocal(hitInst, hitOff, p), hitProto));
           float diff = max(dot(n, normalize(vec3(0.4, 0.6, 0.8))), 0.0);
           col = protoColor(hitProto) * (0.35 + 0.65 * diff);
           // Genuine solid-on-solid overlap (OpenMC would reject this geometry).
@@ -1348,6 +1533,7 @@
       uSurfTex: { value: null as THREE.DataTexture | null },
       uProtoTex: { value: null as THREE.DataTexture | null },
       uGridTex: { value: null as THREE.DataTexture | null },
+      uLatTex: { value: null as THREE.DataTexture | null }, uLatTexH: { value: 1 },
       uTokTexH: { value: 1 }, uInstTexH: { value: 1 }, uBvhTexH: { value: 1 },
       uSurfTexH: { value: 1 }, uProtoTexH: { value: 1 }, uGridTexH: { value: 1 },
       uSceneBMin: { value: new THREE.Vector3(-1e3, -1e3, -1e3) },
@@ -1528,6 +1714,7 @@
       surfTexture?.dispose(); surfTexture = null;
       protoTexture?.dispose(); protoTexture = null;
       gridTexture?.dispose(); gridTexture = null;
+      latTexture?.dispose(); latTexture = null; u.uLatTex.value = null;
       u.uTokenTex.value = null; u.uInstanceTex.value = null; u.uBvhTex.value = null;
       u.uSurfTex.value = null; u.uProtoTex.value = null; u.uGridTex.value = null;
       u.uProtoCount.value = 0; u.uInstanceCount.value = 0; u.uSurfCount.value = 0; u.uBvhNodeCount.value = 0;
@@ -1585,6 +1772,8 @@
     const grids: GridEntry[] = [];
     let gridOverflow = false;
     const instances: { dx: number; dy: number; dz: number; protoIdx: number; count: number; q?: Quat }[] = [];
+    // Lattices drawn by the lattice leaf instead of per-pin instances (see latticeGrid.ts).
+    const latticeEntries: { grid: LatticeGrid; baseProto: number; nLayers: number }[] = [];
     // Drawable cells with the transform that places each in the world (identity for root cells).
     const worldCells = resolveWorldCells(csg.cells);
     const lis = csg.lattice_instances ?? [];
@@ -1633,6 +1822,35 @@
         // world = assembly_offset + pin_offset; prototype stays one pin.
         const innerOffs = (li as LatticeInstance & { inner_offsets?: [number, number, number][] }).inner_offsets ?? [];
         const outerOffs = li.instances;
+
+        // Fast path: a regular rectangular grid becomes ONE BVH leaf that the shader walks cell
+        // by cell, so cost no longer grows with pin count and MAX_INSTANCES stops applying.
+        // Anything that does not qualify (hex, holes, overlapping pins, layers the exact leaf
+        // test cannot hold) keeps the per-pin instances below, unchanged.
+        if (numLayers > 0 && numLayers <= MAX_LAT_LAYERS && latticeEntries.length < MAX_LATTICES) {
+          let union = protos[baseProtoIdx].aabb;
+          // Exact (unpadded) extent: the fit test must not depend on how big the scene is.
+          let tight = cellAABB(protos[baseProtoIdx].region, protoSurfById, sceneBounds, false);
+          let exactOk = true;
+          for (let k = 0; k < numLayers; k++) {
+            union = unionAABB(union, protos[baseProtoIdx + k].aabb);
+            tight = unionAABB(tight, cellAABB(protos[baseProtoIdx + k].region, protoSurfById, sceneBounds, false));
+            const toks: number[] = [];
+            flattenRegion(protos[baseProtoIdx + k].region, new Map(), toks);
+            if (toks.length / 2 > MAX_EXACT_TOKENS) exactOk = false;
+          }
+          const grid = exactOk ? buildLatticeGrid(
+            {
+              origin: li.origin, instances: outerOffs, innerOffsets: innerOffs, proto: union, fit: tight,
+              envelope: pinEnvelope(
+                protos.slice(baseProtoIdx, baseProtoIdx + numLayers).map((p) => p.region),
+                (id) => protoSurfById.get(id),
+              ),
+            },
+            { maxInnerSteps: MAX_LAT_STEPS, maxOuterSteps: MAX_LAT_OUTER },
+          ) : null;
+          if (grid) { latticeEntries.push({ grid, baseProto: baseProtoIdx, nLayers: numLayers }); continue; }
+        }
         // One instance per pin covers all of its layers (see MAX_GROUP).
         const pushPin = (dx: number, dy: number, dz: number) => {
           for (let k = 0; k < numLayers; k += MAX_GROUP) {
@@ -1668,10 +1886,12 @@
         // cell is a real object in its own local frame: keep its exact region. So is a
         // cell cut by pin grids.
         const gridded = (cell.grid_blockers?.length ?? 0) > 0;
-        const standIn = !wc.instanced && !gridded;
+        // Only the moderator fill is simplified; a real solid (CylinderZ, a boolean, ...)
+        // keeps its exact region and is NOT flagged as a fill, so it wins fill ties.
+        const standIn = !wc.instanced && !gridded && !isSolidRegion(region, surfaceById);
         const simplified = standIn ? planeOnlyRegion(region, surfaceById) : null;
         if (simplified) region = simplified;
-        addCell(wc, region, standIn);
+        addCell(wc, region, simplified !== null);
       }
     } else {
       for (const wc of worldCells) {
@@ -1747,7 +1967,8 @@
       if (protoTokenCount[g.envProto] > MAX_EXACT_TOKENS) gridOverflow = true;
     });
     truncatedGrids = gridOverflow;
-    prototypeCount = protos.length; instanceCount = instances.length;
+    prototypeCount = protos.length;
+    instanceCount = instances.length + latticeEntries.reduce((n, e) => n + e.grid.pinCount, 0);
     materialLegend = [...legendSeen.entries()].map(([id, color]) => ({ id, color }));
     u.uProtoCount.value = protos.length;
     protoTexture?.dispose(); protoTexture = tableTexture(protoTab);
@@ -1778,18 +1999,28 @@
     instanceTexture = tableTexture(instTab);
     u.uInstanceTex.value = instanceTexture; u.uInstTexH.value = instTab.height; u.uInstanceCount.value = instances.length;
 
+    // Lattice table + one BVH leaf per lattice (leaf indices follow the instance leaves).
+    const latTab = allocTable(LAT_TEXELS, LAT_TEXELS * Math.max(1, latticeEntries.length));
+    latticeEntries.forEach((e, i) => {
+      packLatticeGrid(e.grid, e.baseProto, e.nLayers, latTab.data, i);
+      instanceBoxes.push(e.grid.box);
+    });
+    latTexture?.dispose(); latTexture = tableTexture(latTab);
+    u.uLatTex.value = latTexture; u.uLatTexH.value = latTab.height;
+    const leafCount = instances.length + latticeEntries.length;
+
     const tBvh0 = performance.now();
-    const bvhTab = allocTable(BVH_TEX_W, 3 * Math.min(MAX_BVH_NODES, Math.max(1, 2 * instances.length)));
+    const bvhTab = allocTable(BVH_TEX_W, 3 * Math.min(MAX_BVH_NODES, Math.max(1, 2 * leafCount)));
     const bvhTexData = bvhTab.data;
     let bvhNodeCount = 0;
     truncatedBvh = false;
-    if (instances.length > 0) {
-      const flat = flattenBvh(buildBvh(instances.map((_, i) => i), instanceBoxes), bvhTexData);
+    if (leafCount > 0) {
+      const flat = flattenBvh(buildBvh(Array.from({ length: leafCount }, (_, i) => i), instanceBoxes), bvhTexData, instances.length);
       bvhNodeCount = flat.count;
       truncatedBvh = flat.truncated;
     }
     u.uBvhNodeCount.value = bvhNodeCount;
-    console.log(`[perf] BVH build: ${(performance.now() - tBvh0).toFixed(2)}ms, nodes=${bvhNodeCount}, protos=${protos.length}, instances=${instances.length}, instancing=${usingInstancing}`);
+    console.log(`[perf] BVH build: ${(performance.now() - tBvh0).toFixed(2)}ms, nodes=${bvhNodeCount}, protos=${protos.length}, instances=${instances.length}, lattices=${latticeEntries.length}, instancing=${usingInstancing}`);
 
     bvhTexture?.dispose();
     bvhTexture = tableTexture(bvhTab);
@@ -1891,7 +2122,7 @@
   onDestroy(() => {
     if (pendingRenderFrame !== null) cancelAnimationFrame(pendingRenderFrame);
     clearTimeout(interactTimer);
-    tokenTexture?.dispose(); bvhTexture?.dispose(); instanceTexture?.dispose(); renderer?.dispose();
+    tokenTexture?.dispose(); bvhTexture?.dispose(); instanceTexture?.dispose(); latTexture?.dispose(); renderer?.dispose();
   });
 </script>
 

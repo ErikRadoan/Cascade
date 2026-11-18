@@ -1664,6 +1664,7 @@ def _expand_flat_lattice(
         prototype_cells=prototype_cells,
         instances=_relative_positions(positions),
         inner_offsets=[],
+        origin=positions[0],
     ))
     return objects
 
@@ -1726,6 +1727,7 @@ def _expand_nested_lattice(
         prototype_cells=prototype_cells,
         instances=_relative_positions(outer_positions),
         inner_offsets=inner_offsets,
+        origin=outer_positions[0],
     ))
     return objects
 
