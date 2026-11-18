@@ -30,7 +30,7 @@ export type Vec3 = [number, number, number];
 export interface Box { xMin: number; xMax: number; yMin: number; yMax: number; zMin: number; zMax: number }
 
 /** Texels per lattice in the lattice table (see packLatticeGrid). */
-export const LAT_TEXELS = 7;
+export const LAT_TEXELS = 10;
 
 export interface AxisGrid { off: number; pitch: number; count: number }
 export interface RegularGrid { x: AxisGrid; y: AxisGrid; z: number }
@@ -107,6 +107,115 @@ export function pinEnvelope(layers: RegionLike[], surface: (id: string) => Surfa
   return layers.length > 0 && rMax > 0 ? [cx, cy, rMax] : null;
 }
 
+/** Most layers a pin stack can hold: radii ride in two texels (4 each). Equals the shader's MAX_LAT_LAYERS. */
+export const MAX_STACK_LAYERS = 8;
+
+/**
+ * A pin that is a stack of concentric Z cylinders sharing two axial planes (FuelPin: pellet, gap,
+ * clad, ...). Layer m is { rho in (radii[m-1], radii[m]] } AND { z in (zLo, zHi] }, radii[-1] = 0.
+ * The shader then intersects a ray with it in closed form instead of interpreting the layer's
+ * token stream (see pinStackLayers() in CsgViewportPanel.svelte). All values are in the
+ * prototype's own frame, the same frame as the layers' surfaces.
+ */
+export interface PinStack { cx: number; cy: number; radii: number[]; zLo: number; zHi: number }
+
+function flattenAnd(r: RegionLike, out: RegionLike[]): void {
+  if (r.op === 'and') for (const it of r.items) flattenAnd(it, out);
+  else out.push(r);
+}
+
+/**
+ * Read `layers` (one region per layer, innermost first) as a PinStack, or null if they are not
+ * exactly that. Strict on purpose: the analytic test replaces the generic evaluator, so anything it
+ * cannot reproduce exactly (an extra term, an OR/NOT, an off-axis or non-nested cylinder, layers that
+ * do not chain, differing axial planes) must return null and keep the generic path.
+ *   layer 0:  Inside(cyl0)            AND Outside(zBot) AND Inside(zTop)
+ *   layer m:  Outside(cyl[m-1]) AND Inside(cyl[m]) AND the same two planes
+ */
+export function pinStack(layers: RegionLike[], surface: (id: string) => SurfaceLike | undefined): PinStack | null {
+  if (layers.length === 0 || layers.length > MAX_STACK_LAYERS) return null;
+  const radii: number[] = [];
+  let cx = NaN, cy = NaN, zLo = NaN, zHi = NaN, prevOuter: string | null = null;
+  const pick = (id: string, type: string): Record<string, number> | null => {
+    const s = surface(id);
+    return s && s.type === type ? s.params : null;
+  };
+  for (let m = 0; m < layers.length; m++) {
+    const terms: RegionLike[] = [];
+    flattenAnd(layers[m], terms);
+    let outer: string | null = null, inner: string | null = null, bot: string | null = null, top: string | null = null;
+    for (const t of terms) {
+      if (t.op !== 'inside' && t.op !== 'outside') return null;
+      const s = surface(t.surface);
+      if (!s) return null;
+      if (s.type === 'cylinder_z') {
+        if (t.op === 'inside') { if (outer) return null; outer = t.surface; }
+        else { if (inner) return null; inner = t.surface; }
+      } else if (s.type === 'plane_z') {
+        if (t.op === 'outside') { if (bot) return null; bot = t.surface; }
+        else { if (top) return null; top = t.surface; }
+      } else return null;
+    }
+    if (!outer || !bot || !top) return null;
+    if (m === 0 ? inner !== null : inner !== prevOuter) return null;   // layers must chain
+    const c = pick(outer, 'cylinder_z'), pb = pick(bot, 'plane_z'), pt = pick(top, 'plane_z');
+    if (!c || !pb || !pt) return null;
+    const x0 = c.x0 ?? c.x, y0 = c.y0 ?? c.y, r = c.r, zb = pb.z0 ?? pb.z, zt = pt.z0 ?? pt.z;
+    if (![x0, y0, r, zb, zt].every(Number.isFinite) || !(r > 0) || !(zt > zb)) return null;
+    if (m === 0) { cx = x0; cy = y0; zLo = zb; zHi = zt; }
+    else if (Math.abs(x0 - cx) > 1e-9 || Math.abs(y0 - cy) > 1e-9 ||
+             Math.abs(zb - zLo) > 1e-9 || Math.abs(zt - zHi) > 1e-9 || !(r > radii[m - 1])) return null;
+    radii.push(r);
+    prevOuter = outer;
+  }
+  return { cx, cy, radii, zLo, zHi };
+}
+
+/** Ray vs the disc rho <= r about the stack axis: [enter, exit], or null on a miss. */
+function discInterval(a: number, b: number, cc: number, r: number): [number, number] | null {
+  const c = cc - r * r;
+  if (a < 1e-12) return c <= 0 ? [-Infinity, Infinity] : null;
+  const disc = b * b - a * c;
+  if (disc < 0) return null;
+  const sq = Math.sqrt(disc);
+  return [(-b - sq) / a, (-b + sq) / a];
+}
+
+/**
+ * First entry of the ray into layer `m` of `st`, within the window [wLo, wHi), or Infinity. `ro` is
+ * in the stack's frame. `sliver` = depth below which a layer is too thin to count (the shader's
+ * max(0.1 * epsAt(t), 1e-6)); a ray already inside at wLo hits at wLo, like the generic leaf test.
+ *
+ * This is the reference for the shader's pinStackLayers(); keep the two in step. Closed form: the
+ * layer along the ray is [outer disc] minus [inner disc], cut to the axial slab, so it is at most
+ * two intervals and its first entry needs two quadratics and no marching.
+ */
+export function pinStackEntry(st: PinStack, m: number, ro: Vec3, rd: Vec3, wLo: number, wHi: number,
+                              sliver: (t: number) => number = () => 1e-6): number {
+  const dx = ro[0] - st.cx, dy = ro[1] - st.cy;
+  const a = rd[0] * rd[0] + rd[1] * rd[1], b = dx * rd[0] + dy * rd[1], cc = dx * dx + dy * dy;
+  let s0: number, s1: number;
+  if (Math.abs(rd[2]) < 1e-9) {
+    if (!(ro[2] > st.zLo && ro[2] < st.zHi)) return Infinity;
+    s0 = -Infinity; s1 = Infinity;
+  } else {
+    const u = (st.zLo - ro[2]) / rd[2], v = (st.zHi - ro[2]) / rd[2];
+    s0 = Math.min(u, v); s1 = Math.max(u, v);
+  }
+  const o = discInterval(a, b, cc, st.radii[m]);
+  if (!o) return Infinity;
+  const inn = m > 0 ? discInterval(a, b, cc, st.radii[m - 1]) : null;
+  const lo = Math.max(o[0], s0), hi = Math.min(o[1], s1);
+  const piece = (g0: number, g1: number): number => {
+    if (g0 > g1) return Infinity;
+    if (g0 < wLo) return g1 >= wLo ? wLo : Infinity;       // already inside at the window start
+    return g0 < wHi && g1 - g0 > sliver(g0) ? g0 : Infinity;
+  };
+  if (!inn) return piece(lo, hi);
+  const first = piece(lo, Math.min(hi, inn[0]));           // before the ray reaches the inner cylinder
+  return first < Infinity ? first : piece(Math.max(lo, inn[1]), hi);   // after it leaves
+}
+
 export interface LatticeGridInput {
   /** World position of the prototype pin. null/undefined -> not usable. */
   origin: Vec3 | null | undefined;
@@ -124,6 +233,8 @@ export interface LatticeGridInput {
   fit?: Box;
   /** From pinEnvelope(); null/undefined = no circle test in the shader. */
   envelope?: [number, number, number] | null;
+  /** From pinStack(); null/undefined = layers go through the generic token evaluator. */
+  stack?: PinStack | null;
 }
 
 export interface LatticeGridLimits { maxInnerSteps: number; maxOuterSteps: number }
@@ -147,6 +258,8 @@ export interface LatticeGrid {
   pinBox: Box;
   /** Pin envelope circle (cx, cy, r) in the prototype's frame; r = 0 disables the test. */
   env: [number, number, number];
+  /** Concentric-cylinder pin in the prototype's frame; null = generic evaluator. */
+  stack: PinStack | null;
 }
 
 const FIT_TOL = 1e-9;
@@ -211,6 +324,7 @@ export function buildLatticeGrid(inp: LatticeGridInput, limits: LatticeGridLimit
     pinCount: outCount[0] * outCount[1] * inCount[0] * inCount[1],
     pinBox: { ...b },
     env: inp.envelope && inp.envelope[2] > 0 && inp.envelope.every(Number.isFinite) ? inp.envelope : [0, 0, 0],
+    stack: inp.stack ?? null,
     box: {
       xMin: pb.xMin + asmOff0[0], xMax: pb.xMax + maxOff[0],
       yMin: pb.yMin + asmOff0[1], yMax: pb.yMax + maxOff[1],
@@ -225,6 +339,9 @@ export function buildLatticeGrid(inp: LatticeGridInput, limits: LatticeGridLimit
  *   2: innerCount.xy, baseProto, nLayers   3: pinLo0.xy, offZ, 0     4: asmOff0.xy, 0, 0
  *   5: pinBox min xyz, 0              6: pinBox max xyz, 0
  *   (texel 3.w = envelope radius, texel 4.zw = envelope centre xy; radius 0 = no envelope)
+ *   7: stack axis cx, cy, zLo, zHi    8: radii 0..3    9: radii 4..7
+ *   A stack exists iff texel 8.x (radius 0) > 0; the shader then skips the generic evaluator for
+ *   its layers. All zero = no stack.
  * Layers of the prototype occupy prototypes [baseProto, baseProto + nLayers).
  */
 export function packLatticeGrid(g: LatticeGrid, baseProto: number, nLayers: number,
@@ -237,4 +354,9 @@ export function packLatticeGrid(g: LatticeGrid, baseProto: number, nLayers: numb
   data.set([g.asmOff0[0], g.asmOff0[1], g.env[0], g.env[1]], t + 16);
   data.set([g.pinBox.xMin, g.pinBox.yMin, g.pinBox.zMin, 0], t + 20);
   data.set([g.pinBox.xMax, g.pinBox.yMax, g.pinBox.zMax, 0], t + 24);
+  const st = g.stack && g.stack.radii.length === nLayers ? g.stack : null;
+  const r = st ? st.radii : [];
+  data.set(st ? [st.cx, st.cy, st.zLo, st.zHi] : [0, 0, 0, 0], t + 28);
+  data.set([r[0] ?? 0, r[1] ?? 0, r[2] ?? 0, r[3] ?? 0], t + 32);
+  data.set([r[4] ?? 0, r[5] ?? 0, r[6] ?? 0, r[7] ?? 0], t + 36);
 }

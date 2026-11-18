@@ -28,7 +28,7 @@
 
   import { onMount, onDestroy, untrack } from 'svelte';
   import * as THREE from 'three';
-  import { buildLatticeGrid, packLatticeGrid, pinEnvelope, LAT_TEXELS, type LatticeGrid } from '../latticeGrid';
+  import { buildLatticeGrid, packLatticeGrid, pinEnvelope, pinStack, LAT_TEXELS, type LatticeGrid } from '../latticeGrid';
   import { activeProject } from '../stores/projects.svelte.js';
   import { csgState, requestCsgRefresh } from '../stores/csg.svelte.js';
   // Same store ObjectPanel writes — keyns are `${projectId}:${placementName}`
@@ -1216,6 +1216,77 @@
     }
 
     // ======================================================================================
+    // Concentric-cylinder pin stack: closed-form layer entry (replaces leafExact for such pins).
+    // ======================================================================================
+    // A FuelPin's layers (pellet, gap, clad ...) are { rho in (r[m-1], r[m]] } AND { z in (zLo, zHi] }.
+    // leafExact() reached the same answer by interpreting the layer's token stream: a texture fetch
+    // per token, a crossing solve per surface, and two evalRegion() calls (each a full token walk)
+    // per crossing. That dominated hit cost in a lattice. Here each radius costs ONE quadratic,
+    // shared by the two layers it bounds, and the axial planes one slab. No token fetches at all.
+    // Set per lattice by latticeVisit() (all zero radius = no stack, generic path):
+    vec4 gStackAxial;      // (cx, cy, zLo, zHi) in the prototype frame
+    vec4 gStackR0, gStackR1;   // radii of layers 0..3 and 4..7
+    float stackR(int m) {
+      vec4 v = (m < 4) ? gStackR0 : gStackR1;
+      int k = m - 4 * (m / 4);
+      return (k == 0) ? v.x : (k == 1) ? v.y : (k == 2) ? v.z : v.w;
+    }
+    // Ray vs the disc rho <= r about the axis: (enter, exit); (INF, NEG_INF) = miss.
+    vec2 discInterval(float a, float b, float cc, float r) {
+      float c = cc - r * r;
+      if (a < 1.0e-12) return (c <= 0.0) ? vec2(NEG_INF, INF) : vec2(INF, NEG_INF);
+      float disc = b * b - a * c;
+      if (disc < 0.0) return vec2(INF, NEG_INF);
+      float sq = sqrt(disc);
+      return vec2((-b - sq) / a, (-b + sq) / a);
+    }
+    // One piece [g0, g1] of a layer along the ray -> entry depth in the window [wLo, wH), or INF.
+    // Same contract as leafExact(): a ray already inside at wLo hits at wLo; a layer thinner than
+    // a fraction of a pixel (the sliver test) is skipped.
+    float stackPiece(float g0, float g1, float wLo, float wH) {
+      if (g0 > g1) return INF;
+      if (g0 < wLo) return (g1 >= wLo) ? wLo : INF;
+      float dl = max(0.1 * epsAt(g0), 1.0e-6);
+      return (g0 < wH && g1 - g0 > dl) ? g0 : INF;
+    }
+    // Offer every layer of the pin whose frame origin is off (roL = ro - off). Mirrors the
+    // generic loop in latticePins: front to back, stop once the window is behind the tie group.
+    void pinStackLayers(vec3 roL, vec3 rd, float wLo, float wHi, int baseProto, int nLayers, vec3 off) {
+      vec2 d = roL.xy - gStackAxial.xy;
+      float a = dot(rd.xy, rd.xy), b = dot(d, rd.xy), cc = dot(d, d);
+      // Axial slab.
+      vec2 sl;
+      if (abs(rd.z) < 1.0e-9) {
+        sl = (roL.z > gStackAxial.z && roL.z < gStackAxial.w) ? vec2(NEG_INF, INF) : vec2(INF, NEG_INF);
+      } else {
+        float u = (gStackAxial.z - roL.z) / rd.z; float v = (gStackAxial.w - roL.z) / rd.z;
+        sl = vec2(min(u, v), max(u, v));
+      }
+      if (sl.x > sl.y) return;
+      vec2 inn = vec2(INF, NEG_INF);   // previous layer's outer disc = this layer's inner disc
+      for (int m = 0; m < MAX_LAT_LAYERS; m++) {
+        if (m >= nLayers) break;
+        float tTolM = (tBest < INF) ? tieAt(tBest) : 0.0;
+        float wH = min(wHi, tBest + tTolM);
+        if (wLo >= wH) break;
+        vec2 o = discInterval(a, b, cc, stackR(m));
+        float lo = max(o.x, sl.x); float hi = min(o.y, sl.y);
+        float hitT = INF;
+        if (o.x <= o.y && lo <= hi) {
+          if (inn.x <= inn.y) {
+            // Before the ray reaches the inner cylinder, else after it leaves.
+            hitT = stackPiece(lo, min(hi, inn.x), wLo, wH);
+            if (hitT >= INF) hitT = stackPiece(max(lo, inn.y), hi, wLo, wH);
+          } else {
+            hitT = stackPiece(lo, hi, wLo, wH);
+          }
+        }
+        if (hitT < INF && hitT >= 0.0) considerHit(hitT, baseProto + m, -1, off);
+        inn = o;
+      }
+    }
+
+    // ======================================================================================
     // Lattice leaf: a rectangular pin grid walked cell by cell.
     // ======================================================================================
     // The whole lattice is ONE BVH leaf. Instead of a BVH over every pin, the ray steps through
@@ -1278,13 +1349,18 @@
         if (pbi.x <= pbi.y) {
           wLo = max(wLo, pbi.x); wHi = min(wHi, pbi.y);
           vec3 roL = ro - off;
-          for (int m = 0; m < MAX_LAT_LAYERS; m++) {
-            if (m >= nLayers) break;
-            float tTolM = (tBest < INF) ? tieAt(tBest) : 0.0;
-            float wH = min(wHi, tBest + tTolM);
-            if (wLo >= wH) break;
-            float hitT = leafExact(baseProto + m, roL, rd, wLo, wH);
-            if (hitT < INF && hitT >= 0.0) considerHit(hitT, baseProto + m, -1, off);
+          if (gStackR0.x > 0.0) {
+            // Concentric cylinders: closed form (see pinStackLayers).
+            pinStackLayers(roL, rd, wLo, wHi, baseProto, nLayers, off);
+          } else {
+            for (int m = 0; m < MAX_LAT_LAYERS; m++) {
+              if (m >= nLayers) break;
+              float tTolM = (tBest < INF) ? tieAt(tBest) : 0.0;
+              float wH = min(wHi, tBest + tTolM);
+              if (wLo >= wH) break;
+              float hitT = leafExact(baseProto + m, roL, rd, wLo, wH);
+              if (hitT < INF && hitT >= 0.0) considerHit(hitT, baseProto + m, -1, off);
+            }
           }
         }
         if (tNext >= tE) return;
@@ -1305,6 +1381,7 @@
       vec2 pinLo0 = d.xy; float offZ = d.z; vec2 asmOff0 = e.xy;
       vec3 bLo = latT(lat, 5).xyz; vec3 bHi = latT(lat, 6).xyz;
       vec3 env = vec3(e.zw, d.w);   // envelope circle: centre xy, radius
+      gStackAxial = latT(lat, 7); gStackR0 = latT(lat, 8); gStackR1 = latT(lat, 9);
       if (ocnt.x < 1.5 && ocnt.y < 1.5) {
         latticePins(ro, rd, tS0, tE0, pinLo0, asmOff0, offZ, ip, icnt, baseProto, nLayers, bLo, bHi, env);
         return;
@@ -1839,13 +1916,13 @@
             flattenRegion(protos[baseProtoIdx + k].region, new Map(), toks);
             if (toks.length / 2 > MAX_EXACT_TOKENS) exactOk = false;
           }
+          const layerRegions = protos.slice(baseProtoIdx, baseProtoIdx + numLayers).map((p) => p.region);
           const grid = exactOk ? buildLatticeGrid(
             {
               origin: li.origin, instances: outerOffs, innerOffsets: innerOffs, proto: union, fit: tight,
-              envelope: pinEnvelope(
-                protos.slice(baseProtoIdx, baseProtoIdx + numLayers).map((p) => p.region),
-                (id) => protoSurfById.get(id),
-              ),
+              envelope: pinEnvelope(layerRegions, (id) => protoSurfById.get(id)),
+              // Concentric cylinders (FuelPin): the shader intersects them in closed form.
+              stack: pinStack(layerRegions, (id) => protoSurfById.get(id)),
             },
             { maxInnerSteps: MAX_LAT_STEPS, maxOuterSteps: MAX_LAT_OUTER },
           ) : null;
