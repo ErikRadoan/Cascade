@@ -224,16 +224,20 @@ export const materials = {
     name: string;
     density: number;
     composition: Record<string, number>;
+    color?: string | null;   // #RRGGBB display colour; null/omitted = automatic
   }, libraryTag = 'user'): Promise<MaterialDetail> =>
     request(`/api/materials/?library_tag=${encodeURIComponent(libraryTag)}`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
 
+  // PUT is a full replace on the backend: always send `color` (null to clear it),
+  // omitting it resets the material to the automatic colour.
   update: (id: string, data: {
     name: string;
     density: number;
     composition: Record<string, number>;
+    color?: string | null;
   }): Promise<MaterialDetail> =>
     request(`/api/materials/${encodeURIComponent(id)}`, {
       method: 'PUT',

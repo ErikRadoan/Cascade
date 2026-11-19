@@ -79,6 +79,8 @@ export interface MaterialSummary {
   id: string;
   name: string;
   density: number | null;
+  /** User-chosen viewport colour as #RRGGBB; null/absent = automatic palette colour. */
+  color?: string | null;
 }
 
 export interface MaterialDetail extends MaterialSummary {

@@ -11,6 +11,7 @@ from ..dsl import loader
 from ..dsl import sweep
 from ..repositories.db import get_db
 from ..repositories.geometry_repositroy import GeometryRepository
+from ..repositories.material_repository import MaterialRepository
 from ..services.scene_builder_service import SceneBuilder
 from .schemas import (
     BoundsOut,
@@ -29,6 +30,9 @@ from .schemas import (
 
 router = APIRouter(prefix="/geometry", tags=["geometry"])
 _scene_builder = SceneBuilder()
+# File-backed (no cache), so a second instance sees the same library as
+# api/materials.py's singleton. Read per scene build for user colour overrides.
+_material_repo = MaterialRepository()
 
 # _geometry_store is GONE — replaced by GeometryRepository (DB-backed).
 
@@ -50,7 +54,7 @@ def build_scene_response(text: str) -> SceneResponse:
         )
     try:
         schemas = sweep.preview_load(text)
-        scene = _scene_builder.build(schemas)
+        scene = _scene_builder.build(schemas, _material_repo.color_overrides())
     except Exception as e:
         return SceneResponse(
             components=[], material_colors={}, bounds=_EMPTY_BOUNDS,

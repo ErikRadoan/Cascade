@@ -7,6 +7,9 @@
   import { onMount } from 'svelte';
   import * as api from '$lib/api';
   import type { MaterialDetail, MaterialSummary } from '$lib/types';
+  import MaterialColorField from './MaterialColorField.svelte';
+  import { defaultMaterialColorHex } from './materialColors';
+  import { loadMaterialColors } from './stores/materialColors.svelte.js';
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -33,6 +36,8 @@
   let editDensity = $state('');
   let editComposition = $state('');  // raw JSON string
   let editLibTag  = $state('user');
+  let editColor   = $state<string | null>(null);   // null = automatic colour
+  let colorError  = $state<string | null>(null);   // quick-pick (detail view) failures
   let editError   = $state<string | null>(null);
   let editSaving  = $state(false);
 
@@ -90,6 +95,43 @@
   });
 
   // ---------------------------------------------------------------------------
+  // Colour
+  // ---------------------------------------------------------------------------
+
+  // The id the backend will assign a NEW material (mirrors materials.py:
+  // name.replace(" ", "_").upper()), so the "automatic" swatch previews the
+  // same hash colour the viewport will really use for it.
+  const editPreviewId = $derived(
+    isNewMaterial ? editName.trim().replace(/ /g, '_').toUpperCase() : editId,
+  );
+
+  // Tell the 3D viewport the library changed. Fire-and-forget: it never throws
+  // (keeps previous colours on failure) and the modal shouldn't wait on it.
+  function refreshViewportColors() { void loadMaterialColors(); }
+
+  // Detail-view quick pick: saves immediately (one PUT per committed pick).
+  async function saveColorQuick(next: string | null) {
+    if (!selected) return;
+    colorError = null;
+    if (selected.density == null) {
+      colorError = 'This material has no density — use Edit to set one before changing its colour.';
+      return;
+    }
+    try {
+      selected = await api.materials.update(selected.id, {
+        name: selected.name,
+        density: selected.density,
+        composition: selected.composition,
+        color: next,
+      });
+      await loadMaterials();
+      refreshViewportColors();
+    } catch (e: unknown) {
+      colorError = e instanceof Error ? e.message : 'Could not save colour.';
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // Select / edit / delete
   // ---------------------------------------------------------------------------
 
@@ -97,6 +139,7 @@
     const detail = await api.materials.get(mat.id);
     selected = detail;
     editing  = false;
+    colorError = null;
   }
 
   function startEdit(mat: MaterialDetail) {
@@ -105,6 +148,7 @@
     editDensity     = String(mat.density ?? '');
     editComposition = JSON.stringify(mat.composition, null, 2);
     editLibTag      = 'user';
+    editColor       = mat.color ?? null;
     editError       = null;
     isNewMaterial   = false;
     editing         = true;
@@ -116,6 +160,7 @@
     editDensity     = '';
     editComposition = '{\n  "": 1.0\n}';
     editLibTag      = 'user';
+    editColor       = null;
     editError       = null;
     isNewMaterial   = true;
     selected        = null;
@@ -138,7 +183,7 @@
         editError = 'Density must be a positive number.';
         return;
       }
-      const body = { name: editName, density, composition };
+      const body = { name: editName, density, composition, color: editColor };
       if (isNewMaterial) {
         await api.materials.create(body, editLibTag);
       } else {
@@ -147,6 +192,7 @@
       editing  = false;
       selected = null;
       await Promise.all([loadLibraries(), loadMaterials()]);
+      refreshViewportColors();
     } catch (e: unknown) {
       editError = e instanceof Error ? e.message : 'Save failed.';
     } finally {
@@ -160,6 +206,7 @@
     selected = null;
     editing  = false;
     await Promise.all([loadLibraries(), loadMaterials()]);
+    refreshViewportColors();
   }
 
   async function deleteLibrary(tag: string) {
@@ -167,6 +214,7 @@
     await api.materials.deleteLibrary(tag);
     activeLibTag = null;
     await Promise.all([loadLibraries(), loadMaterials()]);
+    refreshViewportColors();
   }
 
   // ---------------------------------------------------------------------------
@@ -185,6 +233,7 @@
         errors:   res.errors,
       };
       await Promise.all([loadLibraries(), loadMaterials()]);
+      refreshViewportColors();
     } catch (e: unknown) {
       importResult = { imported: 0, skipped: 0, errors: [e instanceof Error ? e.message : 'Import failed'] };
     } finally {
@@ -295,6 +344,11 @@
                 class:active={selected?.id === mat.id}
                 onclick={() => selectMaterial(mat)}
               >
+                <span
+                  class="mat-swatch"
+                  style="background:{mat.color ?? defaultMaterialColorHex(mat.id)}"
+                  title={mat.color ? `Custom colour ${mat.color}` : 'Automatic colour'}
+                ></span>
                 <span class="mat-id">{mat.id}</span>
                 <span class="mat-name">{mat.name}</span>
                 <span class="mat-density">{mat.density ?? '—'} g/cm³</span>
@@ -326,6 +380,14 @@
               Density (g/cm³)
               <input class="form-input" type="number" step="any" min="0" bind:value={editDensity} />
             </label>
+            <div class="form-label">
+              <span>Colour in 3D view</span>
+              <MaterialColorField
+                value={editColor}
+                defaultHex={defaultMaterialColorHex(editPreviewId || 'material')}
+                onchange={(c) => (editColor = c)}
+              />
+            </div>
             <label class="form-label">
               Library tag
               <input class="form-input" type="text" bind:value={editLibTag} />
@@ -362,8 +424,20 @@
                   <td class="dt-key">Nuclides</td>
                   <td>{Object.keys(selected.composition).length}</td>
                 </tr>
+                <tr>
+                  <td class="dt-key">Colour</td>
+                  <td>
+                    <MaterialColorField
+                      value={selected.color ?? null}
+                      defaultHex={defaultMaterialColorHex(selected.id)}
+                      onchange={saveColorQuick}
+                    />
+                  </td>
+                </tr>
               </tbody>
             </table>
+
+            {#if colorError}<div class="form-error">{colorError}</div>{/if}
 
             <div class="composition-title">Composition (atom fractions)</div>
             <div class="composition-list">
@@ -538,6 +612,10 @@
   .mat-row:hover { background: var(--color-bg-raised); }
   .mat-row.active { background: rgba(6,182,212,0.1); }
 
+  .mat-swatch {
+    width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0;
+    border: 1px solid rgba(255,255,255,0.25);
+  }
   .mat-id {
     font-family: var(--font-mono); font-size: 11px;
     color: var(--color-accent-hi); min-width: 70px; flex-shrink: 0;

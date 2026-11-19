@@ -35,6 +35,7 @@
   // inside isVisible/toggleVisibility. Must match ObjectPanel's import path.
   import { isVisible, visibility } from '../stores/visibility.svelte.js';
   import { baseGroupName } from '../csgCellGrouping';
+  import { materialColorState, loadMaterialColors, resolveMaterialColorRgb01 } from '../stores/materialColors.svelte.js';
   import { resolveWorldCells, transformAABB, QUAT_IDENTITY, type Quat, type WorldCell } from '../csgUniverses';
   import type { CsgCell, CsgGeometry, CsgSurface, RegionNode, LatticeInstance } from '$lib/types';
 
@@ -251,58 +252,10 @@
     }
   }
 
-  // Curated palette — keep in sync with scene_builder_service._MATERIAL_COLORS
-  // so CSG viewport matches ResultsViewport3D / GeometryPlotPanel.
-  const MATERIAL_COLORS: Record<string, string> = {
-    'UO2': '#E8703A', 'UO2_3.5pct': '#E8703A', 'UO2_4pct': '#D4612E',
-    'ThO2': '#C8A882', 'UC': '#B06030',
-    'He': '#D0EEF8', 'He4': '#D0EEF8', 'Air': '#E8F4F8',
-    'Zr4': '#8BAFC0', 'Zircaloy': '#8BAFC0', 'Zircaloy-4': '#8BAFC0',
-    'SS304': '#A0A8B0', 'SS316': '#9098A8', 'Steel': '#909090',
-    'Al': '#C8D0D8',
-    'H2O': '#4A90D9', 'Water': '#4A90D9', 'D2O': '#3A7AC0',
-    'Na': '#F0C040', 'LiFBeF2': '#90D0A0', 'FLiBe': '#90D0A0',
-    'B4C': '#303030', 'Hafnium': '#606878', 'Hf': '#606878',
-    'AgInCd': '#788090', 'Gd2O3': '#A08060',
-    'Graphite': '#505050', 'Be': '#B0C8B0', 'Pb': '#787870',
-    'void': '#101020', 'Void': '#101020',
-  };
-
-  function hexToRgb01(hex: string): [number, number, number] {
-    const h = hex.replace('#', '');
-    const n = parseInt(h.length === 3 ? h.split('').map((c) => c + c).join('') : h, 16);
-    return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
-  }
-
-  function hashColor(id: string): [number, number, number] {
-    let h = 2166136261;
-    for (let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619); }
-    return hslToRgb(((h >>> 0) % 360) / 360, 0.55, 0.55);
-  }
-
-  function resolveMaterialColor(id: string): [number, number, number] {
-    const curated = MATERIAL_COLORS[id];
-    if (curated) return hexToRgb01(curated);
-    const lower = id.toLowerCase();
-    for (const [k, v] of Object.entries(MATERIAL_COLORS)) {
-      if (k.toLowerCase() === lower) return hexToRgb01(v);
-    }
-    return hashColor(id);
-  }
-  function hslToRgb(h: number, s: number, l: number): [number, number, number] {
-    const c = (1 - Math.abs(2 * l - 1)) * s;
-    const hp = h * 6;
-    const x = c * (1 - Math.abs((hp % 2) - 1));
-    let [r1, g1, b1] = [0, 0, 0];
-    if (hp < 1) [r1, g1, b1] = [c, x, 0];
-    else if (hp < 2) [r1, g1, b1] = [x, c, 0];
-    else if (hp < 3) [r1, g1, b1] = [0, c, x];
-    else if (hp < 4) [r1, g1, b1] = [0, x, c];
-    else if (hp < 5) [r1, g1, b1] = [x, 0, c];
-    else [r1, g1, b1] = [c, 0, x];
-    const m = l - c / 2;
-    return [r1 + m, g1 + m, b1 + m];
-  }
+  // Material colours: user override (material library) → curated palette → hash.
+  // The palette/hash live in ../materialColors.ts (keep in sync with
+  // scene_builder_service._MATERIAL_COLORS); overrides in the shared store.
+  const resolveMaterialColor = resolveMaterialColorRgb01;
 
   interface AxisBounds { xMin: number; xMax: number; yMin: number; yMax: number; zMin: number; zMax: number; }
 
@@ -601,6 +554,14 @@
     // Also re-run when the map gains its first hide (keys go from 0 → 1).
     void Object.keys(visibility).length;
     if (shaderMaterial && csg) rebuildAndRender();
+  });
+
+  // Re-pack protos when a material's colour changes in the material library
+  // (colours are baked into the proto table, so this needs a rebuild, not just
+  // a uniform write). `version` only bumps when the override set really changed.
+  $effect(() => {
+    void materialColorState.version;
+    untrack(() => { if (shaderMaterial && csg) rebuildAndRender(); });
   });
 
   let canvasEl: HTMLCanvasElement;
@@ -2428,6 +2389,7 @@
   }
 
   onMount(() => {
+    void loadMaterialColors();   // user colours from the material library
     scene = new THREE.Scene();
     camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
     shaderMaterial = new THREE.ShaderMaterial({ uniforms: makeUniforms(), vertexShader: VERTEX_SHADER, fragmentShader: FRAGMENT_SHADER, defines: { HEATMAP: 0 } });

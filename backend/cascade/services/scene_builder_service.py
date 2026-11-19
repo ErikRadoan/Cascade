@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from ..dsl.schema.base import BaseComponentSchema
@@ -40,7 +41,21 @@ _MATERIAL_OPACITY: dict[str, float] = {
 _DEFAULT_OPACITY = 1.0
 
 
-def material_color(mid: str) -> str:
+def material_color(mid: str, overrides: Mapping[str, str] | None = None) -> str:
+    """Display colour for a material id.
+
+    `overrides` are the user's per-material colours from the material
+    library (MaterialRepository.color_overrides()); they win over the
+    built-in palette. Matching mirrors the palette: exact id first, then
+    case-insensitive — same rule the CSG viewport applies client-side.
+    """
+    if overrides:
+        if mid in overrides:
+            return overrides[mid]
+        lower = mid.lower()
+        for k, v in overrides.items():
+            if k.lower() == lower:
+                return v
     if mid in _MATERIAL_COLORS:
         return _MATERIAL_COLORS[mid]
     for k, v in _MATERIAL_COLORS.items():
@@ -148,7 +163,11 @@ class SceneBuilder:
     A SquareLattice with nx=17, ny=17 produces 289 SceneComponents.
     """
 
-    def build(self, schemas: dict[str, BaseComponentSchema]) -> SceneDescription:
+    def build(
+        self,
+        schemas: dict[str, BaseComponentSchema],
+        color_overrides: Mapping[str, str] | None = None,
+    ) -> SceneDescription:
         # Separate templates from placements
         templates:  dict[str, BaseComponentSchema] = {}
         placements: dict[str, BaseComponentSchema] = {}
@@ -175,7 +194,7 @@ class SceneBuilder:
                 tpl = templates.get(schema.template)
                 if tpl is None:
                     continue
-                comp = self._build_placed(name, tpl, schema.position())
+                comp = self._build_placed(name, tpl, schema.position(), color_overrides)
                 if comp:
                     components.append(comp)
                     _register_colors(comp)
@@ -185,7 +204,7 @@ class SceneBuilder:
                 if tpl is None:
                     continue
                 for i, pos in enumerate(schema.pin_positions()):
-                    comp = self._build_placed(f"{name}_{i}", tpl, pos)
+                    comp = self._build_placed(f"{name}_{i}", tpl, pos, color_overrides)
                     if comp:
                         components.append(comp)
                         _register_colors(comp)
@@ -195,7 +214,7 @@ class SceneBuilder:
                 if tpl is None:
                     continue
                 for i, pos in enumerate(schema.pin_positions()):
-                    comp = self._build_placed(f"{name}_{i}", tpl, pos)
+                    comp = self._build_placed(f"{name}_{i}", tpl, pos, color_overrides)
                     if comp:
                         components.append(comp)
                         _register_colors(comp)
@@ -212,17 +231,19 @@ class SceneBuilder:
         name: str,
         template: BaseComponentSchema,
         position: tuple[float, float, float],
+        color_overrides: Mapping[str, str] | None = None,
     ) -> SceneComponent | None:
         """Build one SceneComponent for a template at a given position."""
         if isinstance(template, FuelPinSchema):
-            return self._build_fuel_pin(name, template, position)
+            return self._build_fuel_pin(name, template, position, color_overrides)
         if isinstance(template, BoxSchema):
-            return self._build_box(name, template, position)
+            return self._build_box(name, template, position, color_overrides)
         return None
 
     def _build_fuel_pin(
         self, name: str, schema: FuelPinSchema,
         position: tuple[float, float, float],
+        color_overrides: Mapping[str, str] | None = None,
     ) -> SceneComponent:
         layers: list[CylinderLayer] = []
         prev_r = 0.0
@@ -235,7 +256,7 @@ class SceneBuilder:
             layers.append(CylinderLayer(
                 r_inner=prev_r, r_outer=r_outer,
                 height=schema.pellet_height, z_base=position[2],
-                material_id=mat_id, color=material_color(mat_id),
+                material_id=mat_id, color=material_color(mat_id, color_overrides),
                 opacity=material_opacity(mat_id),
                 label=labels.get(mat_id, mat_id),
                 # `name` here is exactly the cell_name_prefix expand.py's
@@ -250,6 +271,7 @@ class SceneBuilder:
     def _build_box(
         self, name: str, schema: BoxSchema,
         position: tuple[float, float, float],
+        color_overrides: Mapping[str, str] | None = None,
     ) -> SceneComponent:
         bt_colors = {
             "reflective": "#FFFFFF", "vacuum": "#FF4444",
@@ -260,7 +282,7 @@ class SceneBuilder:
             x_size=schema.x_size, y_size=schema.y_size, z_size=schema.z_size,
             z_base=position[2], color=bt_colors.get(bt_str, "#FFFFFF"),
             boundary_type=bt_str, fill_material_id=schema.material,
-            fill_color=material_color(schema.material),
+            fill_color=material_color(schema.material, color_overrides),
             fill_opacity=material_opacity(schema.material),
             # Matches expander.py's _build_fill_cell, which now names the
             # fill Cell after the box's placement name (the same `name`

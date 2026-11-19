@@ -15,7 +15,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from pydantic import BaseModel, Field, field_serializer
+from pydantic import BaseModel, Field, field_serializer, field_validator
+
+from ..domain.material import normalize_hex_color
 
 
 # ---------------------------------------------------------------------------
@@ -150,12 +152,28 @@ class MaterialCreateRequest(BaseModel):
         ...,
         description="Nuclide name → atom fraction. e.g. {'U235': 0.03, 'U238': 0.97}",
     )
+    # Display-only colour for the 3D viewports. None/omitted/"" = automatic.
+    # NOTE: PUT is a full replace, so omitting `color` on update resets it.
+    color: str | None = Field(
+        None,
+        description="Viewport colour as hex, e.g. '#E8703A'. Null = automatic palette colour.",
+    )
+
+    @field_validator("color", mode="before")
+    @classmethod
+    def _normalise_color(cls, v: object) -> str | None:
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError("color must be a hex string like '#E8703A'.")
+        return normalize_hex_color(v)
 
 
 class MaterialSummary(BaseModel):
     id:   str
     name: str
     density: float | None
+    color: str | None = None
 
 
 class MaterialDetail(MaterialSummary):

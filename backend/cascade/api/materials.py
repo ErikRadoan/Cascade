@@ -28,7 +28,7 @@ _repo = MaterialRepository()
 
 
 def _to_summary(mat: Material, library_tag: str | None = None) -> MaterialSummary:
-    return MaterialSummary(id=mat.id, name=mat.name, density=mat.density)
+    return MaterialSummary(id=mat.id, name=mat.name, density=mat.density, color=mat.color)
 
 
 def _to_detail(mat: Material) -> MaterialDetail:
@@ -36,6 +36,7 @@ def _to_detail(mat: Material) -> MaterialDetail:
         id=mat.id, name=mat.name,
         density=mat.density,
         composition=mat.composition,
+        color=mat.color,
     )
 
 
@@ -92,6 +93,7 @@ async def create_material(
     mat = Material(
         id=mat_id, name=body.name,
         density=body.density, composition=body.composition,
+        color=body.color,
     )
     try:
         _repo.save(mat, library_tag=library_tag)
@@ -120,6 +122,7 @@ async def update_material(material_id: str, body: MaterialCreateRequest) -> Mate
     updated = Material(
         id=material_id, name=body.name,
         density=body.density, composition=body.composition,
+        color=body.color,
     )
     try:
         _repo.update(updated)

@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ..domain.material import Material
+from ..domain.material import Material, normalize_hex_color
 
 # ---------------------------------------------------------------------------
 # Pre-seeded defaults — written on first initialisation if the file
@@ -193,6 +193,18 @@ class MaterialRepository:
     def exists(self, material_id: str) -> bool:
         return material_id in self._read()
 
+    def color_overrides(self) -> dict[str, str]:
+        """Return {material_id: '#RRGGBB'} for every material with a custom colour.
+
+        Cheap single read; used by the scene builder so /geometry/scene and
+        /jobs/{id}/scene render the same colours as the CSG viewport.
+        """
+        return {
+            mid: record["color"]
+            for mid, record in self._read().items()
+            if record.get("color")
+        }
+
     # ------------------------------------------------------------------
     # Write
     # ------------------------------------------------------------------
@@ -277,6 +289,11 @@ class MaterialRepository:
                         for k, v in item.get("composition", {}).items()
                     },
                 }
+                # Optional display colour; invalid values are a per-item
+                # error (ValueError is caught below), not a silent drop.
+                color = normalize_hex_color(item.get("color"))
+                if color:
+                    record["color"] = color
                 data[mat_id] = record
                 imported.append(mat_id)
             except (KeyError, ValueError, TypeError) as e:
@@ -298,14 +315,20 @@ class MaterialRepository:
             name=        record.get("name", record["id"]),
             density=     record.get("density"),
             composition= record.get("composition", {}),
+            color=       record.get("color") or None,
         )
 
     @staticmethod
     def _to_record(material: Material, library_tag: str) -> dict:
-        return {
+        record = {
             "id":          material.id,
             "name":        material.name,
             "density":     material.density,
             "library_tag": library_tag,
             "composition": material.composition,
         }
+        # Only written when set, so files without custom colours stay
+        # byte-identical to the pre-colour format.
+        if material.color:
+            record["color"] = material.color
+        return record
