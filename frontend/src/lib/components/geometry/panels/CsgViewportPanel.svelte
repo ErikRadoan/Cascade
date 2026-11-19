@@ -85,6 +85,17 @@
   // than the cell on tall thin objects (see cellAABB).
   const AABB_PAD_FLOOR_FRACTION = 10 * EPS_MIN_FRACTION;
   const IDLE_DPR = Math.min(typeof window !== 'undefined' ? window.devicePixelRatio : 1.5, 1.5);
+  // ---- render-perf pass 1 switches ---------------------------------------------------------
+  // Table lookups in the shader use texelFetch (integer addressing; no float divides per fetch).
+  // Output is bit-identical to the old texture2D path. Flip to false to A/B it with the GPU-ms badge.
+  const SHADER_TEXELFETCH = true;
+  // While the camera moves, choose the render scale from the MEASURED GPU cost per pixel so a frame
+  // lands near TARGET_FRAME_MS (needs EXT_disjoint_timer_query_webgl2: Chromium browsers). Without
+  // the extension the fixed INTERACT_DPR above is used, exactly as before.
+  const ADAPTIVE_INTERACT_DPR = true;
+  const TARGET_FRAME_MS = 14;
+  const MIN_INTERACT_DPR = 0.3;
+  const MAX_INTERACT_DPR = Math.min(1.0, IDLE_DPR);
 
   const OP_INSIDE = 0, OP_OUTSIDE = 1, OP_AND = 2, OP_OR = 3, OP_NOT = 4;
 
@@ -410,22 +421,95 @@
     return { xMin: Math.min(a.xMin, b.xMin), xMax: Math.max(a.xMax, b.xMax), yMin: Math.min(a.yMin, b.yMin), yMax: Math.max(a.yMax, b.yMax), zMin: Math.min(a.zMin, b.zMin), zMax: Math.max(a.zMax, b.zMax) };
   }
 
+  // ---- BVH build: binned surface-area heuristic (render-perf pass 2) ---------------------------
+  // WHY: the old build split at the median centroid of the longest axis. That cannot separate a
+  // big container box from the small things inside it (a shell's centroid sits in the middle of
+  // everything), so a scene of nested boxes + pins had every ray visit ~15 nodes of a 77-node tree
+  // (see the "Cost: BVH nodes" heat-map). SAH picks the split minimising
+  // nLeft * area(left) + nRight * area(right), which isolates large overlapping boxes near the root.
+  // Measured on a CPU model of the shader walk for 3 nested boxes + 36 pins: mean visits 15.0 -> 7.4.
+  // Output format is unchanged (flattenBvh / the shader do not care how the tree was chosen).
+  const BVH_SAH_BINS = 16;
+  // The shader's traversal stack holds MAX_BVH_STACK = 64 entries and a walk can have one pending
+  // sibling per tree level. SAH trees are not balanced, so past this depth fall back to the old
+  // balanced median split for the subtree (worst case 40 + log2(16384) = 54 levels < 64).
+  const BVH_SAH_MAX_DEPTH = 40;
+
   interface BvhBuildNode { bounds: AxisBounds; isLeaf: boolean; instanceIndex: number; left: BvhBuildNode | null; right: BvhBuildNode | null; }
 
-  function buildBvh(indices: number[], boxes: AxisBounds[]): BvhBuildNode {
+  function surfaceArea(b: AxisBounds): number {
+    const x = b.xMax - b.xMin, y = b.yMax - b.yMin, z = b.zMax - b.zMin;
+    return 2 * (x * y + y * z + z * x);
+  }
+  function axisCentroid(b: AxisBounds, axis: number): number {
+    return axis === 0 ? (b.xMin + b.xMax) / 2 : axis === 1 ? (b.yMin + b.yMax) / 2 : (b.zMin + b.zMax) / 2;
+  }
+
+  /** Best SAH partition of `indices` into two non-empty groups, or null if no axis separates them. */
+  function sahSplit(indices: number[], boxes: AxisBounds[]): [number[], number[]] | null {
+    const NB = BVH_SAH_BINS;
+    let best = { cost: Infinity, axis: 0, lo: 0, scale: 0, split: 0 };
+    const binCount = new Int32Array(NB);
+    const binBox: (AxisBounds | null)[] = new Array(NB).fill(null);
+    const rightArea = new Float64Array(NB), rightN = new Int32Array(NB);
+    for (let axis = 0; axis < 3; axis++) {
+      let lo = Infinity, hi = -Infinity;
+      for (const i of indices) { const c = axisCentroid(boxes[i], axis); if (c < lo) lo = c; if (c > hi) hi = c; }
+      if (!(hi - lo > 1e-12)) continue;                       // all centroids equal on this axis
+      const scale = NB / (hi - lo);
+      binCount.fill(0); binBox.fill(null);
+      for (const i of indices) {
+        const k = Math.min(NB - 1, Math.floor((axisCentroid(boxes[i], axis) - lo) * scale));
+        binCount[k]++;
+        binBox[k] = binBox[k] ? unionAABB(binBox[k]!, boxes[i]) : boxes[i];
+      }
+      // Two O(NB) sweeps (suffix then prefix) instead of re-merging bins per candidate split.
+      let acc: AxisBounds | null = null, n = 0;
+      for (let k = NB - 1; k >= 1; k--) {
+        if (binBox[k]) acc = acc ? unionAABB(acc, binBox[k]!) : binBox[k];
+        n += binCount[k];
+        rightN[k] = n; rightArea[k] = acc ? surfaceArea(acc) : 0;
+      }
+      acc = null; n = 0;
+      for (let k = 0; k < NB - 1; k++) {
+        if (binBox[k]) acc = acc ? unionAABB(acc, binBox[k]!) : binBox[k];
+        n += binCount[k];
+        if (n === 0 || rightN[k + 1] === 0) continue;         // both sides must be non-empty
+        const cost = n * surfaceArea(acc!) + rightN[k + 1] * rightArea[k + 1];
+        if (cost < best.cost) best = { cost, axis, lo, scale, split: k + 1 };
+      }
+    }
+    if (best.cost === Infinity) return null;
+    const left: number[] = [], right: number[] = [];
+    for (const i of indices) {
+      const k = Math.min(NB - 1, Math.floor((axisCentroid(boxes[i], best.axis) - best.lo) * best.scale));
+      (k < best.split ? left : right).push(i);
+    }
+    return left.length && right.length ? [left, right] : null;
+  }
+
+  function buildBvh(indices: number[], boxes: AxisBounds[], depth = 0): BvhBuildNode {
     if (indices.length === 1) {
       const i = indices[0];
       return { bounds: boxes[i], isLeaf: true, instanceIndex: i, left: null, right: null };
     }
-    let combined = boxes[indices[0]];
-    for (let k = 1; k < indices.length; k++) combined = unionAABB(combined, boxes[indices[k]]);
-    const spanX = combined.xMax - combined.xMin, spanY = combined.yMax - combined.yMin, spanZ = combined.zMax - combined.zMin;
-    const axis: 'x' | 'y' | 'z' = spanX >= spanY && spanX >= spanZ ? 'x' : spanY >= spanZ ? 'y' : 'z';
-    const centroid = (i: number) => { const b = boxes[i]; return axis === 'x' ? (b.xMin + b.xMax) / 2 : axis === 'y' ? (b.yMin + b.yMax) / 2 : (b.zMin + b.zMax) / 2; };
-    const sorted = [...indices].sort((a, b) => centroid(a) - centroid(b));
-    const mid = Math.floor(sorted.length / 2);
-    const left = buildBvh(sorted.slice(0, mid), boxes);
-    const right = buildBvh(sorted.slice(mid), boxes);
+    let leftIdx: number[] | null = null, rightIdx: number[] | null = null;
+    if (depth < BVH_SAH_MAX_DEPTH) {
+      const split = sahSplit(indices, boxes);
+      if (split) [leftIdx, rightIdx] = split;
+    }
+    if (!leftIdx || !rightIdx) {
+      // Fallback (deep subtree, or every centroid identical): balanced median split, longest axis.
+      let combined = boxes[indices[0]];
+      for (let k = 1; k < indices.length; k++) combined = unionAABB(combined, boxes[indices[k]]);
+      const spanX = combined.xMax - combined.xMin, spanY = combined.yMax - combined.yMin, spanZ = combined.zMax - combined.zMin;
+      const axis = spanX >= spanY && spanX >= spanZ ? 0 : spanY >= spanZ ? 1 : 2;
+      const sorted = [...indices].sort((a, b) => axisCentroid(boxes[a], axis) - axisCentroid(boxes[b], axis));
+      const mid = Math.floor(sorted.length / 2);
+      leftIdx = sorted.slice(0, mid); rightIdx = sorted.slice(mid);
+    }
+    const left = buildBvh(leftIdx, boxes, depth + 1);
+    const right = buildBvh(rightIdx, boxes, depth + 1);
     return { bounds: unionAABB(left.bounds, right.bounds), isLeaf: false, instanceIndex: -1, left, right };
   }
 
@@ -483,7 +567,8 @@
   //     the sampled pixel is background color) points straight at the bug.
   let debugWalls = $state(false);
   interface DebugBoxEntry { name: string; aabb: AxisBounds; color: string; }
-  let lastDebugBoxes: DebugBoxEntry[] = [];
+  // Built on demand by logCsgDebug() only (see the closure assigned in rebuildAndRender).
+  let debugBoxSource: (() => DebugBoxEntry[]) | null = null;
 
   // The CSG comes from the shared store (the same request ObjectPanel makes),
   // so one edit costs one backend expansion instead of one per panel.
@@ -551,6 +636,99 @@
   let hasFramedOnce = false;
   let interactTimer: ReturnType<typeof setTimeout> | undefined;
 
+  // ---- GPU frame timing, adaptive interaction scale, cost heat-map (render-perf pass 1) ------
+  // renderer.render() only SUBMITS work, so the old [perf] log (which timed that call) measured CPU
+  // submit time, not what the shader costs. These timer queries measure the GPU itself.
+  // RULE FOR FUTURE EDITORS: judge any shader change by the GPU-ms badge / [perf] GPU log, never
+  // by timing renderer.render() on the CPU. Heat-map: bottom-left "Cost" button (see HEATMAP in the shader).
+  interface GpuQuery { q: WebGLQuery; megapixels: number; }
+  let gpuTimer: { ext: any; gl: WebGL2RenderingContext } | null = null;
+  const gpuQueries: GpuQuery[] = [];
+  let gpuPollHandle: number | null = null;
+  let msPerMpx: number | null = null;   // smoothed GPU ms per megapixel for the current view
+  let gpuLogSum = 0, gpuLogCount = 0, gpuLabelAt = 0;
+  let gpuMsLabel = $state<string | null>(null);
+  let interactDpr = INTERACT_DPR;       // current interaction scale (see interactionScale)
+
+  function initGpuTimer() {
+    try {
+      const gl = renderer.getContext() as WebGL2RenderingContext;
+      const ext = gl.getExtension('EXT_disjoint_timer_query_webgl2');
+      if (ext) gpuTimer = { ext, gl };
+    } catch (_) { /* stays null */ }
+    console.log(`[csg-viewer] GPU timer queries: ${gpuTimer ? 'available' : 'unavailable -> fixed interaction scale'}`);
+  }
+
+  /** renderer.render() inside a GPU timer query (at most 4 results pending at once). */
+  function timedRender() {
+    if (!gpuTimer || gpuQueries.length >= 4) { renderer.render(scene, camera); return; }
+    const { ext, gl } = gpuTimer;
+    const q = gl.createQuery();
+    if (!q) { renderer.render(scene, camera); return; }
+    gl.beginQuery(ext.TIME_ELAPSED_EXT, q);
+    renderer.render(scene, camera);
+    gl.endQuery(ext.TIME_ELAPSED_EXT);
+    renderer.getDrawingBufferSize(_bufSize);
+    gpuQueries.push({ q, megapixels: (_bufSize.x * _bufSize.y) / 1e6 });
+    if (gpuPollHandle === null) gpuPollHandle = requestAnimationFrame(pollGpuTimer);
+  }
+
+  // Results arrive 1-3 frames late, so poll on rAF until the queue drains (idle frames included).
+  function pollGpuTimer() {
+    gpuPollHandle = null;
+    if (!gpuTimer) return;
+    const { ext, gl } = gpuTimer;
+    if (gl.getParameter(ext.GPU_DISJOINT_EXT)) {          // clock changed / GPU reset: results invalid
+      for (const e of gpuQueries) gl.deleteQuery(e.q);
+      gpuQueries.length = 0;
+      return;
+    }
+    while (gpuQueries.length && gl.getQueryParameter(gpuQueries[0].q, gl.QUERY_RESULT_AVAILABLE)) {
+      const e = gpuQueries.shift()!;
+      onGpuFrameTime(gl.getQueryParameter(e.q, gl.QUERY_RESULT) / 1e6, e);
+      gl.deleteQuery(e.q);
+    }
+    if (gpuQueries.length) gpuPollHandle = requestAnimationFrame(pollGpuTimer);
+  }
+
+  function onGpuFrameTime(ms: number, e: GpuQuery) {
+    const perMpx = ms / Math.max(e.megapixels, 1e-6);
+    msPerMpx = msPerMpx === null ? perMpx : 0.7 * msPerMpx + 0.3 * perMpx;   // EMA: stable across scale changes
+    gpuLogSum += ms; gpuLogCount++;
+    if (gpuLogCount === 30) {
+      console.log(`[perf] GPU avg=${(gpuLogSum / 30).toFixed(2)}ms  ${msPerMpx.toFixed(2)} ms/Mpx  protos=${prototypeCount} instances=${instanceCount} instancing=${usingInstancing}`);
+      gpuLogSum = 0; gpuLogCount = 0;
+    }
+    const now = performance.now();
+    if (now - gpuLabelAt > 250) { gpuLabelAt = now; gpuMsLabel = `${ms.toFixed(1)} ms`; }   // throttled: it is reactive state
+  }
+
+  /** Render scale while the camera moves: the largest one predicted to fit TARGET_FRAME_MS. */
+  function interactionScale(): number {
+    if (!ADAPTIVE_INTERACT_DPR || msPerMpx === null || !containerEl) return INTERACT_DPR;
+    const cssMpx = (containerEl.clientWidth * containerEl.clientHeight) / 1e6;
+    if (cssMpx <= 0) return INTERACT_DPR;
+    // frame ms ~= msPerMpx * cssMpx * dpr^2  ->  solve for the dpr that hits the target
+    const want = Math.sqrt(TARGET_FRAME_MS / (msPerMpx * cssMpx));
+    const snapped = Math.round(Math.min(MAX_INTERACT_DPR, Math.max(MIN_INTERACT_DPR, want)) * 20) / 20;
+    // Dead-band: every change reallocates the canvas, so ignore moves smaller than 15 %.
+    if (Math.abs(snapped - interactDpr) / interactDpr > 0.15) interactDpr = snapped;
+    return interactDpr;
+  }
+
+  // Cost heat-map: per-pixel work counters, compiled in only while HEATMAP=1 (a recompile), so the
+  // normal shader pays nothing. Modes change a uniform only (no recompile). blue = cheap, red = costly.
+  const HEAT_MODES = ['off', 'total', 'BVH nodes', 'lattice steps', 'grid steps', 'token evals'] as const;
+  let heatMode = $state(0);
+  function cycleHeat() {
+    const wasOn = heatMode > 0;
+    heatMode = (heatMode + 1) % HEAT_MODES.length;
+    const isOn = heatMode > 0;
+    if (isOn !== wasOn) { shaderMaterial.defines.HEATMAP = isOn ? 1 : 0; shaderMaterial.needsUpdate = true; }
+    shaderMaterial.uniforms.uHeatMode.value = heatMode;
+    render();
+  }
+
   const VERTEX_SHADER = `varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.0,1.0); }`;
 
   // Phase B: analytic intervals for primary hit; SDF tetrahedron normals; Phase C instancing.
@@ -596,12 +774,45 @@
     uniform float uMarkOverlaps;  // >0.5 tints pixels where two solid cells genuinely overlap
     varying vec2 vUv;
 
+    // ---- render-perf pass 1: switches, cost counters, shared per-ray state ------------------
+    #define USE_TEXELFETCH ${SHADER_TEXELFETCH ? 1 : 0}
+    uniform int uHeatMode;
+    // HEATMAP is a MATERIAL DEFINE (see cycleHeat): 0 compiles every counter below away.
+    #if HEATMAP
+    int gNodes = 0, gLatSteps = 0, gGridSteps = 0, gTokEvals = 0;
+    #define COUNT_NODE gNodes++;
+    #define COUNT_LAT gLatSteps++;
+    #define COUNT_GRID gGridSteps++;
+    #define COUNT_TOK(n) gTokEvals += (n);
+    #else
+    #define COUNT_NODE
+    #define COUNT_LAT
+    #define COUNT_GRID
+    #define COUNT_TOK(n)
+    #endif
+    vec3 heatRamp(float x) {   // jet-style: 0 = dark blue ... 1 = dark red
+      x = clamp(x, 0.0, 1.0);
+      return clamp(vec3(1.5 - abs(4.0 * x - 3.0), 1.5 - abs(4.0 * x - 2.0), 1.5 - abs(4.0 * x - 1.0)), 0.0, 1.0);
+    }
+    // 1 / rd of the PRIMARY (world-space) ray, near-zero components clamped exactly as boxInterval()
+    // does. Set once in main(); used by boxIntervalInv(). Do not use it for local-frame rays.
+    vec3 gInvRd;
+
     // Element idx of a linear table wrapped at width w (texels), h rows.
+    #if USE_TEXELFETCH
+    // Row via a float multiply (w is a compile-time constant, so this is one MAD; no integer divide,
+    // which is slow on some GPUs). Exact: idx < ~1e5 keeps (idx + 0.5) / w well clear of a row edge.
+    vec4 fetchLinear(sampler2D tex, int idx, float w, float h) {
+      int row = int((float(idx) + 0.5) / w);
+      return texelFetch(tex, ivec2(idx - row * int(w), row), 0);
+    }
+    #else
     vec4 fetchLinear(sampler2D tex, int idx, float w, float h) {
       float fi = float(idx);
       float row = floor((fi + 0.5) / w);
       return texture2D(tex, vec2((fi - row * w + 0.5) / w, (row + 0.5) / h));
     }
+    #endif
     // Surface table: params = main vec4 (centre / radius); meta.x = type id (-1 unused),
     // meta.yz = extra scalars (torus b, c).
     vec4 surfParams(int i) { return fetchLinear(uSurfTex, 2 * i, SURF_TEX_W, uSurfTexH); }
@@ -632,6 +843,20 @@
       vec3 inv = 1.0 / rdd;
       vec3 t0 = (bmin - ro) * inv;
       vec3 t1 = (bmax - ro) * inv;
+      vec3 tsm = min(t0, t1);
+      vec3 tlg = max(t0, t1);
+      float tEnter = max(max(tsm.x, tsm.y), tsm.z);
+      float tExit = min(min(tlg.x, tlg.y), tlg.z);
+      if (tEnter > tExit) return vec2(INF, NEG_INF);
+      return vec2(tEnter, tExit);
+    }
+
+    // boxInterval() for the PRIMARY ray (world frame), with 1/rd hoisted to once per pixel (gInvRd).
+    // Same arithmetic, so results are bit-identical; the BVH walk calls this ~3x per node.
+    // NOT for local-frame rays (rotated instances, torus): gInvRd belongs to the world ray.
+    vec2 boxIntervalInv(vec3 ro, vec3 bmin, vec3 bmax) {
+      vec3 t0 = (bmin - ro) * gInvRd;
+      vec3 t1 = (bmax - ro) * gInvRd;
       vec3 tsm = min(t0, t1);
       vec3 tlg = max(t0, t1);
       float tEnter = max(max(tsm.x, tsm.y), tsm.z);
@@ -865,7 +1090,11 @@
     }
 
     vec2 fetchToken(int protoIdx, int pairIdx) {
+    #if USE_TEXELFETCH
+      return texelFetch(uTokenTex, ivec2(pairIdx, protoIdx), 0).rg;
+    #else
       return texture2D(uTokenTex, vec2((float(pairIdx)+0.5)/TOK_TEX_W, (float(protoIdx)+0.5)/uTokTexH)).rg;
+    #endif
     }
     // Instance i is two texels: 2i = (offset.xyz, first prototype + GROUP_STRIDE * layer count),
     // 2i+1 = rotation quaternion (x, y, z, w), local -> world.
@@ -894,6 +1123,7 @@
     }
     float evalTokens(int protoIdx, vec3 pLocal) {
       int tokenCount = protoTokenCount(protoIdx);
+      COUNT_TOK(tokenCount)
       // Deep AND-chains (fill cell vs many pins) need more than 16 slots.
       float stack[32]; int sp = 0;
       for (int i = 0; i < MAX_TOKEN_ITERS; i++) {
@@ -1121,10 +1351,16 @@
                          abs(rd.y) < 1.0e-9 ? INF : pit.y / abs(rd.y));
       float tCur = tA;
       for (int s = 0; s < MAX_GRID_STEPS; s++) {
+        COUNT_GRID
         float tNext = min(min(tMax.x, tMax.y), tB);
         // This grid cell's pin is the shared envelope shifted by cell * pitch.
         vec3 roP = roL - vec3(cell * pit, 0.0);
         float wLo = max(tCur - pad, tStart);
+        // EXACT early-out (render-perf pass 1). Cells are visited in increasing t, so this and every
+        // later window starts at >= wLo, and the crossing filter below rejects tc >= best. Once the
+        // walk has passed best, nothing can improve it. Before this, a hit found early still left
+        // the walk running to the far side of the grid (every remaining cell paid its full token loop).
+        if (wLo >= best) break;
         float wHi = min(tNext + pad, min(tEnd, best));
         for (int i = 0; i < MAX_EXACT_TOKENS; i++) {
           if (i >= envTokens) break;
@@ -1322,6 +1558,7 @@
                          abs(rd.y) < 1.0e-9 ? INF : ip.y / abs(rd.y));
       float tCur = tS;
       for (int s = 0; s < MAX_LAT_STEPS; s++) {
+        COUNT_LAT
         float tNext = min(min(tMax.x, tMax.y), tE);
         // Front to back: once a hit is known, a cell entered beyond its tie window cannot win.
         float tTol = (tBest < INF) ? tieAt(tBest) : 0.0;
@@ -1331,7 +1568,7 @@
         vec3 off = vec3(asmOff + cell * ip, offZ);
         // The ray only matters while it is inside THIS pin's box: skip cells it merely crosses
         // (the gaps between pins) and start the exact test where it enters the box.
-        vec2 pbi = boxInterval(ro, rd, bLo + off - pad, bHi + off + pad);
+        vec2 pbi = boxIntervalInv(ro, bLo + off - pad, bHi + off + pad);
         // Then to the pin's envelope circle (env = centre xy, radius; radius 0 = none). A ray that
         // only clips the box CORNER misses the circle and costs no exact test at all.
         if (pbi.x <= pbi.y && env.z > 0.0) {
@@ -1403,6 +1640,7 @@
                          abs(rd.y) < 1.0e-9 ? INF : op.y / abs(rd.y));
       float tCur = tS;
       for (int s = 0; s < MAX_LAT_OUTER; s++) {
+        COUNT_LAT
         float tNext = min(min(tMax.x, tMax.y), tE);
         float tTol = (tBest < INF) ? tieAt(tBest) : 0.0;
         if (tCur - pad > tBest + tTol) return;
@@ -1433,11 +1671,12 @@
         if (sp <= 0) break;
         int nodeIdx = stack[--sp];
         if (nodeIdx < 0 || nodeIdx >= uBvhNodeCount) continue;
+        COUNT_NODE
         vec4 t0 = fetchBvhTexel(nodeIdx, 0);
         vec4 t1 = fetchBvhTexel(nodeIdx, 1);
         // Tie window for the current best. Zero until the first hit (tBest = INF).
         float tTol = (tBest < INF) ? tieAt(tBest) : 0.0;
-        vec2 bi = boxInterval(ro, rd, t0.xyz, t1.xyz);
+        vec2 bi = boxIntervalInv(ro, t0.xyz, t1.xyz);
         // Prune only boxes that start beyond the tie window: a box that begins
         // inside it can still hold a tied candidate.
         if (bi.x > bi.y || bi.x > tBest + tTol) continue;
@@ -1494,8 +1733,8 @@
           vec4 l1 = fetchBvhTexel(leftIdx, 1);
           vec4 r0 = fetchBvhTexel(rightIdx, 0);
           vec4 r1 = fetchBvhTexel(rightIdx, 1);
-          float tL = boxInterval(ro, rd, l0.xyz, l1.xyz).x;
-          float tR = boxInterval(ro, rd, r0.xyz, r1.xyz).x;
+          float tL = boxIntervalInv(ro, l0.xyz, l1.xyz).x;
+          float tR = boxIntervalInv(ro, r0.xyz, r1.xyz).x;
           if (tL > tR) {
             if (sp < MAX_BVH_STACK) stack[sp++] = leftIdx;
             if (sp < MAX_BVH_STACK) stack[sp++] = rightIdx;
@@ -1574,7 +1813,11 @@
       vec3 col = vec3(0.059, 0.090, 0.165);
 
       // Phase A: root AABB pre-test
-      vec2 rootHit = boxInterval(ro, rd, uSceneBMin, uSceneBMax);
+      // Per-ray constant for every world-space box test below (see boxIntervalInv).
+      gInvRd = 1.0 / vec3(abs(rd.x) < 1.0e-8 ? (rd.x >= 0.0 ? 1.0e-8 : -1.0e-8) : rd.x,
+                          abs(rd.y) < 1.0e-8 ? (rd.y >= 0.0 ? 1.0e-8 : -1.0e-8) : rd.y,
+                          abs(rd.z) < 1.0e-8 ? (rd.z >= 0.0 ? 1.0e-8 : -1.0e-8) : rd.z);
+      vec2 rootHit = boxIntervalInv(ro, uSceneBMin, uSceneBMax);
       if (rootHit.x <= rootHit.y && rootHit.y >= 0.0) {
         int hitProto; int hitInst; vec3 hitOff; bool hitOverlap;
         float t = sceneHit(ro, rd, hitProto, hitInst, hitOff, hitOverlap);
@@ -1588,6 +1831,14 @@
           if (uMarkOverlaps > 0.5 && hitOverlap) col = mix(col, vec3(1.0, 0.1, 0.8), 0.5);
         }
       }
+      #if HEATMAP
+      {
+        // Normalisers are "this pixel is heavy" levels for each counter; tune freely. blue cheap -> red costly.
+        float n = float(gNodes) / 48.0, l = float(gLatSteps) / 96.0, g = float(gGridSteps) / 96.0, k = float(gTokEvals) / 3000.0;
+        float h = (uHeatMode == 2) ? n : (uHeatMode == 3) ? l : (uHeatMode == 4) ? g : (uHeatMode == 5) ? k : 0.5 * (n + l + g + k);
+        col = heatRamp(h);
+      }
+      #endif
       gl_FragColor = vec4(col, 1.0);
     }
   `;
@@ -1619,6 +1870,7 @@
       uEpsMin: { value: 1e-4 },        // set per scene in rebuildAndRender()
       uPixelAngle: { value: 1e-3 },    // set per frame in updateCameraUniforms()
       uMarkOverlaps: { value: MARK_OVERLAPS ? 1 : 0 },
+      uHeatMode: { value: 0 },          // cost heat-map mode (only read when HEATMAP=1)
     };
   }
 
@@ -1690,7 +1942,7 @@
     ];
 
     console.log('<walls of a box displayed>');
-    for (const box of lastDebugBoxes) {
+    for (const box of debugBoxSource?.() ?? []) {
       const cx = (box.aabb.xMin + box.aabb.xMax) / 2;
       const cy = (box.aabb.yMin + box.aabb.yMax) / 2;
       const cz = (box.aabb.zMin + box.aabb.zMax) / 2;
@@ -1748,7 +2000,7 @@
 
   function beginInteraction() {
     if (!renderer) return;
-    setRenderScale(INTERACT_DPR);
+    setRenderScale(interactionScale());
     clearTimeout(interactTimer);
     interactTimer = setTimeout(() => setRenderScale(IDLE_DPR), 150);
   }
@@ -1996,19 +2248,29 @@
     // Snapshot every named proto's AABB + resolved color for the wall-debug
     // logger (see debugWalls below). Instance offsets are folded in so this
     // is world-space, matching what the shader actually renders.
-    lastDebugBoxes = protos
-      .map((p, pi) => {
-        if (p.isEnvelope) return null;
-        const inst = instances.find((ins) => pi >= ins.protoIdx && pi < ins.protoIdx + ins.count);
-        const offset = inst ? { dx: inst.dx, dy: inst.dy, dz: inst.dz } : { dx: 0, dy: 0, dz: 0 };
-        const [r, g, b] = resolveMaterialColor(p.material_id);
-        return {
-          name: p.name ?? `${p.isFill ? 'fill' : 'cell'}#${pi}`,
-          color: `#${Math.round(r * 255).toString(16).padStart(2, '0')}${Math.round(g * 255).toString(16).padStart(2, '0')}${Math.round(b * 255).toString(16).padStart(2, '0')}`,
-          aabb: transformAABB(p.aabb, [offset.dx, offset.dy, offset.dz], inst?.q ?? QUAT_IDENTITY),
-        };
-      })
-      .filter((b): b is DebugBoxEntry => b !== null && Number.isFinite(b.aabb.xMin) && Number.isFinite(b.aabb.xMax));
+    // LAZY on purpose: the old eager version ran an O(protos x instances) scan on EVERY rebuild
+    // (measured ~110 ms worst case at 1024 protos x 16384 instances) for a log nobody had open.
+    // RULE FOR FUTURE EDITORS: keep debug-only work out of rebuildAndRender's hot path.
+    debugBoxSource = () => {
+      // first instance that covers each prototype (same answer as the old per-proto find())
+      const firstInst = new Map<number, (typeof instances)[number]>();
+      for (const ins of instances) {
+        for (let k = 0; k < ins.count; k++) if (!firstInst.has(ins.protoIdx + k)) firstInst.set(ins.protoIdx + k, ins);
+      }
+      return protos
+        .map((p, pi) => {
+          if (p.isEnvelope) return null;
+          const inst = firstInst.get(pi);
+          const offset = inst ? { dx: inst.dx, dy: inst.dy, dz: inst.dz } : { dx: 0, dy: 0, dz: 0 };
+          const [r, g, b] = resolveMaterialColor(p.material_id);
+          return {
+            name: p.name ?? `${p.isFill ? 'fill' : 'cell'}#${pi}`,
+            color: `#${Math.round(r * 255).toString(16).padStart(2, '0')}${Math.round(g * 255).toString(16).padStart(2, '0')}${Math.round(b * 255).toString(16).padStart(2, '0')}`,
+            aabb: transformAABB(p.aabb, [offset.dx, offset.dy, offset.dz], inst?.q ?? QUAT_IDENTITY),
+          };
+        })
+        .filter((b): b is DebugBoxEntry => b !== null && Number.isFinite(b.aabb.xMin) && Number.isFinite(b.aabb.xMax));
+    };
 
     truncatedProtos = protos.length >= MAX_PROTOTYPES;
     truncatedInstances = instances.length >= MAX_INSTANCES;
@@ -2117,18 +2379,11 @@
     updateCameraUniforms(); render();
   }
 
-  let frameCount = 0, frameTimeSum = 0, frameTimeMax = 0, pointerMoveCount = 0;
+  let pointerMoveCount = 0;
   function render() {
     if (!renderer) return;
     updateCameraUniforms();
-    const t0 = performance.now();
-    renderer.render(scene, camera);
-    const dt = performance.now() - t0;
-    frameCount++; frameTimeSum += dt; frameTimeMax = Math.max(frameTimeMax, dt);
-    if (frameCount % 30 === 0) {
-      console.log(`[perf] avg=${(frameTimeSum/30).toFixed(2)}ms max=${frameTimeMax.toFixed(2)}ms protos=${prototypeCount} instances=${instanceCount} instancing=${usingInstancing}`);
-      frameTimeSum = 0; frameTimeMax = 0;
-    }
+    timedRender();
   }
 
   let isDragging = false, lastX = 0, lastY = 0, renderQueued = false, pendingRenderFrame: number | null = null;
@@ -2175,10 +2430,11 @@
   onMount(() => {
     scene = new THREE.Scene();
     camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-    shaderMaterial = new THREE.ShaderMaterial({ uniforms: makeUniforms(), vertexShader: VERTEX_SHADER, fragmentShader: FRAGMENT_SHADER });
+    shaderMaterial = new THREE.ShaderMaterial({ uniforms: makeUniforms(), vertexShader: VERTEX_SHADER, fragmentShader: FRAGMENT_SHADER, defines: { HEATMAP: 0 } });
     scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), shaderMaterial));
     renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: false });
     renderer.setPixelRatio(IDLE_DPR);
+    initGpuTimer();
     // Force one compile pass and log diagnostics
     const gl = renderer.getContext();
     renderer.compile(scene, camera);
@@ -2199,6 +2455,8 @@
   onDestroy(() => {
     if (pendingRenderFrame !== null) cancelAnimationFrame(pendingRenderFrame);
     clearTimeout(interactTimer);
+    if (gpuPollHandle !== null) cancelAnimationFrame(gpuPollHandle);
+    if (gpuTimer) for (const e of gpuQueries) gpuTimer.gl.deleteQuery(e.q);
     tokenTexture?.dispose(); bvhTexture?.dispose(); instanceTexture?.dispose(); latTexture?.dispose(); renderer?.dispose();
   });
 </script>
@@ -2213,9 +2471,15 @@
       onclick={() => { debugWalls = !debugWalls; if (debugWalls) logCsgDebug(); }}
       title="Log camera pose + expected-vs-rendered box walls to the console after every drag"
     >Debug walls{debugWalls ? ' ●' : ''}</button>
+    <button
+      class="viewport-btn"
+      class:active={heatMode > 0}
+      onclick={cycleHeat}
+      title="Cycle the render-cost heat-map: per-pixel work, blue = cheap, red = expensive. Entering/leaving it recompiles the shader once."
+    >Cost: {HEAT_MODES[heatMode]}</button>
     {#if !loading && !loadError}
       <span class="count-badge">
-        {#if usingInstancing}{prototypeCount} proto · {instanceCount} inst{:else}{instanceCount} cell{instanceCount === 1 ? '' : 's'}{/if}
+        {#if usingInstancing}{prototypeCount} proto · {instanceCount} inst{:else}{instanceCount} cell{instanceCount === 1 ? '' : 's'}{/if}{#if gpuMsLabel} · {gpuMsLabel}{/if}
       </span>
     {/if}
   </div>
