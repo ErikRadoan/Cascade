@@ -48,6 +48,16 @@ from ..domain.run_settings import RunMode, SourceDef, SourceSpaceType
 from ..domain.paths import UPLOADS_DIR
 from .backend_config import DockerBackendConfig
 from .base import ExecutionBackend
+from .container_runtime import (
+    ContainerRuntimeError,
+    container_name,
+    format_command,
+    quote_shell,
+    resolve_runtime,
+    stop_container,
+    verify_runtime,
+    volume_spec,
+)
 
 # Keyed by job.id for legacy single-leg jobs, by step.id for stepped jobs.
 # No collision risk — both are independently-generated UUID strings — and
@@ -65,6 +75,23 @@ class DockerBackend(ExecutionBackend):
     def __init__(self, config: DockerBackendConfig):
         self._config  = config
         self._adapter = OpenMCAdapter()
+        # Absolute path of the podman/docker executable. Resolved LAZILY (first
+        # launch / cancel) rather than here: create_backend() runs inside API
+        # handlers on every request (including status polls), and a missing
+        # runtime must become a failed *job* with a readable error, not an
+        # exception from the constructor.
+        self._runtime_path: str | None = None
+
+    def _runtime(self) -> str:
+        """Resolve + verify the container runtime once per backend instance.
+
+        Raises ContainerRuntimeError (message is user-facing).
+        """
+        if self._runtime_path is None:
+            path = resolve_runtime(self._config.cli, self._config.cli_path)
+            verify_runtime(path)
+            self._runtime_path = path
+        return self._runtime_path
 
     @classmethod
     def from_config(cls, config: DockerBackendConfig) -> DockerBackend:
@@ -109,12 +136,14 @@ class DockerBackend(ExecutionBackend):
             results_config=job.results_config,
         )
 
-        cmd = self._build_run_command(job.input_dir(), job.output_dir(), job.id)
+        # Building the command resolves the runtime, and launching can fail for
+        # reasons other than "not found" (permissions, broken install, bad mount
+        # path) — all of those must end as a FAILED job carrying the real reason.
         try:
-            process = self._launch(cmd, job.working_dir / "run.log")
-        except FileNotFoundError:
+            process = self._start(job.input_dir(), job.output_dir(), job.id, job.working_dir / "run.log")
+        except (ContainerRuntimeError, OSError) as e:
             job.status      = JobStatus.FAILED
-            job.error       = f"'{self._config.cli}' not found in PATH."
+            job.error       = str(e)
             job.finished_at = datetime.now(timezone.utc)
             return job
 
@@ -159,11 +188,7 @@ class DockerBackend(ExecutionBackend):
             results_config=job.results_config,
         )
 
-        cmd = self._build_run_command(
-            step.input_dir(), step.output_dir(), step.id,
-            driver_script="run_depletion.py",
-        )
-        self._launch_step(step, cmd)
+        self._launch_step(step, driver_script="run_depletion.py")
         return job
 
     def _submit_r2s(self, job: SimulationJob) -> SimulationJob:
@@ -201,8 +226,7 @@ class DockerBackend(ExecutionBackend):
             results_config=rc.neutron_leg,
         )
 
-        cmd = self._build_run_command(neutron_step.input_dir(), neutron_step.output_dir(), neutron_step.id)
-        self._launch_step(neutron_step, cmd)
+        self._launch_step(neutron_step)
         return job
 
     # ------------------------------------------------------------------
@@ -398,8 +422,7 @@ class DockerBackend(ExecutionBackend):
             results_config=rc.photon_leg,
         )
 
-        cmd = self._build_run_command(photon_step.input_dir(), photon_step.output_dir(), photon_step.id)
-        self._launch_step(photon_step, cmd)
+        self._launch_step(photon_step)
 
     # ------------------------------------------------------------------
     # cancel()
@@ -461,21 +484,51 @@ class DockerBackend(ExecutionBackend):
     # Process management (shared by legacy and stepped paths)
     # ------------------------------------------------------------------
 
+    def _start(
+        self,
+        input_dir: Path,
+        output_dir: Path,
+        unit_id: str,
+        log_path: Path,
+        driver_script: str | None = None,
+    ) -> subprocess.Popen:
+        """Build the container command for one execution unit and launch it.
+
+        Raises ContainerRuntimeError (runtime missing/unusable/bad mount path)
+        or OSError (spawn failed). Callers turn both into a FAILED status.
+        """
+        cmd = self._build_run_command(input_dir, output_dir, unit_id, driver_script=driver_script)
+        return self._launch(cmd, log_path)
+
     def _launch(self, cmd: list[str], log_path: Path) -> subprocess.Popen:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_file = open(log_path, "w")
-        log_file.write(f"Command: {' '.join(cmd)}\n")
-        log_file.write(f"Started: {datetime.now(timezone.utc).isoformat()}\n")
-        log_file.write("=" * 60 + "\n")
-        log_file.flush()
-        return subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, text=True)
-
-    def _launch_step(self, step: JobStep, cmd: list[str]) -> None:
+        # utf-8 explicitly: the platform default (e.g. cp1250 on Windows) would
+        # garble or crash on non-ASCII paths / OpenMC output.
+        log_file = open(log_path, "w", encoding="utf-8")
         try:
-            process = self._launch(cmd, step.working_dir / "run.log")
-        except FileNotFoundError:
+            log_file.write(f"Command: {format_command(cmd)}\n")
+            log_file.write(f"Started: {datetime.now(timezone.utc).isoformat()}\n")
+            log_file.write("=" * 60 + "\n")
+            log_file.flush()
+            return subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, text=True)
+        finally:
+            # The child inherited its own duplicate of the descriptor, so the
+            # parent's handle is not needed. Close it explicitly instead of
+            # relying on garbage collection (CPython usually collects it
+            # immediately, but that is an implementation detail and it raises
+            # ResourceWarning; also guarantees closure if Popen itself fails).
+            log_file.close()
+
+    def _launch_step(self, step: JobStep, driver_script: str | None = None) -> None:
+        """Launch `step`; on any launch failure mark it FAILED with the reason."""
+        try:
+            process = self._start(
+                step.input_dir(), step.output_dir(), step.id,
+                step.working_dir / "run.log", driver_script=driver_script,
+            )
+        except (ContainerRuntimeError, OSError) as e:
             step.status      = StepStatus.FAILED
-            step.error       = f"'{self._config.cli}' not found in PATH."
+            step.error       = str(e)
             step.finished_at = datetime.now(timezone.utc)
             return
 
@@ -494,6 +547,12 @@ class DockerBackend(ExecutionBackend):
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
+            # Killing the `podman run` CLIENT does not reliably stop the
+            # CONTAINER (SIGKILL orphans it). Ask the runtime to stop it by name.
+            try:
+                stop_container(self._runtime(), container_name(unit_id))
+            except ContainerRuntimeError:
+                pass  # runtime vanished since launch; nothing more we can do
 
     # ------------------------------------------------------------------
     # Container command building
@@ -508,25 +567,34 @@ class DockerBackend(ExecutionBackend):
         extra_mounts: list[str] | None = None,
     ) -> list[str]:
         """Build the container invocation for one execution unit (a legacy
-        job or a single step).
+        job or a single step). Returns an argv list; NO host shell is involved.
 
+        `name`: the job/step id; the container is named container_name(name) so
+        _terminate() can find it again.
         `driver_script`: if set (depletion), runs `python {driver_script}`
         inside the conda env instead of the `openmc` CLI binary — see
         openmc_adapter.py's write_depletion_driver().
         `extra_mounts`: additional `--volume` args, for any future case that
         genuinely needs a host-side mount rather than a file staged into
-        input_dir (uploaded files — chain files, decay libraries — no
-        longer need this; see _stage_uploaded_file()).
+        input_dir (uploaded files no longer need this; see _stage_uploaded_file()).
+
+        Quoting: argv elements are passed to the runtime verbatim, so they need
+        no quoting. The ONE shell involved is `bash -lc "<script>"` inside the
+        container; every value interpolated into that script goes through
+        quote_shell() (previously unquoted, so a path with a space or a shell
+        metacharacter in openmc_bin / the driver name broke the command).
+
+        Raises:
+            ContainerRuntimeError: runtime unusable or a mount path is invalid.
         """
         cfg = self._config
-        nuclear_host = Path(cfg.nuclear_data_path)
 
         cmd = [
-            cfg.cli, "run", "--rm",
-            "--name", f"cascade-{name[:8]}",
-            "--volume", f"{input_dir}:/work:z",
-            "--volume", f"{nuclear_host}:{cfg.nuclear_data_container_path}:ro,z",
-            "--volume", f"{output_dir}:/output:z",
+            self._runtime(), "run", "--rm",
+            "--name", container_name(name),
+            "--volume", volume_spec(input_dir, "/work", "z"),
+            "--volume", volume_spec(cfg.nuclear_data_path, cfg.nuclear_data_container_path, "ro,z"),
+            "--volume", volume_spec(output_dir, "/output", "z"),
             "--workdir", "/work",
             "--env", f"OPENMC_CROSS_SECTIONS={cfg.cross_sections_container_path}",
         ]
@@ -537,21 +605,21 @@ class DockerBackend(ExecutionBackend):
         if cfg.memory_limit:
             cmd += ["--memory", cfg.memory_limit]
 
-        if cfg.cpu_limit and cfg.cpu_limit != "0":
+        if cfg.cpu_limit and float(cfg.cpu_limit) > 0:
             cmd += ["--cpus", cfg.cpu_limit]
 
-        inner = f"{cfg.openmc_bin}" if driver_script is None else f"python {driver_script}"
+        inner = quote_shell(cfg.openmc_bin) if driver_script is None else f"python {quote_shell(driver_script)}"
 
-        cmd += [
-            cfg.image,
-            "bash", "-lc",
-            (
-                f"source /opt/miniconda/etc/profile.d/conda.sh && "
-                f"conda activate openmc && "
-                f"{inner}"
-            ),
-        ]
+        # NOTE: the conda.sh location is baked into the cascade-openmc image
+        # layout. If images with a different layout must be supported, make it a
+        # config field rather than editing this string.
+        script = (
+            "source /opt/miniconda/etc/profile.d/conda.sh && "
+            "conda activate openmc && "
+            f"{inner}"
+        )
 
+        cmd += [cfg.image, "bash", "-lc", script]
         return cmd
 
     def _stage_uploaded_file(self, upload_ref: str, dest_dir: Path) -> str:

@@ -1,5 +1,5 @@
 // Typed API client — all fetch calls to the Cascade backend.
-// Base URL reads from VITE_API_URL env var, defaults to localhost:8000.
+// Base URL: VITE_API_URL if set; else localhost:8000 in dev and same-origin in production builds.
 //
 // AUDIT NOTE (kept intentionally, don't delete on next edit): this file was
 // compared line-by-line against the actual backend routers (geometry.py,
@@ -17,7 +17,10 @@ import type {
     CsgGeometry, RasterResponse,
 } from '$lib/types';
 
-const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
+// Dev (`vite dev`): separate backend on :8000. Production build (standalone app):
+// the backend serves the frontend, so use same-origin relative URLs. An explicit
+// VITE_API_URL always wins in both modes.
+const BASE: string = import.meta.env.VITE_API_URL ?? (import.meta.env.PROD ? '' : 'http://localhost:8000');
 
 /**
  * Shared fetch wrapper. Two behaviors worth knowing if you're editing this:

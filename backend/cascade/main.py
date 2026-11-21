@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+import os
+import sys
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from cascade.api.backends import router as backends_router
@@ -68,6 +73,49 @@ async def health() -> dict:
     return {"status": "ok", "version": "0.1.0"}
 
 
-@app.get("/", tags=["system"])
-async def root() -> dict:
-    return {"name": "Cascade API", "docs": "/docs", "health": "/health"}
+# ---------------------------------------------------------------------------
+# Optional: serve the built frontend (standalone mode)
+# ---------------------------------------------------------------------------
+# In dev the frontend runs separately (`vite dev` on :5173) and nothing here
+# changes. In the standalone app the SvelteKit static build (frontend/build/)
+# is shipped next to / inside the backend and served from the same origin, so
+# no CORS and no second process are needed.
+#
+# Lookup order for the static directory:
+#   1. $CASCADE_STATIC_DIR                      (explicit override)
+#   2. <PyInstaller bundle>/static              (frozen app; see scripts/build_standalone.py)
+#   3. <repo>/frontend/build                    (running from source after `npm run build`)
+# If none exists, "/" returns the small JSON info document as before.
+#
+# MUST stay registered AFTER every API router and /health: the catch-all below
+# would otherwise shadow them.
+
+def _find_static_dir() -> Path | None:
+    candidates: list[Path] = []
+    if os.getenv("CASCADE_STATIC_DIR"):
+        candidates.append(Path(os.environ["CASCADE_STATIC_DIR"]))
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(getattr(sys, "_MEIPASS", ".")) / "static")
+    candidates.append(Path(__file__).resolve().parents[2] / "frontend" / "build")
+    return next((c for c in candidates if (c / "index.html").is_file()), None)
+
+
+_STATIC_DIR = _find_static_dir()
+
+if _STATIC_DIR is not None:
+    _STATIC_ROOT = _STATIC_DIR.resolve()
+
+    @app.get("/{path:path}", include_in_schema=False)
+    async def serve_frontend(path: str) -> FileResponse:
+        # Unknown API paths must stay real 404s (JSON clients), not index.html.
+        if path.startswith(("api/", "docs", "redoc", "openapi.json")):
+            raise HTTPException(status_code=404)
+        # Resolve + containment check: never serve outside the static dir (../ etc).
+        target = (_STATIC_ROOT / path).resolve()
+        if path and target.is_file() and _STATIC_ROOT in target.parents:
+            return FileResponse(target)
+        return FileResponse(_STATIC_ROOT / "index.html")  # SPA fallback
+else:
+    @app.get("/", tags=["system"])
+    async def root() -> dict:
+        return {"name": "Cascade API", "docs": "/docs", "health": "/health"}

@@ -47,3 +47,6 @@ Thumbs.db
 /backend/tests/
 /site/
 /misc/
+
+# PyInstaller work dir (standalone build)
+build_pyinstaller/

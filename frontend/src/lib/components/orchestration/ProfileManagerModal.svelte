@@ -34,6 +34,7 @@
   const BACKEND_FIELDS: Record<string, FieldDef[]> = {
     docker: [
       { key: 'cli',                         label: 'Container CLI',               type: 'select', options: ['podman', 'docker'], required: true },
+      { key: 'cli_path',                    label: 'Container CLI path (optional)', type: 'text', placeholder: '/usr/bin/podman', hint: "Full path to the executable. Set this if jobs fail with 'not found' even though it works in your terminal.", wide: true },
       { key: 'image',                       label: 'Container image',             type: 'text',   placeholder: 'cascade-openmc:latest', required: true },
       { key: 'openmc_bin',                  label: 'OpenMC binary (container)',   type: 'text',   placeholder: '/opt/miniconda/envs/openmc/bin/openmc', wide: true },
       { key: 'nuclear_data_path',           label: 'Nuclear data path (host)',    type: 'text',   placeholder: '~/.cascade/data', hint: 'Directory containing cross_sections.xml.', wide: true },
@@ -68,7 +69,7 @@
 
   const DEFAULTS: Record<string, Record<string, string>> = {
     docker: {
-      cli: 'podman', image: 'cascade-openmc:latest',
+      cli: 'podman', cli_path: '', image: 'cascade-openmc:latest',
       openmc_bin: '/opt/miniconda/envs/openmc/bin/openmc',
       nuclear_data_path: '~/.cascade/data',
       nuclear_data_container_path: '/nuclear-data',

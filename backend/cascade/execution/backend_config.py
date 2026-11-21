@@ -26,11 +26,40 @@ Adding a new backend:
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers (shared by the local-machine backends)
+# ---------------------------------------------------------------------------
+
+# '4g', '512m', '1024k', '2GiB', '100' (bytes). Empty string = no limit.
+_MEMORY_LIMIT_RE = re.compile(r"^\d+(\.\d+)?([bkmgt]|[kmgt]i?b)?$", re.IGNORECASE)
+
+
+def _absolutize_local_path(value: str) -> str:
+    """Expand '~' and make a HOST path absolute.
+
+    Why: the frontend sends defaults like '~/.cascade/data'. Nothing on the
+    execution path goes through a shell, so '~' was never expanded: jobs were
+    staged in a literal './~/.cascade/jobs' directory relative to the backend's
+    cwd, and '~/...' was handed to the container runtime as a mount source.
+    Normalizing here means every consumer (and the persisted profile) sees a
+    real absolute path.
+
+    NOT applied to SlurmBackendConfig.nuclear_data_path: that is a path on the
+    cluster, where '~' and '/shared/...' must not be rewritten locally.
+    """
+    value = value.strip()
+    if not value:
+        raise ValueError("must not be empty")
+    return os.path.abspath(os.path.expanduser(value))
 
 # ---------------------------------------------------------------------------
 # Base
@@ -117,6 +146,67 @@ class DockerBackendConfig(BaseBackendConfig):
         ),
     )
 
+    # Explicit path to the runtime executable. Needed when the backend process's
+    # PATH differs from the user's shell (IDE / service / launcher), or when the
+    # runtime lives somewhere unusual. When set it takes precedence over PATH
+    # lookup — see container_runtime.resolve_runtime().
+    cli_path: str | None = Field(
+        default=None,
+        description=(
+            "Optional full path to the podman/docker executable, e.g. "
+            "'/usr/bin/podman'. Leave empty to look it up on PATH."
+        ),
+    )
+
+    # --- validators ------------------------------------------------------
+
+    @field_validator("nuclear_data_path", "jobs_base_dir")
+    @classmethod
+    def _expand_host_paths(cls, v: str) -> str:
+        return _absolutize_local_path(v)
+
+    @field_validator("cli_path")
+    @classmethod
+    def _blank_cli_path_is_none(cls, v: str | None) -> str | None:
+        return (v.strip() or None) if v is not None else None
+
+    @field_validator("openmc_bin")
+    @classmethod
+    def _openmc_bin_not_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must not be empty")
+        return v.strip()
+
+    @field_validator("nuclear_data_container_path")
+    @classmethod
+    def _container_path_is_safe(cls, v: str) -> str:
+        # Must be absolute inside the container, and must not contain ':' or
+        # whitespace — it is embedded in a colon-delimited --volume spec and in
+        # an env var value.
+        if not re.fullmatch(r"/[^:\s]*", v):
+            raise ValueError("must be an absolute path without ':' or whitespace, e.g. '/nuclear-data'")
+        return v
+
+    @field_validator("memory_limit")
+    @classmethod
+    def _memory_limit_format(cls, v: str) -> str:
+        v = v.strip()
+        if v and not _MEMORY_LIMIT_RE.fullmatch(v):
+            raise ValueError("must look like '4g', '512m' or '2GiB' (or be empty for no limit)")
+        return v
+
+    @field_validator("cpu_limit")
+    @classmethod
+    def _cpu_limit_format(cls, v: str) -> str:
+        v = v.strip()
+        try:
+            ok = float(v) >= 0
+        except ValueError:
+            ok = False
+        if not ok:
+            raise ValueError("must be a non-negative number, e.g. '0' (no limit) or '2.0'")
+        return v
+
     @property
     def cross_sections_container_path(self) -> str:
         return f"{self.nuclear_data_container_path}/cross_sections.xml"
@@ -155,6 +245,11 @@ class LocalBackendConfig(BaseBackendConfig):
         default="",
         description="Not used for local backend — nuclear_data_path is used directly.",
     )
+
+    @field_validator("nuclear_data_path", "jobs_base_dir")
+    @classmethod
+    def _expand_host_paths(cls, v: str) -> str:
+        return _absolutize_local_path(v)
 
 
 # ---------------------------------------------------------------------------

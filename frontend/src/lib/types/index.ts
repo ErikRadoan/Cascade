@@ -272,6 +272,8 @@ export type BackendType = 'docker' | 'local' | 'slurm';
 export interface DockerBackendConfig {
   type:                          'docker';
   cli:                           'podman' | 'docker';
+  /** Optional absolute path to the runtime executable (overrides PATH lookup). */
+  cli_path?:                     string | null;
   image:                         string;
   openmc_bin:                    string;
   nuclear_data_path:             string;
